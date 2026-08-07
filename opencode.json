@@ -1,0 +1,73 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "openrouter/anthropic/claude-opus-5",
+  "small_model": "openrouter/anthropic/claude-sonnet-5",
+  "default_agent": "charm-architect",
+  "instructions": ["AGENTS.md"],
+  "references": {
+    "snap-pi-hole": {
+      "repository": "rajannpatel/snap-pi-hole",
+      "branch": "main",
+      "description": "Source of the pihole-by-rajannpatel snap. Use for snapcraft.yaml (apps, daemons, plugs, layouts, install-mode), the configure hook (which snap set keys are accepted), and bin/launcher-ftl, bin/launcher-pihole, bin/snap-check, bin/pihole-config.sh."
+    },
+    "ops": {
+      "repository": "canonical/operator",
+      "branch": "main",
+      "description": "The ops framework itself. Use examples/machine-tinyproxy for the canonical machine-charm reference layout, and testing/ for ops.testing internals."
+    },
+    "charmlibs": {
+      "repository": "canonical/charmlibs",
+      "branch": "main",
+      "description": "Source of charmlibs-snap, charmlibs-systemd, charmlibs-apt. Use to check real API signatures instead of guessing."
+    },
+    "fp-edge": {
+      "repository": "canonical/fp-edge-canonical",
+      "branch": "master",
+      "description": "Workshop material on functional-style charms. Read code/src/charms_examples/case_study/step2_functional for the fetch/compute/apply split and the outcome ADT. Educational only, not production code — see the charm-functional-style skill for caveats.",
+      "hidden": true
+    },
+    "flaplint": {
+      "repository": "michaeldmitry/flaplint",
+      "branch": "main",
+      "description": "Static analyser for relation-databag ordering churn. Read docs/taint-model.md and docs/sinks-and-findings.md to interpret a finding.",
+      "hidden": true
+    }
+  },
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "uv *": "allow",
+      "uvx *": "allow",
+      "tox *": "allow",
+      "ruff *": "allow",
+      "pyright *": "allow",
+      "pytest *": "allow",
+      "charmcraft *": "allow",
+      "juju *": "allow",
+      "juju destroy-*": "ask",
+      "git *": "allow",
+      "git commit*": "deny",
+      "git push*": "deny",
+      "gh *": "ask",
+      "snap *": "ask",
+      "sudo *": "ask",
+      "systemctl *": "ask",
+      "rm -rf *": "deny"
+    }
+  },
+  "agent": {
+    "explore": {
+      "model": "openrouter/anthropic/claude-sonnet-5"
+    },
+    "general": {
+      "model": "openrouter/anthropic/claude-sonnet-5"
+    },
+    "charm-reviewer": {
+      "permission": {
+        "task": {
+          "*": "deny"
+        }
+      }
+    }
+  }
+}

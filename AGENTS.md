@@ -1,0 +1,179 @@
+# pi-hole-operator
+
+Juju **machine charm** that deploys and operates Pi-hole v6 on Ubuntu VMs/LXD
+containers via the `pihole-by-rajannpatel` snap.
+
+This is not a Kubernetes charm. There is no Pebble, no `lightkube`, no OCI image.
+
+## Non-negotiables
+
+Rules 3 and 5 are partly machine-checked; the rest are not. **A green
+`tox -e lint,static,unit` is not evidence of compliance with 1, 2, 4, 6, 7, or 8.**
+Those are audited by `charm-reviewer`. Do not treat a passing gate as a review.
+
+1. **One reconciler.** Every observed event routes to a single `_reconcile`.
+   Every reconcile step must be safe to run twice and safe to never run.
+   The test for "deserves its own handler" is objective, from the ops docs:
+   *an event that cannot be deferred needs a dedicated handler.* That set is
+   exactly: actions, `stop`, `remove`, `secret_rotate`, `secret_expired`, and the
+   `collect_*_status` lifecycle events. Everything deferrable — including
+   `config_changed`, `upgrade_charm`, `secret_changed`, `leader_elected`, and every
+   relation event — goes through `_reconcile`. The one allowed exception is
+   `upgrade_charm` *if* it needs migration logic distinct from convergence.
+2. **Charm logic and workload logic are separate modules.** `src/charm.py` only
+   observes events, maps config to arguments, and reports status. All snap/systemd/
+   file manipulation lives in `src/pihole.py`, which never imports `ops`. This is
+   what makes unit tests possible — tests mock the module, never `subprocess`.
+   No linter checks this; if a test of `charm.py` patches `subprocess` or
+   `charmlibs`, the boundary has already broken.
+3. **No imports inside functions.** PEP 8 already says imports go at the top of
+   the file; the reason it is restated here as absolute is charm-specific. A Juju
+   hook runs once and exits, so an import inside a rarely-taken branch fails in
+   production, in that branch, with a venv that differs from the one the tests
+   ran against. An import at module top fails on the first hook instead.
+   Enforced by `E402` **and `PLC0415`** — `E402` alone only catches late
+   module-level imports, not function-level ones. `if TYPE_CHECKING:` blocks are
+   at module top and therefore fine; if you need a function-level import to break
+   a cycle, the `charm.py`/`pihole.py` layering has been violated — fix that
+   instead.
+4. **Relations over config options.** A config option is a permanent public API:
+   removing or renaming one breaks every existing deployment, the same class of
+   irreversibility as `limit`. So before adding one, check the three alternatives
+   in order — does another charm own this data (a relation)? is it network
+   placement (`extra-bindings` / a Juju space)? is it deployment shape the operator
+   sets outside the charm (constraints, placement, their own deployment tooling)?
+   Config options are the residue, not the default.
+5. **Optional by default.** Every `requires`/`provides` entry gets
+   `optional: true` unless the charm physically cannot reach `ActiveStatus`
+   without it. The charm must come up clean with zero relations. Note that Juju
+   does **not** enforce `optional` — it is documentation. The guarantee lives in
+   `_reconcile` and `collect_unit_status`, so a correct `charmcraft.yaml` is not
+   evidence. (`limit`, by contrast, *is* enforced — and adding it later breaks
+   `juju refresh` for existing users. See `charm-relations`.)
+6. **Never trust a success signal you did not verify.** `snap set` and several
+   `pihole` subcommands return 0 without doing anything — see `pihole-snap`. The
+   same shape appears in `ops`: `Secret.set_content` succeeds and the unit errors
+   at the *end* of the hook if permission was missing. And `snap services` reports
+   `active` long before Pi-hole is serving. In every case, read the state the
+   operation was supposed to produce. An exit code is not evidence.
+7. **Decide, then act — never both in one function.** A function that performs an
+   effect *and* returns a flag describing what it decided cannot be tested without
+   running the effect. Pure functions compute an outcome value; impure functions
+   consume it. The detection signal is cheap: **if a test needs a mock to reach a
+   decision, this rule was broken.** See `charm-functional-style`.
+8. **Inheritance only where a framework demands it.** `ops.CharmBase` is the one
+   mandatory subclass; charm libraries are instantiated, never extended.
+   Everything else is composition — but note the verified constraint:
+   **constructor injection into the charm is impossible.** `ops` instantiates it as
+   `charm_class(framework)` and `ops.testing.Context` takes a type, not a factory.
+   So inject *below* the charm, in `Pihole`, and do not invent a factory
+   indirection to work around it. Pass the narrowest collaborator a function needs,
+   never the charm itself.
+
+## Toolchain
+
+`uv` + `tox` + `ruff` + `pyright`. No `pip`, no `poetry`, no `black`/`isort`/`flake8`.
+
+```
+tox -e fmt        # ruff format + ruff check --fix
+tox -e lint       # ruff check
+tox -e static     # pyright
+tox -e unit       # pytest tests/unit, coverage fail_under = 90
+tox -e integration  # pytest tests/integration (needs a juju machine model)
+tox -e flaplint   # advisory: relation-databag ordering churn. Not in envlist.
+```
+
+`uv.lock` is committed. Dependencies go in `pyproject.toml`, never in
+`charmcraft.yaml`'s `charm-libs` — that key is only for Charmhub-hosted libraries,
+of which this charm needs exactly one (`grafana_agent.cos_agent`, because no PyPI
+replacement exists).
+
+## Layout
+
+```
+charmcraft.yaml           # base: ubuntu@24.04, platforms: {amd64:, arm64:}
+pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, + dev extras
+uv.lock
+tox.ini
+lib/charms/grafana_agent/ # vendored, third-party. Never edited, never linted.
+src/
+  charm.py                # PiholeCharm: observe -> _reconcile -> collect_unit_status
+  pihole.py               # snap install/start, config apply, readiness, status
+  pihole_config.py        # pydantic models, charm config -> FTL keys mapping
+  resolved.py             # systemd-resolved port 53 orchestration
+  grafana_dashboards/
+  prometheus_alert_rules/
+  loki_alert_rules/
+tests/
+  unit/                   # ops.testing, Model(type='lxd'), mocks src.pihole
+  integration/            # jubilant + pytest-jubilant on LXD
+```
+
+## Python conventions
+
+Authority is [PEP 8](https://peps.python.org/pep-0008/) and
+[PEP 257](https://peps.python.org/pep-0257/), enforced by `ruff`. Details and the
+rule-family mapping live in the `python-style` skill.
+
+Machine-checked:
+
+- **PEP 8 with the 99-character exception**, which PEP 8 grants explicitly —
+  *provided comments and docstrings stay wrapped at 72*. That proviso is the
+  condition, not a suggestion: `E501` and `W505` are both enabled.
+- Type annotations everywhere; `pyright` in strict-ish mode must pass. They also
+  let `flaplint` resolve cross-object calls, so they buy correctness twice.
+- No `from x import *` (`F403`/`F405`). No bare `except:` (`E722`).
+- Python **3.12**, which is what `ubuntu@24.04` ships. Not 3.10 — the charm only
+  ever runs on the base's interpreter, and claiming `>=3.10` makes `pyright` and
+  `ruff` reject the PEP 695 `type X = A | B` syntax this repo mandates. `ubuntu@26.04`
+  ships **3.14**, so avoid anything that exists in only one of the two. See
+  `machine-charm-scaffold` for the 26.04 migration trigger.
+
+Not machine-checked — the reviewer's job:
+
+- **Prefer the functional style.** Frozen dataclasses, unions as ADTs, exhaustive
+  `match` with `assert_never`, `Mapping`/`Sequence`/`FrozenSet` in signatures.
+  Functional core, imperative shell. See `charm-functional-style` — including what
+  we deliberately do *not* adopt from `fp-edge-canonical`.
+- `pydantic` for anything parsed or serialised: charm config (via
+  `self.load_config`), databags (via `Relation.load`/`save`), the subset of
+  `pihole.toml` the charm cares about.
+- Logging via `logging.getLogger(__name__)`, never `print`. `ops.main` already
+  wires this to `juju-log`, so no setup is needed.
+- No `except Exception:` where a narrower exception is what actually occurs. Ruff's
+  `BLE001` is deliberately not enabled because it cannot tell the difference — this
+  one is judgement.
+- Tests use `# GIVEN / # WHEN / # THEN` comments and live in `conftest.py`-backed
+  fixtures rather than per-file setup boilerplate.
+
+
+## Ecosystem facts that bite (2026)
+
+- Charmhub-hosted charm libraries (`charmcraft fetch-lib`, `LIBPATCH`/`LIBAPI`)
+  are **being phased out** in favour of PyPI packages. Do not create new
+  `lib/charms/...` files for code this repo owns.
+- `charms.operator_libs_linux.*` is **deprecated**. Use `charmlibs-snap`,
+  `charmlibs-systemd`, `charmlibs-apt` from PyPI: `from charmlibs import snap`.
+- The COS machine subordinate is `opentelemetry-collector` (`grafana-agent` is
+  EOL). But the interface is still `cos_agent` and its library is still published
+  as `grafana_agent.cos_agent` — there is no `opentelemetry_collector` equivalent.
+- `bases:` in `charmcraft.yaml` is deprecated. Use `base:` + `platforms:`.
+
+## Agents and skills in this repo
+
+Three agents, three jobs. Design decisions go to `charm-architect`,
+implementation to `charm-engineer`, and audits to `charm-reviewer` (read-only).
+
+Load the relevant skill instead of guessing — they carry verified, sourced
+detail that changes faster than this file:
+
+| Skill | Use for |
+|---|---|
+| `python-style` | PEP 8 / PEP 257, ruff rule families, `flaplint` |
+| `charm-functional-style` | Outcome ADTs, functional core / imperative shell, what not to copy from `fp-edge-canonical` |
+| `pihole-snap` | Anything touching the snap: services, plugs, `snap set` limits, ports, paths, commands |
+| `machine-charm-scaffold` | `charmcraft.yaml`, `pyproject.toml`, `tox.ini`, repo layout |
+| `machine-charm-workload` | `charmlibs` snap/systemd/apt usage, workload module design |
+| `charm-relations` | Adding or reviewing a relation; which library owns which interface |
+| `charm-testing` | Unit tests with `ops.testing`, integration with `jubilant` on LXD |
+| `charm-cos-integration` | `cos-agent`, `COSAgentProvider`, alert rules, dashboards |
