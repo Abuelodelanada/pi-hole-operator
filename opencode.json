@@ -35,24 +35,12 @@
   },
   "permission": {
     "bash": {
-      "*": "ask",
-      "uv *": "allow",
-      "uvx *": "allow",
-      "tox *": "allow",
-      "ruff *": "allow",
-      "pyright *": "allow",
-      "pytest *": "allow",
-      "charmcraft *": "allow",
-      "juju *": "allow",
-      "juju destroy-*": "ask",
-      "git *": "allow",
+      "*": "allow",
       "git commit*": "deny",
       "git push*": "deny",
-      "gh *": "ask",
-      "snap *": "ask",
-      "sudo *": "ask",
-      "systemctl *": "ask",
-      "rm -rf *": "deny"
+      "gh pr create*": "deny",
+      "gh pr merge*": "deny",
+      "gh release*": "deny"
     }
   },
   "agent": {
