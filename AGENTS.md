@@ -91,7 +91,7 @@ replacement exists).
 ## Layout
 
 ```
-charmcraft.yaml           # base: ubuntu@24.04, platforms: {amd64:, arm64:}
+charmcraft.yaml           # base: ubuntu@26.04, platforms: {amd64:, arm64:}
 pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, + dev extras
 uv.lock
 tox.ini
@@ -123,11 +123,15 @@ Machine-checked:
 - Type annotations everywhere; `pyright` in strict-ish mode must pass. They also
   let `flaplint` resolve cross-object calls, so they buy correctness twice.
 - No `from x import *` (`F403`/`F405`). No bare `except:` (`E722`).
-- Python **3.12**, which is what `ubuntu@24.04` ships. Not 3.10 — the charm only
-  ever runs on the base's interpreter, and claiming `>=3.10` makes `pyright` and
-  `ruff` reject the PEP 695 `type X = A | B` syntax this repo mandates. `ubuntu@26.04`
-  ships **3.14**, so avoid anything that exists in only one of the two. See
-  `machine-charm-scaffold` for the 26.04 migration trigger.
+- Python **3.14**, which is what `ubuntu@26.04` ships — and the *only* interpreter
+  in that base's archive, so there is no fallback. The charm never runs on anything
+  else, so `requires-python = ">=3.14"`, `ruff target-version = "py314"` and
+  `pyright pythonVersion = "3.14"`. Do not write code that merely tolerates older
+  interpreters. See `docs/adr/0002-tech-stack-and-repo-architecture.md`.
+- **Note on `ruff format` at py314:** it rewrites `except (A, B):` into PEP 758's
+  unparenthesized form, which `flaplint`'s Python 3.12 parser cannot read — and it
+  then **skips the whole module silently**. Give multi-type `except` clauses an
+  `as err:` binding, which keeps the parentheses.
 
 Not machine-checked — the reviewer's job:
 
