@@ -343,7 +343,12 @@ For this charm that means the snap store, which is genuinely flaky:
 
 ```python
 @tenacity.retry(
-    retry=tenacity.retry_if_exception_type(snap.SnapError),
+    # snap.Error, NOT snap.SnapError. Verified against charmlibs-snap 1.0.1:
+    # SnapError, SnapAPIError and SnapNotFoundError all inherit directly from
+    # Error and none subclasses another, so retrying SnapError alone misses the
+    # store and lookup failures that are the flaky ones. The Snap* names are
+    # also legacy aliases, already removed on charmlibs main.
+    retry=tenacity.retry_if_exception_type(snap.Error),
     wait=tenacity.wait_fixed(2) + tenacity.wait_random(0, 5),
     stop=tenacity.stop_after_attempt(3),
     reraise=True,

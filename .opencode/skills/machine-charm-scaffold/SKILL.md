@@ -190,8 +190,8 @@ dev = [
     "pytest",
     "pytest-cov",
     "coverage[toml]",
-    "jubilant>=2,<3",
-    "pytest-jubilant>=2,<3",
+    "jubilant>=1.12,<2",      # NOT >=2: jubilant 2.x does not exist, latest is 1.12.0
+    "pytest-jubilant>=2.2,<3",
     "ruff",
     "pyright",
 ]
@@ -503,9 +503,32 @@ the pack** unless `--force`. Two attributes matter here:
 - `framework` must resolve to `operator` — requires `venv/ops` present in the
   packed charm and `import ops` in the entrypoint.
 
-The `uv` plugin creates the venv at `${CRAFT_PART_INSTALL}/venv`, so this is
-satisfied by default. If you ever touch `UV_PROJECT_ENVIRONMENT` or
-`python-keep-bins`, run `charmcraft analyse` to confirm the linters still pass.
+**Both of these currently FAIL for a `plugin: uv` charm, verified 2026-08-08 with
+charmcraft 4.3.1.** An earlier version of this skill claimed they are "satisfied by
+default" — that is wrong. Two independent charmcraft defects:
+
+1. **`entrypoint` / `language`.** `charmcraft/dispatch.py` emits
+   `exec "${python_path}" "${dispatch_path}/src/charm.py"`, but
+   `linters.py::get_entrypoint_from_dispatch` takes `shlex.split(last_line)[-1]` and
+   joins it to the base directory **without expanding the shell variable**. It then
+   looks for a literal `${dispatch_path}/src/charm.py` and fails. This affects every
+   charm packed with charmcraft 4.x's generated dispatch.
+2. **`framework`.** `_check_operator` requires `basedir/venv/ops` to be a
+   *directory*. The `uv` plugin builds a real virtualenv, so `ops` lands at
+   `venv/lib/pythonX.Y/site-packages/ops`. There is no `venv/ops`, so `framework`
+   can never resolve to `operator`.
+
+Consequences: `manifest.yaml` records `language: unknown` and `framework: unknown`,
+so this affects what Charmhub sees, not just CLI output. **`charmcraft pack` is not
+blocked** — the analysers are advisory unless a linter is in error state.
+
+Do **not** vendor a hand-written `dispatch` to work around #1 without reading the
+`uv` plugin first: it deletes `venv/bin/python*` during build, so the template's
+`ln -s $(which python3)` and `LD_LIBRARY_PATH` setup are load-bearing at runtime.
+And #2 cannot be fixed from inside a charm repo at all.
+
+One thing that *is* ours: the entrypoint must be executable (`chmod +x src/charm.py`),
+because `check_dispatch_with_python_entrypoint` calls `os.access(entrypoint, os.X_OK)`.
 
 Linters can be silenced via `analysis: {ignore: {attributes: [...], linters: [...]}}`.
 
