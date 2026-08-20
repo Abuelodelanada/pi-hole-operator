@@ -42,9 +42,16 @@ See `charm-functional-style`.
 
 **Compose, don't inherit.** `ops.CharmBase` is the only subclass you are allowed
 to write. Charm libraries get instantiated, not extended. Give `Pihole` its
-collaborators as constructor defaults so a fake can replace them — but only where a
-fake actually exists; a `Protocol` with one implementation and no test double is
-ceremony. And never pass the whole charm to a function that needs one value.
+collaborators as constructor defaults so a fake can replace them. And never pass
+the whole charm to a function that needs one value.
+
+A `Protocol` earns its place for one of two reasons, and you should be able to
+say which: **(a)** a test double implements it — `PiholeFacts` in
+`src/pihole_state.py` is implemented by both `Pihole` and `FactsStub` in the
+tests; or **(b)** it inverts an import that rule 2 forbids — that same
+`PiholeFacts` is why the pure core can describe the reads it needs without
+`import pihole` dragging `charmlibs.snap` into it. A `Protocol` with neither —
+one implementation, no fake, no import to break — is ceremony. Delete it.
 
 **`Mapping`, `Sequence`, `FrozenSet` in signatures and frozen fields** — never
 `dict`, `list`, `set`. Iteration order of a `set` is a real source of relation

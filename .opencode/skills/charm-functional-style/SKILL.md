@@ -1,7 +1,7 @@
 ---
 name: charm-functional-style
 description: >-
-  Use when designing or writing src/pihole.py, src/pihole_config.py, or the
+  Use when designing or writing src/pihole_state.py, src/pihole.py, or the
   reconciler — the functional core / imperative shell split, outcome ADTs,
   frozen dataclasses, exhaustive match with assert_never, and errors as data.
   Load before writing a function that both decides something and performs an

@@ -7,9 +7,10 @@ This is not a Kubernetes charm. There is no Pebble, no `lightkube`, no OCI image
 
 ## Non-negotiables
 
-Rules 3 and 5 are partly machine-checked; the rest are not. **A green
-`tox -e lint,static,unit` is not evidence of compliance with 1, 2, 4, 6, 7, or 8.**
-Those are audited by `charm-reviewer`. Do not treat a passing gate as a review.
+Only rule 3 is machine-checked. **A green `tox -e lint,static,unit` is not
+evidence of compliance with 1, 2, 4, 5, 6, 7, or 8.** Rule 5 in particular looks
+checkable and is not: Juju ignores `optional`, and no tool reads it. All of them
+are audited by `charm-reviewer`. Do not treat a passing gate as a review.
 
 1. **One reconciler.** Every observed event routes to a single `_reconcile`.
    Every reconcile step must be safe to run twice and safe to never run.
@@ -22,10 +23,12 @@ Those are audited by `charm-reviewer`. Do not treat a passing gate as a review.
    `upgrade_charm` *if* it needs migration logic distinct from convergence.
 2. **Charm logic and workload logic are separate modules.** `src/charm.py` only
    observes events, maps config to arguments, and reports status. All snap/systemd/
-   file manipulation lives in `src/pihole.py`, which never imports `ops`. This is
-   what makes unit tests possible — tests mock the module, never `subprocess`.
-   No linter checks this; if a test of `charm.py` patches `subprocess` or
-   `charmlibs`, the boundary has already broken.
+   file manipulation lives in the workload modules — `src/pihole.py` and
+   `src/resolved.py` — neither of which ever imports `ops`. `src/pihole_state.py`
+   sits between them as the pure core and imports neither `ops` nor the workload.
+   This is what makes unit tests possible — tests mock the module, never
+   `subprocess`. No linter checks this; if a test of `charm.py` patches
+   `subprocess` or `charmlibs`, the boundary has already broken.
 3. **No imports inside functions.** PEP 8 already says imports go at the top of
    the file; the reason it is restated here as absolute is charm-specific. A Juju
    hook runs once and exits, so an import inside a rarely-taken branch fails in
@@ -90,23 +93,41 @@ replacement exists).
 
 ## Layout
 
+Present today:
+
 ```
 charmcraft.yaml           # base: ubuntu@26.04, platforms: {amd64:, arm64:}
 pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, + dev extras
 uv.lock
 tox.ini
-lib/charms/grafana_agent/ # vendored, third-party. Never edited, never linted.
+docs/
+  adr/                    # numbered decision records. Load `new-adr` before adding one.
+  roadmap.md              # staged delivery plan
+  snap-constraints.md     # what the snap cannot do, and the workarounds
+  BACKLOG.md
 src/
   charm.py                # PiholeCharm: observe -> _reconcile -> collect_unit_status
-  pihole.py               # snap install/start, config apply, readiness, status
-  pihole_config.py        # pydantic models, charm config -> FTL keys mapping
-  resolved.py             # systemd-resolved port 53 orchestration
-  grafana_dashboards/
-  prometheus_alert_rules/
-  loki_alert_rules/
+  pihole.py               # workload: snap install/start, config apply, readiness
+  pihole_state.py         # functional core: intent, state, outcome ADT, fetch/compute
+  resolved.py             # workload: systemd-resolved port 53 orchestration
 tests/
   unit/                   # ops.testing, Model(type='lxd'), mocks src.pihole
   integration/            # jubilant + pytest-jubilant on LXD
+```
+
+`src/pihole_state.py` is the pure core: it holds `PiholeIntent`, the `PiholeState`
+and `PiholeOutcome` unions, `fetch`, and `compute`. It imports neither `ops` nor
+anything that touches the machine — it reaches the workload only through the
+`PiholeFacts` protocol, which is what keeps that import out. See rule 2.
+
+Arrives with later stages, so do not expect it on disk yet:
+
+```
+lib/charms/grafana_agent/ # vendored, third-party. Never edited, never linted.
+src/
+  grafana_dashboards/     # COSAgentProvider defaults
+  prometheus_alert_rules/
+  loki_alert_rules/
 ```
 
 ## Python conventions
@@ -181,3 +202,9 @@ detail that changes faster than this file:
 | `charm-relations` | Adding or reviewing a relation; which library owns which interface |
 | `charm-testing` | Unit tests with `ops.testing`, integration with `jubilant` on LXD |
 | `charm-cos-integration` | `cos-agent`, `COSAgentProvider`, alert rules, dashboards |
+| `new-adr` | Writing or revising anything under `docs/adr/`; deciding whether a decision belongs in an ADR, the roadmap, or the backlog |
+
+Decisions live in `docs/adr/`, numbered and dated. `src/charm.py` cites them by
+number in comments, so an ADR is not optional documentation — it is where the
+reason for a rule lives once the rule is no longer obvious. Load `new-adr`
+before adding or revising one.

@@ -331,18 +331,19 @@ README.md
 CONTRIBUTING.md
 src/
   charm.py            # events -> _reconcile -> collect_unit_status. No snap calls.
-  pihole.py           # all snap/systemd/filesystem interaction. No ops imports.
-  pihole_config.py    # pydantic models, charm config -> FTL key mapping
-  resolved.py         # systemd-resolved drop-in management
-  grafana_dashboards/      # COSAgentProvider default
-  prometheus_alert_rules/  # COSAgentProvider default
-  loki_alert_rules/        # COSAgentProvider default
+  pihole.py           # all snap/filesystem interaction. No ops imports.
+  pihole_state.py     # pure core: intent, state/outcome ADTs, fetch, compute
+  resolved.py         # systemd-resolved drop-in management. No ops imports.
+  grafana_dashboards/      # COSAgentProvider default, arrives with COS
+  prometheus_alert_rules/  # COSAgentProvider default, arrives with COS
+  loki_alert_rules/        # COSAgentProvider default, arrives with COS
 tests/
   unit/
     conftest.py
     test_charm.py
     test_pihole.py
-    test_pihole_config.py
+    test_pihole_state.py
+    test_resolved.py
   integration/
     conftest.py
     test_deploy.py

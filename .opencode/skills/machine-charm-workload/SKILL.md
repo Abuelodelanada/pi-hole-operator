@@ -103,13 +103,19 @@ drop-in, neither of which the snap can do under strict confinement.
 
 ## Reconciler skeleton
 
+There is no `pihole_config.py` in this repo and you should not create one. The
+pure core lives in `src/pihole_state.py`, and a pydantic model of the charm's
+config belongs there alongside the intent — it is parsed data, so it is core, not
+workload. `PiholeConfig` below is illustrative: Stage 1 has no config options
+yet, so add it when the first one lands.
+
 ```python
 import logging
 
 import ops
 
 from pihole import Pihole, PiholeError
-from pihole_config import PiholeConfig
+from pihole_state import PiholeConfig
 
 logger = logging.getLogger(__name__)
 

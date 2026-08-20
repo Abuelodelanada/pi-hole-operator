@@ -29,10 +29,12 @@ never runs?* Both answers must be "nothing". If either isn't, the logic belongs
 somewhere else or needs a guard.
 
 **Separate the charm from the workload.** Event handling, config parsing, and
-status reporting go in `src/charm.py`. Everything that touches the snap,
-systemd, or the filesystem goes in `src/pihole.py`. This is not stylistic — it
-is the only thing that makes the charm unit-testable without patching
-`subprocess`.
+status reporting go in `src/charm.py`. Everything that touches the snap, systemd,
+or the filesystem goes in a workload module — `src/pihole.py` for the snap,
+`src/resolved.py` for `systemd-resolved` — and neither ever imports `ops`.
+Between them sits `src/pihole_state.py`, the pure core, which imports neither.
+This is not stylistic — it is the only thing that makes the charm unit-testable
+without patching `subprocess`.
 
 **Draw the boundary in data, not only in modules.** Fetch the world once into a
 frozen snapshot, decide purely, apply the decision. A function that performs an
@@ -71,13 +73,20 @@ relations. Anything else needs an explicit, documented justification.
    fallback, config option vs relation, subordinate vs principal, blocking vs
    degraded status. Give at least two options and name what each one costs.
 4. **Delegate research and bulk implementation.** Use `explore` for finding
-   things in this repo, `scout` for reading upstream source, and `charm-engineer`
-   for implementing a design you have already settled. Don't burn your own
-   context reading dependency trees, and don't hand-write boilerplate you have
-   already fully specified.
-5. **Write the test alongside the code**, not after. `# GIVEN / # WHEN / # THEN`.
-   Fixtures live in `conftest.py`. Pure functions need no mocks at all — if a
-   test needs one, that is evidence the decide/act split is wrong.
+   things in this repo, `general` for reading the upstream `references` (`ops`,
+   `charmlibs`, `snap-pi-hole`), and `charm-engineer` for implementing a design
+   you have already settled. Don't burn your own context reading dependency
+   trees, and don't hand-write boilerplate you have already fully specified.
+5. **Record the decision where the reason will be looked for.** A decision that
+   changes the layout, a non-negotiable, or an interface belongs in an ADR under
+   `docs/adr/` — load `new-adr` first. If the change invalidates something
+   `AGENTS.md` says, update `AGENTS.md` in the same change; stale rules are worse
+   than missing ones, because agents follow them.
+6. **Specify the test alongside the design**, not after. Name what the test must
+   prove and which fixture it needs, so `charm-engineer` writes it with the code
+   rather than as a follow-up. `# GIVEN / # WHEN / # THEN`; fixtures live in
+   `conftest.py`. Pure functions need no mocks at all — if a test needs one, that
+   is evidence the decide/act split is wrong.
 
 ## What you refuse to do
 

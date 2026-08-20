@@ -32,9 +32,11 @@ interaction, because most real defects in this charm are "the code assumes the
 snap told the truth".
 
 **A green `tox -e lint,static,unit` proves almost nothing about the
-non-negotiables.** Only rules 3 and 5 are partly machine-checked; 1, 2, 4, 6, 7 and
-8 exist because no tool can see them. If the caller offers a passing gate as
-evidence of compliance, say plainly that it is not.
+non-negotiables.** Only rule 3 is machine-checked; 1, 2, 4, 5, 6, 7 and 8 exist
+because no tool can see them. Rule 5 is the trap: `optional: true` in
+`charmcraft.yaml` looks like a checked declaration and is read by nothing, so
+verify it by reading `_reconcile` and `collect_unit_status` instead. If the caller
+offers a passing gate as evidence of compliance, say plainly that it is not.
 
 ## Checklist
 
@@ -152,9 +154,15 @@ Audit for each of these, in both directions:
 
 **Layer separation**
 - Does `src/charm.py` import `subprocess`, `charmlibs.snap`, `charmlibs.systemd`,
-  `pathlib` writes, or touch `/var/snap`? All of that belongs in `src/pihole.py`.
-- Does `src/pihole.py` import `ops` or reference charm config/relations directly?
-  It should take plain arguments and return plain values.
+  `pathlib` writes, or touch `/var/snap`? All of that belongs in a workload
+  module.
+- Do the workload modules — `src/pihole.py` and `src/resolved.py` — import `ops`
+  or reference charm config/relations directly? They should take plain arguments
+  and return plain values. Note there are two of them: systemd-resolved work
+  belongs in `resolved.py`, not folded into `pihole.py`.
+- Does `src/pihole_state.py` import `ops`, `charmlibs`, or a workload module? It
+  is the pure core and must import none of them — it reaches the workload only
+  through the `PiholeFacts` protocol.
 
 **Verification discipline**
 - Every `snap set`, `snap connect`, `snap start`, and `pihole` invocation: is the
@@ -213,8 +221,12 @@ Audit for each of these, in both directions:
   `pihole.py` where a constructor default would make it a testable seam — but only
   flag it if a test is actually patching around it. Injection with no second
   implementation is ceremony; do not demand it.
-- Conversely: a `Protocol` or factory indirection with exactly one implementation
-  and no fake in the tests. That is over-engineering; say so.
+- Conversely: a `Protocol` or factory indirection that earns its place for
+  neither of the two legitimate reasons — **(a)** a test double implements it, or
+  **(b)** it inverts an import that rule 2 forbids. `PiholeFacts` in
+  `src/pihole_state.py` qualifies on both counts (`FactsStub` implements it, and
+  it keeps `import pihole` out of the pure core), so do **not** flag it. One
+  implementation, no fake, and no import to break is over-engineering; say so.
 
 **Python conventions (PEP 8 / PEP 257)**
 - Any import inside a function or class body (`PLC0415`), or any module-level
