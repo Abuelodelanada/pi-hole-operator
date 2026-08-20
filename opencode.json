@@ -3,7 +3,6 @@
   "model": "openrouter/anthropic/claude-opus-5",
   "small_model": "openrouter/anthropic/claude-sonnet-5",
   "default_agent": "charm-architect",
-  "instructions": ["AGENTS.md"],
   "references": {
     "snap-pi-hole": {
       "repository": "rajannpatel/snap-pi-hole",

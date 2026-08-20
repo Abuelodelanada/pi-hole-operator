@@ -211,6 +211,13 @@ Output formats: `pretty` (default), `concise` (greppable, one line per finding),
 `json`. **No SARIF.** `--explain-gaps` lists writes it saw but could not trace —
 advisory, never fails.
 
+**`ruff format` at py314 can silence flaplint on a whole module.** Because
+flaplint parses with a Python 3.12 `ast`, and `ruff format` rewrites
+`except (A, B):` into PEP 758's unparenthesized `except A, B:`, which that parser
+cannot read — so it **skips the module without saying so**, and a clean run means
+nothing. Give every multi-type `except` an `as err:` binding, which keeps the
+parentheses and keeps the module visible.
+
 ### Reading a finding
 
 There are **no rule codes** like `FL001` and no `rules/` directory. A finding is

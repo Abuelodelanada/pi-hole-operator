@@ -5,6 +5,19 @@ containers via the `pihole-by-rajannpatel` snap.
 
 This is not a Kubernetes charm. There is no Pebble, no `lightkube`, no OCI image.
 
+## Where we are
+
+**Stage 1 is on disk; Stage 2 has not started.** So the charm installs the snap,
+frees port 53, starts FTL, restores the host resolver on removal, and owns the
+admin password. `docs/roadmap.md` defines the stages and is the source of truth —
+check it before treating a missing feature as a defect rather than as unstarted
+work.
+
+The public interface today is two actions, `get-admin-password` and
+`rotate-admin-password`, and **nothing else**: zero config options, zero
+relations. That is the state rules 4 and 5 exist to defend, so adding the first
+config option or the first `requires` is a decision, not a detail.
+
 ## Non-negotiables
 
 Only rule 3 is machine-checked. **A green `tox -e lint,static,unit` is not
@@ -89,8 +102,14 @@ tox -e lint       # ruff check
 tox -e static     # pyright
 tox -e unit       # pytest tests/unit, coverage fail_under = 90
 tox -e integration  # pytest tests/integration (needs a juju machine model)
+tox -e lock       # regenerate uv.lock after changing pyproject.toml
 tox -e flaplint   # advisory: relation-databag ordering churn. Not in envlist.
 ```
+
+**A change is not done until `fmt`, `lint`, `static` and `unit` are green.** That
+is the floor, not the finish line — reread the non-negotiables above, because none
+of those four gates can see rules 1, 2, 4, 5, 6, 7 or 8. Run `flaplint` as well
+when the change touches a databag write, a file write, or a hash.
 
 `uv.lock` is committed. Dependencies go in `pyproject.toml`, never in
 `charmcraft.yaml`'s `charm-libs` — that key is only for Charmhub-hosted libraries,
@@ -103,7 +122,7 @@ Present today:
 
 ```
 charmcraft.yaml           # base: ubuntu@26.04, platforms: {amd64:, arm64:}
-pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, + dev extras
+pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, pydantic, tenacity
 uv.lock
 tox.ini
 docs/
@@ -126,15 +145,15 @@ and `PiholeOutcome` unions, `fetch`, and `compute`. It imports neither `ops` nor
 anything that touches the machine — it reaches the workload only through the
 `PiholeFacts` protocol, which is what keeps that import out. See rule 2.
 
-Arrives with later stages, so do not expect it on disk yet:
+**`src/` is on `PYTHONPATH`, so imports are flat.** `tox.ini` sets
+`PYTHONPATH={tox_root}/lib:{tox_root}/src`, which is what Juju's charm venv also
+does. So it is `import pihole` and `import charm`, never `from src.pihole import
+...` — the latter works nowhere, in the charm or in the tests.
 
-```
-lib/charms/grafana_agent/ # vendored, third-party. Never edited, never linted.
-src/
-  grafana_dashboards/     # COSAgentProvider defaults
-  prometheus_alert_rules/
-  loki_alert_rules/
-```
+Arriving with later stages, so do not expect them on disk yet:
+`lib/charms/grafana_agent/` (vendored, never edited, never linted) and
+`src/grafana_dashboards/`, `src/prometheus_alert_rules/`, `src/loki_alert_rules/`
+(COSAgentProvider defaults).
 
 ## Python conventions
 
@@ -147,18 +166,23 @@ Machine-checked:
 - **PEP 8 with the 99-character exception**, which PEP 8 grants explicitly —
   *provided comments and docstrings stay wrapped at 72*. That proviso is the
   condition, not a suggestion: `E501` and `W505` are both enabled.
-- Type annotations everywhere; `pyright` in strict-ish mode must pass. They also
-  let `flaplint` resolve cross-object calls, so they buy correctness twice.
-- No `from x import *` (`F403`/`F405`). No bare `except:` (`E722`).
+- Type annotations everywhere; `pyright` runs `typeCheckingMode = "strict"` over
+  **both `src` and `tests`**, so a test helper needs the same annotations as
+  production code. They also let `flaplint` resolve cross-object calls, so they buy
+  correctness twice.
+- Ruff's `select` is `E W F I N UP B C4 SIM RUF ANN D PLC0415`. Two consequences
+  worth knowing before you write: **`ANN` makes annotations a lint error, and `D`
+  does the same for docstrings** — neither is merely a house preference. No
+  `from x import *` (`F403`/`F405`). No bare `except:` (`E722`).
 - Python **3.14**, which is what `ubuntu@26.04` ships — and the *only* interpreter
   in that base's archive, so there is no fallback. The charm never runs on anything
   else, so `requires-python = ">=3.14"`, `ruff target-version = "py314"` and
   `pyright pythonVersion = "3.14"`. Do not write code that merely tolerates older
-  interpreters. See `docs/adr/0002-tech-stack-and-repo-architecture.md`.
-- **Note on `ruff format` at py314:** it rewrites `except (A, B):` into PEP 758's
-  unparenthesized form, which `flaplint`'s Python 3.12 parser cannot read — and it
-  then **skips the whole module silently**. Give multi-type `except` clauses an
-  `as err:` binding, which keeps the parentheses.
+  interpreters. See `docs/adr/0002-tech-stack-and-repo-architecture.md`. One
+  consequence bites silently: `ruff format` rewrites `except (A, B):` into PEP
+  758's unparenthesized form, which makes `flaplint` skip the module without
+  saying so. Give multi-type `except` clauses an `as err:` binding — see
+  `python-style`.
 
 Not machine-checked — the reviewer's job:
 
@@ -176,7 +200,11 @@ Not machine-checked — the reviewer's job:
   one is judgement.
 - Tests use `# GIVEN / # WHEN / # THEN` comments and live in `conftest.py`-backed
   fixtures rather than per-file setup boilerplate.
-
+- **`# databag-order: ignore` suppresses one `flaplint` finding on one line.** It
+  is legitimate only where the nondeterminism is the point and cannot flap: the two
+  uses in `src/charm.py` are on `_store_password`, where the value is a fresh random
+  token written exactly once. A suppression on a line that runs on every reconcile
+  is a defect being silenced — fix the ordering instead.
 
 ## Ecosystem facts that bite (2026)
 
@@ -194,21 +222,13 @@ Not machine-checked — the reviewer's job:
 
 Three agents, three jobs. Design decisions go to `charm-architect`,
 implementation to `charm-engineer`, and audits to `charm-reviewer` (read-only).
+Research delegates to `explore` (this repo) and `general` (the upstream
+`references`), both on a cheaper model.
 
-Load the relevant skill instead of guessing — they carry verified, sourced
-detail that changes faster than this file:
-
-| Skill | Use for |
-|---|---|
-| `python-style` | PEP 8 / PEP 257, ruff rule families, `flaplint` |
-| `charm-functional-style` | Outcome ADTs, functional core / imperative shell, what not to copy from `fp-edge-canonical` |
-| `pihole-snap` | Anything touching the snap: services, plugs, `snap set` limits, ports, paths, commands |
-| `machine-charm-scaffold` | `charmcraft.yaml`, `pyproject.toml`, `tox.ini`, repo layout |
-| `machine-charm-workload` | `charmlibs` snap/systemd/apt usage, workload module design |
-| `charm-relations` | Adding or reviewing a relation; which library owns which interface |
-| `charm-testing` | Unit tests with `ops.testing`, integration with `jubilant` on LXD |
-| `charm-cos-integration` | `cos-agent`, `COSAgentProvider`, alert rules, dashboards |
-| `new-adr` | Writing or revising anything under `docs/adr/`; deciding whether a decision belongs in an ADR, the roadmap, or the backlog |
+**Load the relevant skill instead of guessing.** Their names and trigger
+conditions are already in your system prompt, so this file does not restate them.
+They carry verified, sourced, dated detail — so where a skill and this file
+disagree, the skill is newer and wins, and this file is the thing to fix.
 
 Decisions live in `docs/adr/`, numbered and dated. `src/charm.py` cites them by
 number in comments, so an ADR is not optional documentation — it is where the
