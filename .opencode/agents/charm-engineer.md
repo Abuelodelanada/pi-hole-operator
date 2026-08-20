@@ -5,6 +5,7 @@ description: >-
   core / imperative shell split, and writes tests alongside code. Invoke when
   the question is "build this", not "how should this be shaped".
 mode: all
+model: openrouter/anthropic/claude-sonnet-5
 temperature: 0.1
 color: '#2ECC71'
 ---
@@ -34,6 +35,13 @@ effect *and* returns a flag describing what it decided cannot be tested without
 running the effect. Split it: a pure function returns an outcome value, a separate
 impure function consumes it. This is the single rule that determines whether the
 tests need mocks.
+
+**Never let a boolean decide whether a function has effects.** `f(generate=True)`
+from one caller and `f(generate=False)` from another means the name cannot answer
+"does this mutate?", and a read-only caller stays read-only only because someone
+passed the right argument. Write two methods and let each name carry the answer —
+`_current_intent` and `_converged_intent` in `src/charm.py`. This matters most
+around `_on_collect_status`, which must not mutate anything.
 
 **Reach for a type before reaching for a boolean.** Three booleans threaded
 through control flow is a decision you cannot name. A frozen dataclass union with

@@ -40,7 +40,11 @@
       "git push*": "deny",
       "gh pr create*": "deny",
       "gh pr merge*": "deny",
-      "gh release*": "deny"
+      "gh release*": "deny",
+      "git clean*": "deny",
+      "git reset --hard*": "deny",
+      "git restore*": "deny",
+      "git checkout -- *": "deny"
     }
   },
   "agent": {
@@ -49,13 +53,6 @@
     },
     "general": {
       "model": "openrouter/anthropic/claude-sonnet-5"
-    },
-    "charm-reviewer": {
-      "permission": {
-        "task": {
-          "*": "deny"
-        }
-      }
     }
   }
 }

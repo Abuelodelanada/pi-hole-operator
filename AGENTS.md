@@ -63,7 +63,13 @@ are audited by `charm-reviewer`. Do not treat a passing gate as a review.
    effect *and* returns a flag describing what it decided cannot be tested without
    running the effect. Pure functions compute an outcome value; impure functions
    consume it. The detection signal is cheap: **if a test needs a mock to reach a
-   decision, this rule was broken.** See `charm-functional-style`.
+   decision, this rule was broken.** The inverse shape counts too: a boolean
+   parameter that decides *whether* the function has effects — `f(generate=True)`
+   from one caller, `f(generate=False)` from another — leaves the name unable to
+   answer "does this mutate?", and puts the guarantee in an argument instead of in
+   the type system. Split it into two named methods and let each name carry the
+   answer; `_current_intent` and `_converged_intent` in `src/charm.py` are the
+   worked example. See `charm-functional-style`.
 8. **Inheritance only where a framework demands it.** `ops.CharmBase` is the one
    mandatory subclass; charm libraries are instantiated, never extended.
    Everything else is composition — but note the verified constraint:

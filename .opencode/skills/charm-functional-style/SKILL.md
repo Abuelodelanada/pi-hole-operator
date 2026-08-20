@@ -289,13 +289,59 @@ copy — **our own functions take the narrowest thing they need**, never
 
 **Where injection is not worth it.** This is a process that runs once per hook and
 exits. A constructor with eight collaborators and a factory to assemble them is
-ceremony with no payoff. A `Protocol` earns its place when you need two
-implementations (a real one and a fake), not merely when you want testability —
-for that, replacing a module attribute is enough. The fp-edge slides say as much
-about their own `ConfigActions`: *"You don't have to use abstract interfaces like
-this. But phrasing your 'atomic' actions helps with design."*
+ceremony with no payoff. A `Protocol` earns its place for one of two reasons:
+**(a)** a second implementation exists — a real one and a fake, as with
+`PiholeFacts`, implemented by `Pihole` and by `FactsStub` in the tests; or
+**(b)** it inverts an import the layering forbids — that same `PiholeFacts` is
+what lets `pihole_state.py` describe the reads it needs without `import pihole`
+pulling `charmlibs.snap` into the pure core. Wanting testability alone is not a
+reason: for that, replacing a module attribute is enough. The fp-edge slides say
+as much about their own `ConfigActions`: *"You don't have to use abstract
+interfaces like this. But phrasing your 'atomic' actions helps with design."*
 
 Rule of thumb: **inject the effect boundary, not every collaborator.**
+
+## Pattern 8 — A boolean must not gate whether a function has effects
+
+Pattern 2 removes booleans that carry a *decision*. This one removes the boolean
+that carries *permission to mutate*. The shape looks harmless:
+
+```python
+# Don't. The name cannot answer "does this mutate?"
+def _intent(self, *, generate: bool) -> PiholeIntent | None:
+    password = self._read_password()
+    if password is None and generate and self.unit.is_leader():
+        password = secrets.token_urlsafe(24)
+        self._store_password(password)   # a write, reachable only via the flag
+    ...
+```
+
+Two callers pass different values: the reconciler wants the write, the status
+handler must not have it. So whether `collect_unit_status` stays side-effect-free
+depends on an argument at a call site, not on anything the type checker can see.
+One wrong `True` in a future refactor makes a status handler mutate state, and no
+gate catches it.
+
+Split it so each name is the answer:
+
+```python
+def _current_intent(self) -> PiholeIntent | None:
+    """The declared desired state as it stands now, reading only."""
+    return self._intent_from(self._read_password())
+
+
+def _converged_intent(self) -> PiholeIntent | None:
+    """The declared desired state to converge toward, minting if needed."""
+    return self._intent_from(self._obtain_password())
+```
+
+Now `_on_collect_status` calls `_current_intent()` and there is no argument that
+could make it write. The reachability of the effect moved from a runtime value
+into the call graph, where reading the code answers the question.
+
+Not every boolean parameter is this defect. `check: bool` passed straight through
+to `subprocess.run` is fine — it configures an effect that happens either way. The
+test is whether flipping the flag changes *whether* the function mutates anything.
 
 ## What we deliberately do not adopt
 
