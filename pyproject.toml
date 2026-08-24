@@ -68,6 +68,11 @@ typeCheckingMode = "strict"
 [tool.pytest.ini_options]
 minversion = "8.0"
 log_cli_level = "INFO"
+# The integration tests import shared constants from their conftest
+# (`from tests.integration.conftest import ...`), which needs the repo
+# root importable. There are no `__init__.py` files under tests/, so
+# without this the import fails on every machine.
+pythonpath = ["."]
 # ops runs its own unit tests this way: a deprecation warning should fail the
 # build while it is still a warning, not after it becomes a breakage.
 filterwarnings = ["error"]
