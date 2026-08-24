@@ -1,0 +1,22 @@
+# Everything matched here is excluded from the packed charm.
+/venv
+/.venv
+/.tox
+/.git
+/.github
+/.opencode
+/docs
+/tests
+*.charm
+*.py[cod]
+__pycache__
+.coverage
+.coverage.*
+.pytest_cache
+.ruff_cache
+AGENTS.md
+CONTRIBUTING.md
+# Upstream bug reports, written up for the snap's maintainer. They belong
+# in the repository and never in the packed charm.
+snap-issue-*.md
+opencode.json

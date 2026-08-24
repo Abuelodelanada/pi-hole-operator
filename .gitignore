@@ -1,0 +1,20 @@
+# Build artifacts
+*.charm
+
+# Environments and caches
+/.venv
+/venv
+/.tox
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+*swp
+.tox
+
+# Terraform
+**/.terraform/*
+**/.terraform.lock.hcl
