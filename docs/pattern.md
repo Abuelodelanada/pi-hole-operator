@@ -19,14 +19,14 @@ the design.
    Every hook starts with nothing and has to work out what to do by looking at
    the workload.
 2. **You cannot assume order, and you are not shown every change.** The Juju hook
-   reference is direct about it: *"Generally, no assumptions can be made about the
-   order of hook execution."* A leader has no stronger guarantee — *"Juju doesn't
-   guarantee that a leader will see every event"*, because if a unit is busy long
-   enough for its 30-second lease to expire, the events that fired meanwhile land
-   on a unit that is not leader yet, or not leader any more. And Juju coalesces on
-   purpose: when remote units leave a relation, the agent runs *"the fewest
-   possible hooks"*. So code that only runs on one specific event is code whose
-   work sometimes does not happen.
+   reference is direct: *"Generally, no assumptions can be made about the order of
+   hook execution."* A leader gets no stronger guarantee. *"Juju doesn't guarantee
+   that a leader will see every event"* — a unit that stays busy for more than 30
+   seconds loses its lease, and whatever fired meanwhile lands on a unit that is
+   not leader yet, or not leader any more. Juju also coalesces on purpose: when
+   remote units leave a relation, the agent runs *"the fewest possible hooks"*. So
+   code that runs on one specific event is code whose work sometimes never
+   happens.
 3. **A hook can be aborted and run again from scratch.** Same source: if the unit
    agent is killed mid-hook, Juju *"will treat that hook as having failed"*, and
    *"users could (and probably will) attempt to re-execute failed hooks"*. Whatever
@@ -64,6 +64,24 @@ The charm is split in two parts, and the split is the main idea.
 - The other part **reads and writes the workload**. It contains no decisions at
   all. It only translates: the workload into values on the way in, and values into
   effects on the way out.
+
+Read "the workload" broadly there. Sometimes a charm also has to change the
+*machine* to make room for the workload, and that belongs in the same outer half.
+This charm has an example: Pi-hole needs port 53, and on Ubuntu that port is held
+by `systemd-resolved`, so `src/resolved.py` writes a drop-in and restarts that
+service. It never touches Pi-hole at all.
+
+The deciding half does not know the difference, and that is the point. The fact
+arrives as a plain `stub_listener_disabled: bool` on the state. `compute` returns a
+`ReleasePort53()` outcome when it is `False`. Only `_apply` knows that this means a
+systemd drop-in and not a snap command. Naming an outcome after *what* it achieves,
+rather than *how*, is what keeps that knowledge out of the core.
+
+**Undoing this kind of change does not belong in the reconciler.** Giving the port
+back is not a step toward a working Pi-hole. It is what you do when there will not
+be one. So `resolved.restore()` is called from the `remove` handler, not from
+`_apply`. That is the same reason lifecycle-end events get their own handler at
+all.
 
 The part that decides is small and easy to test, because a test only has to build
 values and check the values that come back. The part that touches the workload is
@@ -148,8 +166,8 @@ def _reconcile(self, _: ops.EventBase) -> None:
 ```
 
 `Intent` and the two functions are the ones defined in the example in the next
-section. Notice where each side comes from: the intent is built from Juju — config,
-relations, secrets — and the state from the workload. Neither is built from the
+section. Notice where each side comes from: the intent is built from Juju (config,
+relations, secrets) and the state from the workload. Neither is built from the
 other.
 
 That is the shape, not a copy of this charm's code. A real reconciler adds two
@@ -234,6 +252,10 @@ It lives in three files, and the split between them is the design:
 | `src/prometheus_state.py` | `Intent`, `State`, `Outcome`, the `Facts` protocol, `fetch`, `compute` | `ops`, and the workload file |
 | `src/prometheus.py` | the class that implements `Facts` and performs the effects | `ops` |
 | `src/charm.py` | `_reconcile`, `_apply`, status reporting | `subprocess`, and anything that writes a file |
+
+A charm that also has to change the machine to make room for its workload gets one
+more file in the outer half, one per subsystem it touches — this repo has
+`src/resolved.py` for `systemd-resolved`. Same rule: it never imports `ops`.
 
 The "never imports" column is the part that matters, and it is mechanically
 checkable: grep the import block. `prometheus_state.py` importing the workload is
