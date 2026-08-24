@@ -29,10 +29,11 @@ are audited by `charm-reviewer`. Do not treat a passing gate as a review.
    Every reconcile step must be safe to run twice and safe to never run.
    The test for "deserves its own handler" is objective, from the ops docs:
    *an event that cannot be deferred needs a dedicated handler.* That set is
-   exactly: actions, `stop`, `remove`, `secret_rotate`, `secret_expired`, and the
-   `collect_*_status` lifecycle events. Everything deferrable — including
-   `config_changed`, `upgrade_charm`, `secret_changed`, `leader_elected`, and every
-   relation event — goes through `_reconcile`. The one allowed exception is
+   exactly: actions, `stop`, `remove`, `secret_rotate`, `secret_remove`,
+   `secret_expired`, and the `collect_*_status` lifecycle events. Everything
+   deferrable — including `config_changed`, `upgrade_charm`, `secret_changed`,
+   `leader_elected`, storage events, Pebble events, and every relation event —
+   goes through `_reconcile`. The one allowed exception is
    `upgrade_charm` *if* it needs migration logic distinct from convergence.
 2. **Charm logic and workload logic are separate modules.** `src/charm.py` only
    observes events, maps config to arguments, and reports status. All snap/systemd/
@@ -81,7 +82,7 @@ are audited by `charm-reviewer`. Do not treat a passing gate as a review.
    from one caller, `f(generate=False)` from another — leaves the name unable to
    answer "does this mutate?", and puts the guarantee in an argument instead of in
    the type system. Split it into two named methods and let each name carry the
-   answer; `_current_intent` and `_converged_intent` in `src/charm.py` are the
+   answer; `_read_intent` and `_ensure_intent` in `src/charm.py` are the
    worked example. See `charm-functional-style`.
 8. **Inheritance only where a framework demands it.** `ops.CharmBase` is the one
    mandatory subclass; charm libraries are instantiated, never extended.
@@ -126,7 +127,9 @@ pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, pydantic, te
 uv.lock
 tox.ini
 docs/
+  pattern.md              # how the charm decides what to do, taught with a small example
   adr/                    # numbered decision records. Load `new-adr` before adding one.
+  implementation/         # how an existing module works. One file per module, as it lands.
   roadmap.md              # staged delivery plan
   snap-constraints.md     # what the snap cannot do, and the workarounds
   BACKLOG.md
@@ -200,6 +203,13 @@ Not machine-checked — the reviewer's job:
   one is judgement.
 - Tests use `# GIVEN / # WHEN / # THEN` comments and live in `conftest.py`-backed
   fixtures rather than per-file setup boilerplate.
+- **Docstrings say what; ADRs say why.** `D` is enforced, so the floor is one
+  imperative line plus `Raises:` where the caller must handle it — but design
+  rationale belongs in `docs/adr/`. Cite it (`See ADR-0005 section 2.9`) instead of
+  paraphrasing it: a docstring that restates an ADR goes stale and then wins by
+  proximity. Keep a rationale inline only where a reader would otherwise plausibly
+  "fix" the code, and then as one sentence. A comment explains why *this line*, at
+  the line, in two lines or fewer.
 - **`# databag-order: ignore` suppresses one `flaplint` finding on one line.** It
   is legitimate only where the nondeterminism is the point and cannot flap: the two
   uses in `src/charm.py` are on `_store_password`, where the value is a fresh random

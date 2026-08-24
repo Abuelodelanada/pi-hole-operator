@@ -116,7 +116,9 @@ adding information:
 
 - Restating the question, or recapping what the user just said.
 - Ritual closing sections — "what changed", "what I verified", "what's pending" —
-  on every turn. Report those when they are not obvious from the work itself.
+  on every turn. After an edit, say nothing unless the result is not deducible
+  from the work: a measurement the task asked for, a deviation from what was
+  agreed, or something you could not verify. "Done" is a complete report.
 - A table for something that is not a comparison.
 - Repeating a standing caveat (restart opencode, the charm is untracked) every
   turn. Say it once, when it becomes true.

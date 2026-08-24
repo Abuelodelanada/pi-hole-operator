@@ -1,0 +1,88 @@
+[project]
+name = "pihole-operator"
+version = "0.1.0"
+description = "Juju machine charm for Pi-hole v6 on Ubuntu."
+requires-python = ">=3.14"
+
+# Dependencies of the charm code in src/. Charmhub-hosted libraries do NOT go
+# here — they go in charmcraft.yaml's charm-libs, and their transitive PYDEPS
+# have to be added here by hand. See ADR-0002 section 2.5.
+dependencies = [
+    "ops~=3.8",
+    "charmlibs-snap",
+    "charmlibs-systemd",
+    "pydantic>=2,<3",
+    "tenacity",
+]
+
+[dependency-groups]
+dev = [
+    "ops[testing]",
+    "pytest",
+    "pytest-cov",
+    "coverage[toml]",
+    "jubilant>=1.12,<2",
+    "pytest-jubilant>=2.2,<3",
+    "ruff",
+    "pyright",
+]
+
+[tool.ruff]
+line-length = 99
+target-version = "py314"
+extend-exclude = ["lib", "__pycache__", "*.egg_info"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ANN", "D", "PLC0415"]
+# E501 is deliberately NOT ignored: PEP 8 permits 99 characters only on the
+# condition that comments and docstrings stay at 72, so both limits are
+# enforced or neither is.
+# PLC0415 is what actually enforces "no imports inside functions" — E402 only
+# catches late module-level imports and lets `def f(): import x` through.
+ignore = [
+    "D105", # Magic methods do not need a docstring.
+    "D107", # __init__ is documented by its class docstring.
+    "D203", # Incompatible with D211, which we keep.
+    "D213", # Incompatible with D212, which we keep.
+]
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 72 # Enables W505, the PEP 8 proviso for comments/docstrings.
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# A test is documented by its name plus its GIVEN/WHEN/THEN comments; a
+# docstring on top of those is duplication. Annotations on fixtures and
+# helpers are still required, only the test bodies are exempt.
+"tests/*" = ["ANN201", "D103"]
+
+[tool.pyright]
+include = ["src", "tests"]
+exclude = ["lib"]
+pythonVersion = "3.14"
+pythonPlatform = "Linux"
+typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+log_cli_level = "INFO"
+# ops runs its own unit tests this way: a deprecation warning should fail the
+# build while it is still a warning, not after it becomes a breakage.
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+
+[tool.coverage.report]
+exclude_also = [
+    # Unreachable by construction. Every `match` over a closed union ends
+    # in this branch, and `tox -e static` already fails if a variant is
+    # unhandled — so pyright, not a test, is what proves it cannot run.
+    # Counting these as misses only hides the gaps that are real.
+    "case _ as unreachable:",
+]
+fail_under = 90
+show_missing = true

@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-08-07
-**Related:** [ADR-0003: Reconciler and Functional Core](0003-reconciler-and-functional-core.md), [ADR-0005: Status Semantics and Failure Handling](0005-status-semantics-and-failure-handling.md), [ADR-0006: Configuration Surface](0006-configuration-surface.md), [ADR-0007: Admin Password Handling](0007-admin-password-handling.md), [snap constraints §4](../snap-constraints.md)
+**Related:** [ADR-0003: Reconciler and Functional Core](0003-reconciler-and-functional-core.md), [ADR-0005: Status Semantics and Failure Handling](0005-status-semantics-and-failure-handling.md), [ADR-0006: Configuration Surface](0006-configuration-surface.md), [ADR-0007: Admin Password Handling](0007-admin-password-handling.md), [ADR-0009: Split the FTL API client out of `Pihole`](0009-ftl-api-client-module.md), [snap constraints §4](../snap-constraints.md)
 
 ---
 
@@ -155,9 +155,10 @@ such key exists today.
 
 ### 5.1 The client
 
-`pihole.py` owns a small HTTP client using stdlib `urllib.request` — no new
+`ftl_api.py` owns a small HTTP client using stdlib `urllib.request` — no new
 dependency. It talks to `http://127.0.0.1:<webserver-port>/api/`, and the charm
-knows the port because it sets it (§4).
+knows the port because it sets it (§4). (This client lived in `pihole.py` when
+this ADR was written; ADR-0009 moved it.)
 
 *(The `pihole api` wrapper discovers the URL by querying a CHAOS TXT record,
 `dig +short -p <dns.port> chaos txt local.api.ftl @127.0.0.1`. That is a more

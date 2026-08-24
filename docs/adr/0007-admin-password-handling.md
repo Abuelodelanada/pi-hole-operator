@@ -5,7 +5,7 @@
 **Accepted:** 2026-08-08
 **Amended:** 2026-08-08 — §4.3's oracle table listed only `200` and `401`; the missing rows let an implementation misread `429` as a wrong password.
 **Amended:** 2026-08-11 — §4.3 gained the settle window: `setpassword` reports success ~1s before FTL validates against the hash it just wrote, so a single `401` is not a verdict ([snap-constraints §7.2.5](../snap-constraints.md)).
-**Related:** [ADR-0004: FTL Configuration Mechanism](0004-ftl-configuration-mechanism.md), [ADR-0005: Status Semantics and Failure Handling](0005-status-semantics-and-failure-handling.md), [ADR-0006: Configuration Surface](0006-configuration-surface.md), [snap constraints §5.2](../snap-constraints.md)
+**Related:** [ADR-0004: FTL Configuration Mechanism](0004-ftl-configuration-mechanism.md), [ADR-0005: Status Semantics and Failure Handling](0005-status-semantics-and-failure-handling.md), [ADR-0006: Configuration Surface](0006-configuration-surface.md), [ADR-0009: Split the FTL API client out of `Pihole`](0009-ftl-api-client-module.md), [snap constraints §5.2](../snap-constraints.md)
 
 ---
 

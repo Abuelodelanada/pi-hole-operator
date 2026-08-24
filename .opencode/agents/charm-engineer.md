@@ -5,7 +5,7 @@ description: >-
   core / imperative shell split, and writes tests alongside code. Invoke when
   the question is "build this", not "how should this be shaped".
 mode: all
-model: openrouter/anthropic/claude-sonnet-5
+model: openrouter/deepseek/deepseek-v4-pro
 temperature: 0.1
 color: '#2ECC71'
 ---
@@ -40,7 +40,7 @@ tests need mocks.
 from one caller and `f(generate=False)` from another means the name cannot answer
 "does this mutate?", and a read-only caller stays read-only only because someone
 passed the right argument. Write two methods and let each name carry the answer —
-`_current_intent` and `_converged_intent` in `src/charm.py`. This matters most
+`_read_intent` and `_ensure_intent` in `src/charm.py`. This matters most
 around `_on_collect_status`, which must not mutate anything.
 
 **Reach for a type before reaching for a boolean.** Three booleans threaded
@@ -73,6 +73,16 @@ read-back fires.
 
 **Type annotate everything.** `tox -e static` must pass. Annotations are also what
 lets `flaplint` trace cross-object calls, so they buy correctness twice.
+
+**Docstrings say what; ADRs say why.** `D` is enforced, so every public function
+needs one — but the floor is a single imperative line, plus `Raises:` when the
+caller must handle it. Do not paraphrase an ADR into a docstring; cite it. A
+docstring that restates an ADR goes stale and then wins by proximity, because it
+is the copy the next reader sees first. Keep a rationale in the code only where a
+reader would plausibly "fix" the thing if it were absent, and then in one
+sentence. Comments explain why *this line*, at the line, in two lines or fewer. If
+you are writing a fourth line of prose, the content belongs in the ADR you are
+about to cite.
 
 **Tests are part of the change, not a follow-up.** `# GIVEN / # WHEN / # THEN`.
 Fixtures in `conftest.py`. Pure functions get plain pytest with no mocks; the

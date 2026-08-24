@@ -77,7 +77,7 @@ Work through these in order. For each finding, cite `file_path:line_number`.
 - Is there exactly one `_reconcile`? Apply the objective test: **an event that
   cannot be deferred deserves its own handler; everything else belongs in
   `_reconcile`.** Non-deferrable: actions, `stop`, `remove`, `secret_rotate`,
-  `secret_expired`, `collect_*_status`. So a dedicated handler for
+  `secret_remove`, `secret_expired`, `collect_*_status`. So a dedicated handler for
   `config_changed`, `secret_changed`, `leader_elected`, or any relation event is a
   finding. `upgrade_charm` may have its own handler only if it does migration work
   distinct from convergence — say so if it does not.
@@ -212,8 +212,8 @@ the `ops` definition is just an opinion. The triggers:
   function called both ways — `f(generate=True)` from `_reconcile` and
   `f(generate=False)` from `_on_collect_status` — where the name can no longer
   answer "does this mutate?" and the guarantee lives in an argument. The fix is
-  two methods whose names carry the answer; `_current_intent` (reads only) and
-  `_converged_intent` (may mint a secret) in `src/charm.py` are the worked
+  two methods whose names carry the answer; `_read_intent` (reads only) and
+  `_ensure_intent` (may mint a secret) in `src/charm.py` are the worked
   example, so do not flag those. Report it as Should fix normally, and
   **Blocking when one of the callers is `_on_collect_status`** — that handler must
   not mutate, and a correctly-passed bool is the only thing enforcing it.
@@ -221,7 +221,13 @@ the `ops` definition is just an opinion. The triggers:
   that should be a union with an exhaustive `match`?
 - Any `match` over a `type X = A | B` union missing `case _ as unreachable:
   assert_never(unreachable)`? Without it, adding a variant fails silently at
-  runtime instead of loudly in `tox -e static`.
+  runtime instead of loudly in `tox -e static`. **Where the first pattern refines a
+  variant rather than matching it whole** — `case SnapPresent(version=str() as
+  version)` — a bare `assert_never` is a *type error*, because the leftover is
+  still reachable. The fix is to enumerate the ignored variants explicitly
+  (`case SnapAbsent() | SnapPresent(): pass`) so the final branch narrows to
+  `Never`. `_report_version` in `src/charm.py` is the worked example. A `case _:
+  pass` in that position is the finding: it swallows a variant added later.
 - Any `dict`, `list`, or `set` in a function signature or a frozen dataclass
   field where `Mapping`, `Sequence`, or `FrozenSet` belongs?
 - Any mutation of a value that was passed in? Prefer a modified copy.

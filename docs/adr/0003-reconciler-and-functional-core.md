@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-08-07
 **Accepted:** 2026-08-08
-**Related:** [ADR-0002: Tech Stack and Repository Architecture](0002-tech-stack-and-repo-architecture.md), [ADR-0004: FTL Configuration Mechanism](0004-ftl-configuration-mechanism.md), [ADR-0005: Status Semantics and Failure Handling](0005-status-semantics-and-failure-handling.md)
+**Related:** [ADR-0002: Tech Stack and Repository Architecture](0002-tech-stack-and-repo-architecture.md), [ADR-0004: FTL Configuration Mechanism](0004-ftl-configuration-mechanism.md), [ADR-0005: Status Semantics and Failure Handling](0005-status-semantics-and-failure-handling.md), [ADR-0009: Split the FTL API client out of `Pihole`](0009-ftl-api-client-module.md)
 
 ---
 

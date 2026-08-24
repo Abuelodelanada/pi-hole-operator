@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-08-07
 **Accepted:** 2026-08-08
-**Related:** [ADR-0001: Charm Scope and Specification](0001-charm-scope-and-specification.md), [ADR-0003: Reconciler and Functional Core](0003-reconciler-and-functional-core.md)
+**Related:** [ADR-0001: Charm Scope and Specification](0001-charm-scope-and-specification.md), [ADR-0003: Reconciler and Functional Core](0003-reconciler-and-functional-core.md), [ADR-0009: Split the FTL API client out of `Pihole`](0009-ftl-api-client-module.md)
 
 ---
 
@@ -271,28 +271,31 @@ docs/                    # ADRs, roadmap, snap-constraints, backlog
 lib/charms/grafana_agent/ # vendored third-party. Never edited, never linted.
 src/
   charm.py               # ops only: observe -> _reconcile -> collect_unit_status
-  pihole.py              # snap/systemd/filesystem. Never imports ops.
-  pihole_config.py       # pydantic models, charm config -> FTL key mapping. Pure.
+  pihole.py              # snapd + $SNAP_DATA reads. Never imports ops.
+  ftl_api.py             # FTL's HTTP API and its sessions. Never imports ops.
   pihole_state.py        # frozen snapshot + outcome ADT + pure compute(). No IO.
   resolved.py            # systemd-resolved drop-in. Never imports ops.
   grafana_dashboards/
   prometheus_alert_rules/
   loki_alert_rules/
 tests/
-  unit/{conftest.py,test_charm.py,test_pihole.py,test_pihole_config.py,test_pihole_state.py}
+  unit/{conftest.py,test_charm.py,test_pihole.py,test_ftl_api.py,test_pihole_state.py,test_resolved.py}
   integration/{conftest.py,test_deploy.py}
 ```
 
-The `charm.py` / `pihole.py` split is mandatory and comes from the official
-machine-charm guidance. Rules:
+The split of charm logic from workload logic is mandatory and comes from the
+official machine-charm guidance. Rules:
 
-- **`pihole.py`** never imports `ops`; owns every call to `snap`, `systemd`,
-  `subprocess`, and every filesystem write; knows nothing about relations,
-  config options, or statuses.
+- **The workload modules** — `pihole.py`, `ftl_api.py` and `resolved.py` — never
+  import `ops`; between them they own every call to `snap`, `systemd`,
+  `subprocess` and `urllib`, and every filesystem write. None of them knows
+  anything about relations, config options, or statuses. `ftl_api.py` was split
+  out of `pihole.py` later; see ADR-0009 for which names live where.
 - **`charm.py`** never imports `charmlibs.*` or `subprocess` and never writes
   files; translates config into arguments and return values into statuses.
-- **`pihole_state.py`** is separate from `pihole.py` on purpose: it is the one
-  module with *zero* IO imports. See ADR-0003.
+- **`pihole_state.py`** is separate from all of them on purpose: it is the one
+  module with *zero* IO imports, and therefore the only place a name shared by two
+  workload modules can live without a cycle. See ADR-0003 and ADR-0009 section 4.
 
 **Detecting a broken boundary is cheap and objective:** a test of `charm.py` that
 patches `subprocess` or `charmlibs`, or a test of `compute()` that needs

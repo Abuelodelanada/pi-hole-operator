@@ -17,13 +17,16 @@ defines acceptance. For *why*, follow the ADR links.
 
 | Doc | Answers |
 |---|---|
+| [`pattern.md`](pattern.md) | How the charm decides what to do, taught with a small example that is not Pi-hole. |
 | [`adr/`](adr/) | Why the charm is shaped this way. Decisions, alternatives, consequences. |
 | [`snap-constraints.md`](snap-constraints.md) | What the workload actually does. Verified facts, cited by the ADRs. |
+| [`implementation/`](implementation/) | How a module that already exists works, and the edge cases it encodes. |
 | **this file** | In what order we build it, and how we know a stage is done. |
 | [`BACKLOG.md`](BACKLOG.md) | What we deliberately are not building yet, and the trigger to revisit. |
 
-`docs/implementation/` does not exist yet. It gets one document per module as
-that module lands — documenting code that exists, not code we intend to write.
+`docs/implementation/` gets one document per module as that module lands —
+documenting code that exists, not code we intend to write. Present today:
+[`pihole_state.md`](implementation/pihole_state.md).
 
 ---
 

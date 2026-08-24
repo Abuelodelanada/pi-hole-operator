@@ -325,17 +325,17 @@ gate catches it.
 Split it so each name is the answer:
 
 ```python
-def _current_intent(self) -> PiholeIntent | None:
+def _read_intent(self) -> PiholeIntent | None:
     """The declared desired state as it stands now, reading only."""
-    return self._intent_from(self._read_password())
+    return _intent_from(self._read_password())
 
 
-def _converged_intent(self) -> PiholeIntent | None:
+def _ensure_intent(self) -> PiholeIntent | None:
     """The declared desired state to converge toward, minting if needed."""
-    return self._intent_from(self._obtain_password())
+    return _intent_from(self._ensure_password())
 ```
 
-Now `_on_collect_status` calls `_current_intent()` and there is no argument that
+Now `_on_collect_status` calls `_read_intent()` and there is no argument that
 could make it write. The reachability of the effect moved from a runtime value
 into the call graph, where reading the code answers the question.
 
