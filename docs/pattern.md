@@ -18,15 +18,29 @@ the design.
 1. **A hook runs once and then exits.** No process stays alive between events.
    Every hook starts with nothing and has to work out what to do by looking at
    the workload.
-2. **You will miss events.** A unit can be down. A hook can fail. A relation can
-   change while your unit is not running. So any code that runs on one event only
-   is code that will sometimes not run at all.
-3. **Events arrive more than once.** `config-changed` fires on install, on
-   upgrade, and every time someone changes config. Code that breaks when it runs
-   twice will break.
+2. **You cannot assume order, and you are not shown every change.** The Juju hook
+   reference is direct about it: *"Generally, no assumptions can be made about the
+   order of hook execution."* A leader has no stronger guarantee — *"Juju doesn't
+   guarantee that a leader will see every event"*, because if a unit is busy long
+   enough for its 30-second lease to expire, the events that fired meanwhile land
+   on a unit that is not leader yet, or not leader any more. And Juju coalesces on
+   purpose: when remote units leave a relation, the agent runs *"the fewest
+   possible hooks"*. So code that only runs on one specific event is code whose
+   work sometimes does not happen.
+3. **A hook can be aborted and run again from scratch.** Same source: if the unit
+   agent is killed mid-hook, Juju *"will treat that hook as having failed"*, and
+   *"users could (and probably will) attempt to re-execute failed hooks"*. Whatever
+   a hook does must therefore be safe to repeat.
 4. **The workload may lie.** Package managers, service managers and command-line
    tools often return success for work they did not do. An exit code is a claim.
    It is not proof.
+
+Facts 1 to 3 are quoted from the
+[Juju hook reference](https://canonical.com/juju/docs/juju-cli/3.6/reference/hook/),
+which also states the design conclusion plainly: *"Hooks should ideally be
+idempotent, so that they can fail and be re-executed from scratch without
+trouble."* Fact 4 is about this particular workload, and is recorded with evidence
+in [`snap-constraints.md`](snap-constraints.md).
 
 Facts 2 and 3 have one answer. Do not ask "what just happened?". Ask "what is
 true now, and what should be true?". Then close the gap. Fact 4 has another
