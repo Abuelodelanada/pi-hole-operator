@@ -14,19 +14,19 @@ description: |
 
   What the charm does for you:
 
-  - Installs the snap, optionally pinned to an exact revision, and starts the
-    FTL daemon (which the snap does not start by itself).
-  - Takes port 53 away from `systemd-resolved` on deployment, and gives it back
-    on removal, so the machine is never left without a resolver.
-  - Applies upstream resolvers, blocking behaviour, and the rest of the FTL
-    configuration declaratively, verifying each value actually landed rather
-    than trusting an exit code.
-  - Sets the admin UI password from a Juju secret.
-  - Refreshes blocklists on a schedule you choose.
-  - Reports health from the Pi-hole API, not from the service manager, so
-    `active` means "answering queries".
-  - Ships logs, dashboards, and alert rules to the Canonical Observability
-    Stack over the `cos-agent` interface.
+  - Installs the snap and starts the FTL daemon, which the snap does
+    not start by itself.
+  - Takes port 53 away from `systemd-resolved` on deployment, and gives
+    it back on removal, so the machine is never left without a resolver.
+  - Corrects the webserver port the snap ships with, which requests TLS
+    the snap cannot serve — without that fix there is no admin UI and
+    no HTTP API at all.
+  - Closes the NTP server the snap opens on 123/udp by default.
+  - Generates the admin UI password itself, stores it in a Juju secret,
+    and applies it before the daemon ever serves; actions retrieve and
+    rotate it. There is no configuration option for the password.
+  - Reports health from the Pi-hole API, not from the service manager,
+    so `active` means "answering queries".
 
   A single unit is the supported shape. Two Pi-holes are two independent
   resolvers with independently drifting blocklists, not a cluster.
@@ -48,10 +48,11 @@ platforms:
   amd64:
   arm64:
 
-# Support for the ubuntu@26.04 base landed in Juju 3.6.17, so anything older
-# cannot deploy this charm at all. There is no "machine" feature to assume.
+# Support for the ubuntu@26.04 base landed in Juju 3.6.17, so anything
+# older cannot deploy this charm at all. There is no "machine" feature
+# to assume.
 assumes:
-  - juju >= 3.6
+  - juju >= 3.6.17
 
 # `additionalProperties` is set explicitly on every action: the default
 # differs between Juju 3 (true) and Juju 4 (false), so omitting it means

@@ -35,6 +35,8 @@ PORTS = (
 """What the charm serves.
 
 **Not 443**: the charm disables TLS. See ADR-0006 section 2.10.
+**Not 123/udp** either: the charm closes the NTP server the snap
+opens by default rather than advertising it.
 """
 
 ADMIN_PASSWORD_LABEL = "pihole-admin-password"
@@ -132,6 +134,8 @@ class PiholeCharm(ops.CharmBase):
                 self._pihole.install()
             case pihole_state.SetWebserverPort(value=value):
                 self._pihole.set_webserver_port(value)
+            case pihole_state.DisableNtpServer():
+                self._pihole.disable_ntp_server()
             case pihole_state.SetAdminPassword(password=password):
                 self._pihole.set_password(password)
             case pihole_state.StartFtl():

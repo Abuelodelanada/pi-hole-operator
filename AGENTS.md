@@ -7,9 +7,10 @@ This is not a Kubernetes charm. There is no Pebble, no `lightkube`, no OCI image
 
 ## Where we are
 
-**Stage 1 is on disk; Stage 2 has not started.** So the charm installs the snap,
-frees port 53, starts FTL, restores the host resolver on removal, and owns the
-admin password. `docs/roadmap.md` defines the stages and is the source of truth —
+**Stage 1 is complete and reviewed; Stage 2 has not started.** The charm
+installs the snap, frees port 53, starts FTL, closes the snap's default NTP
+server on 123/udp, restores the host resolver on removal, and owns the admin
+password. Integration tests on LXD passed against this tree. `docs/roadmap.md` defines the stages and is the source of truth —
 check it before treating a missing feature as a defect rather than as unstarted
 work.
 
@@ -123,7 +124,7 @@ Present today:
 
 ```
 charmcraft.yaml           # base: ubuntu@26.04, platforms: {amd64:, arm64:}
-pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, pydantic, tenacity
+pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, tenacity
 uv.lock
 tox.ini
 docs/
@@ -136,6 +137,7 @@ docs/
 src/
   charm.py                # PiholeCharm: observe -> _reconcile -> collect_unit_status
   pihole.py               # workload: snap install/start, config apply, readiness
+  ftl_api.py              # workload: FTL HTTP API client (ADR-0009)
   pihole_state.py         # functional core: intent, state, outcome ADT, fetch/compute
   resolved.py             # workload: systemd-resolved port 53 orchestration
 tests/

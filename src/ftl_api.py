@@ -6,9 +6,10 @@ An exit code is never evidence (rule 6): every session is verified
 against the real API state. API sessions are scarce, capped at 16
 by FTL — see snap-constraints section 7.2.4.
 
-The path constants below duplicate `pihole.py`'s rather than
-import them: `pihole.py` composes `FtlApi`, so the reverse import
-would be a cycle. See ADR-0009 section 4.
+The path constants come from `pihole_state`, the one module both
+workload files may import without a cycle: `pihole.py` composes
+`FtlApi`, so importing it back here would close a loop. See ADR-0009
+section 4.
 """
 
 import http.client
@@ -34,6 +35,7 @@ from pihole_state import (
     PasswordRejected,
     PasswordUnset,
     PasswordUnverified,
+    config_value,
 )
 
 logger = logging.getLogger(__name__)
@@ -437,15 +439,12 @@ class FtlApi:
         path = self._snap_data / PIHOLE_TOML
         try:
             with path.open("rb") as handle:
-                node: object = tomllib.load(handle)
+                document = tomllib.load(handle)
         except (OSError, tomllib.TOMLDecodeError) as err:
             logger.debug("Could not read %s: %s", path, err)
             return None
-        for segment in PWHASH_KEY.split("."):
-            if not isinstance(node, dict):
-                return None
-            node = cast("Mapping[str, object]", node).get(segment)
-        return node if isinstance(node, str) else None
+        value = config_value(document, PWHASH_KEY)
+        return value if isinstance(value, str) else None
 
     def _authenticate(self, password: str) -> tuple[int, str | None]:
         """Post a password to `/api/auth`, returning status and sid."""

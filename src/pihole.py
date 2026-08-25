@@ -17,7 +17,7 @@ import tomllib
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast, final
+from typing import Protocol, final
 
 import tenacity
 from charmlibs import snap
@@ -32,6 +32,7 @@ from pihole_state import (
     AdminPasswordState,
     ApiFacts,
     ServiceStatus,
+    config_value,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,9 @@ PIHOLE_CMD = f"/snap/bin/{SNAP_NAME}.pihole"
 """The fully qualified command: the `pihole` alias does not register."""
 
 WEBSERVER_PORT_KEY = "webserver.port"
+
+NTP_ACTIVE_KEYS = ("ntp.ipv4.active", "ntp.ipv6.active")
+"""The two keys behind FTL's NTP server on 123/udp, on by default."""
 
 INSTALL_ATTEMPTS = 3
 INSTALL_WAIT = tenacity.wait_fixed(2) + tenacity.wait_random(0, 5)
@@ -253,6 +257,18 @@ class Pihole:
         """Return `webserver.port` as `pihole.toml` holds it."""
         return self._ftl_config_value(WEBSERVER_PORT_KEY)
 
+    def ntp_server_active(self) -> bool | None:
+        """Report whether FTL's NTP server is enabled on 123/udp.
+
+        None when `pihole.toml` cannot answer — file missing,
+        unparseable, or the keys absent. The caller decides what
+        unknown means; the pure core treats it as open.
+        """
+        states = [self._ftl_config_bool(key) for key in NTP_ACTIVE_KEYS]
+        if any(state is None for state in states):
+            return None
+        return any(state for state in states)
+
     def stub_listener_disabled(self) -> bool:
         """Report whether port 53 was taken from systemd-resolved."""
         return resolved.is_stub_disabled(self._resolved_drop_in)
@@ -401,6 +417,39 @@ class Pihole:
                 remedy="`snap set` returns 0 on keys it drops; inspect pihole.toml on the unit",
             )
         logger.info("Set ftl.%s to %r.", WEBSERVER_PORT_KEY, value)
+
+    def disable_ntp_server(self) -> None:
+        """Set both `ftl.ntp.*.active` keys false, and verify the TOML.
+
+        The snap starts an NTP server on 123/udp by default — attack
+        surface nothing asked for. Both keys are `snap set`-reachable,
+        and the configure hook restarts FTL only when a value actually
+        changed, so a converged machine is not bounced.
+
+        Raises:
+            PiholeError: snapd refused the keys, or either server is
+                still enabled in `pihole.toml`.
+        """
+        operation = "disabling the FTL NTP server on 123/udp"
+        with _converting_snapd_failure(operation=operation, remedy=SNAPD_REMEDY):
+            self._require_snap().set(
+                {f"ftl.{key}": False for key in NTP_ACTIVE_KEYS},
+                typed=True,
+            )
+        # Strict read-back: both keys must be present and false. An
+        # absent or unreadable key is not evidence the server is off —
+        # FTL's default is true, so absence can mean the write never
+        # landed (rule 6).
+        after = {key: self._ftl_config_bool(key) for key in NTP_ACTIVE_KEYS}
+        not_off = [key for key, state in after.items() if state is not False]
+        if not_off:
+            raise PiholeError(
+                operation=operation,
+                expected="both NTP servers disabled in pihole.toml",
+                actual=f"not proven off: {', '.join(not_off)}",
+                remedy="`snap set` returns 0 on keys it drops; inspect pihole.toml on the unit",
+            )
+        logger.info("Disabled the FTL NTP server.")
 
     def set_password(self, password: str) -> None:
         """Apply the admin password with `pihole setpassword`.
@@ -554,16 +603,22 @@ class Pihole:
 
         Returns None when the file, the table, or the key is absent —
         the normal state before the daemon has ever run — and also when
-        the value is not a string, because Stage 1 reads only strings.
+        the value is not a string, because Stage 1 reads only strings
+        and booleans.
         """
-        node: object = self._read_toml()
-        for segment in key.split("."):
-            if not isinstance(node, dict):
-                return None
-            # A parsed TOML table really is a str-keyed mapping of
-            # anything; the cast tells pyright what isinstance cannot.
-            node = cast("Mapping[str, object]", node).get(segment)
-        return node if isinstance(node, str) else None
+        value = config_value(self._read_toml(), key)
+        return value if isinstance(value, str) else None
+
+    def _ftl_config_bool(self, key: str) -> bool | None:
+        """Read one dotted boolean key out of `pihole.toml`.
+
+        None when the file cannot answer — missing, unparseable, or
+        the key absent. Callers decide what unknown means; for the
+        NTP verification it is failure, because FTL's default is true
+        and absence is not evidence of a closed port.
+        """
+        value = config_value(self._read_toml(), key)
+        return value if isinstance(value, bool) else None
 
     def _read_toml(self) -> Mapping[str, object]:
         """Parse `pihole.toml`, or return nothing if it is not there."""

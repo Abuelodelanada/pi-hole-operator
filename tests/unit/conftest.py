@@ -93,6 +93,7 @@ def mock_pihole(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     mock.api_facts.return_value = api_facts()
     mock.admin_password_state.return_value = pihole_state.PasswordAccepted()
     mock.stub_listener_disabled.return_value = True
+    mock.ntp_server_active.return_value = False
     monkeypatch.setattr(charm.pihole, "Pihole", lambda: mock)
     return mock
 
@@ -490,6 +491,7 @@ def write_pihole_toml(
     *,
     webserver_port: str | None = None,
     pwhash: str | None = None,
+    ntp_active: bool | None = None,
     raw: str | None = None,
 ) -> None:
     """Write the subset of `pihole.toml` this charm reads back."""
@@ -504,6 +506,13 @@ def write_pihole_toml(
     lines.append("[webserver.api]")
     if pwhash is not None:
         lines.append(f'pwhash = "{pwhash}"')
+    if ntp_active is not None:
+        lines += [
+            "[ntp.ipv4]",
+            f"active = {str(ntp_active).lower()}",
+            "[ntp.ipv6]",
+            f"active = {str(ntp_active).lower()}",
+        ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

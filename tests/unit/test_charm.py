@@ -42,6 +42,7 @@ EFFECTS = frozenset(
     {
         "install",
         "set_webserver_port",
+        "disable_ntp_server",
         "set_password",
         "start",
         "await_api",
@@ -117,6 +118,7 @@ def test_reconcile_is_idempotent(
     mock_pihole.install.assert_not_called()
     mock_pihole.start.assert_not_called()
     mock_pihole.set_webserver_port.assert_not_called()
+    mock_pihole.disable_ntp_server.assert_not_called()
     mock_pihole.set_password.assert_not_called()
     mock_resolved.disable_stub_listener.assert_not_called()
 
@@ -142,6 +144,21 @@ def test_ports_never_include_443(
     assert testing.TCPPort(443) not in state_out.opened_ports
 
 
+def test_ports_never_include_the_ntp_server(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a converged machine whose NTP server the charm has closed
+    # WHEN it reconciles
+    state_out = ctx.run(ctx.on.start(), base_state)
+
+    # THEN 123/udp is not advertised: the server is disabled, not
+    # exposed, so there is no listener to document
+    assert testing.UDPPort(123) not in state_out.opened_ports
+
+
 def test_a_fresh_machine_is_installed_started_and_gated(
     ctx: testing.Context[charm.PiholeCharm],
     base_state: testing.State,
@@ -159,6 +176,7 @@ def test_a_fresh_machine_is_installed_started_and_gated(
     assert effects == [
         "install",
         "set_webserver_port",
+        "disable_ntp_server",
         "set_password",
         "start",
         "await_api",
@@ -168,6 +186,7 @@ def test_a_fresh_machine_is_installed_started_and_gated(
     # install-mode: disable and would otherwise never run
     absent_snap.start.assert_called_once_with(enable=True)
     absent_snap.set_webserver_port.assert_called_once_with("80o,[::]:80o")
+    absent_snap.disable_ntp_server.assert_called_once_with()
     absent_snap.set_password.assert_called_once_with(ADMIN_PASSWORD)
 
 
@@ -202,6 +221,7 @@ def test_the_snap_is_fetched_before_the_host_loses_its_resolver(
         "pihole.install",
         "resolved.disable_stub_listener",
         "pihole.set_webserver_port",
+        "pihole.disable_ntp_server",
         "pihole.set_password",
         "pihole.start",
         "pihole.await_api",

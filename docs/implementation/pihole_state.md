@@ -21,7 +21,7 @@ It imports neither `ops` nor any workload module, which has two consequences:
    other for anything but the `FtlApi` class itself. This is why the snap path
    constants live here rather than in `pihole.py` (ADR-0009 §4).
 
-Reading `compute`, `_bootstrap` and `_converge` — 56 lines — tells you everything
+Reading `compute`, `_bootstrap` and `_converge` — 66 lines — tells you everything
 the charm does.
 
 ---
@@ -54,7 +54,7 @@ show an operator, whether to retry, and whether to reapply the password.
 type PiholeState = SnapAbsent | SnapPresent
 ```
 
-`SnapAbsent` carries no fields. `SnapPresent` carries the eight facts that only
+`SnapAbsent` carries no fields. `SnapPresent` carries the nine facts that only
 exist once the snap is installed. Nothing can construct "not installed, but the
 webserver port is 80".
 
@@ -65,14 +65,14 @@ webserver port is 80".
 
 ### The outcomes
 
-`PiholeOutcome`, seven variants: `ReleasePort53`, `InstallSnap`,
-`SetWebserverPort`, `SetAdminPassword`, `StartFtl`, `AwaitApi`, `Noop`. Each is a
-value, not an action; `charm.py`'s `_apply` is the only thing that turns one into
-an effect.
+`PiholeOutcome`, eight variants: `ReleasePort53`, `InstallSnap`,
+`SetWebserverPort`, `DisableNtpServer`, `SetAdminPassword`, `StartFtl`,
+`AwaitApi`, `Noop`. Each is a value, not an action; `charm.py`'s `_apply` is the
+only thing that turns one into an effect.
 
 ### The effect boundary and the two functions
 
-`PiholeFacts` is a `Protocol` of six reads. Two implementations exist: `Pihole`
+`PiholeFacts` is a `Protocol` of seven reads. Two implementations exist: `Pihole`
 in production, and `FactsStub` in the tests.
 
 `fetch` is the charm's **only** impure read path, and it short-circuits: if
@@ -81,7 +81,7 @@ anything else, because none of the other facts are knowable.
 
 `compute` dispatches on the state union:
 
-- `SnapAbsent` → `_bootstrap`, which returns a **fixed six-outcome tuple**. The
+- `SnapAbsent` → `_bootstrap`, which returns a **fixed seven-outcome tuple**. The
   order is the correctness condition and is stated once, literally, in that
   function.
 - `SnapPresent` → `_converge`, which appends conditionally in the same order,
@@ -96,6 +96,7 @@ anything else, because none of the other facts are knowable.
 | `webserver_port()` returns `None` (file missing, unparseable TOML) | Recorded as `""` | `""` never equals `WEBSERVER_PORT`, so an unreadable port is treated as wrong and corrected. Mistaking it for correct would skip the fix and leave the webserver dead. |
 | `version` is `None` on an installed snap | `SnapPresent.version: str \| None` | The snap may declare no version. `charm.py` matches `version=str() as version` so it only reports a real one. |
 | A port correction is needed | `AwaitApi()` is appended too, even if `api_ready` was `True` | Changing the port restarts FTL (snap-constraints §4), so the step carries its own readiness gate instead of leaving an unguarded bounce for the next status check. |
+| An NTP correction is needed | `AwaitApi()` appended too, for the same reason | The configure hook restarts FTL whenever a *changed* value lands, so a plan that closes 123/udp cannot trust a readiness fact read before it. |
 | `PasswordUnverified` | **Not** reapplied | A hash is already set; rewriting it while the daemon is down is churn, and the salt means the write cannot be verified anyway. |
 | `PasswordUnset` | Always reapplied | An empty `pwhash` means FTL accepts *any* password, so the config API is open to the network. |
 | Fully converged machine | `(Noop(),)`, never `()` | An empty sequence and "nothing to do" are different claims. `Noop` makes the second one explicit and gives `_apply` something to log. |
@@ -105,8 +106,8 @@ anything else, because none of the other facts are knowable.
 
 ## Testing strategy
 
-[`tests/unit/test_pihole_state.py`](../../tests/unit/test_pihole_state.py) — 15
-test functions, 22 collected cases, **zero mocks**: no `monkeypatch`, no
+[`tests/unit/test_pihole_state.py`](../../tests/unit/test_pihole_state.py) — 16
+test functions, 23 collected cases, **zero mocks**: no `monkeypatch`, no
 `unittest.mock`, no snap. `FactsStub` implements `PiholeFacts` with plain
 attributes and counts its reads.
 

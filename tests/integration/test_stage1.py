@@ -83,6 +83,20 @@ def test_the_webserver_port_no_longer_requests_tls(deployed: jubilant.Juju):
     assert STOCK_WEBSERVER_PORT not in result.stdout
 
 
+def test_nothing_listens_on_the_ntp_port(deployed: jubilant.Juju):
+    # GIVEN a converged unit
+    # WHEN its UDP listeners are read
+    result = deployed.exec("ss -ulpn", unit=f"{APP_NAME}/0")
+
+    # THEN 123 is not among them. The snap starts an NTP server on
+    # 123/udp by default — attack surface nothing asked for — and the
+    # charm closes it rather than advertising it. The positive
+    # assertion keeps the probe honest: without it a useless `ss`
+    # output would pass vacuously.
+    assert ":53 " in result.stdout
+    assert ":123 " not in result.stdout
+
+
 def test_the_api_answers_on_the_first_boot(deployed: jubilant.Juju):
     # GIVEN a converged unit
     # WHEN the API is queried through the snap's own wrapper

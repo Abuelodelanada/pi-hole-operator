@@ -42,7 +42,7 @@ uv sync
 src/
   charm.py           # ops only: observe -> _reconcile -> collect_unit_status
   pihole.py          # snap/systemd/filesystem. Never imports ops.
-  pihole_config.py   # pydantic models, charm config -> FTL key mapping. Pure.
+  ftl_api.py         # FTL HTTP API client: sessions, auth, readiness.
   pihole_state.py    # frozen snapshot + outcome ADT + pure compute(). No IO.
   resolved.py        # systemd-resolved drop-in. Never imports ops.
 docs/
@@ -50,8 +50,11 @@ docs/
   roadmap.md         # stages, acceptance criteria, open spikes
   snap-constraints.md# verified facts about the workload
   BACKLOG.md         # deferred work, with triggers
-lib/charms/grafana_agent/   # vendored third-party. Never edited, never linted.
 ```
+
+`lib/charms/grafana_agent/` arrives with Stage 5 (COS) and is vendored then —
+never edited, never linted. There is deliberately **no** `pihole_config.py` yet;
+it is a Stage 2 deliverable.
 
 ### The module boundary is not stylistic
 
@@ -75,7 +78,7 @@ Either one is a design defect, not a test problem. See
 
 **Work is driven by stages in [`docs/roadmap.md`](docs/roadmap.md), not by ADRs.**
 
-ADRs are decisions; stages are work. Five of the eight ADRs are *cross-cutting* —
+ADRs are decisions; stages are work. Five of the nine ADRs are *cross-cutting* —
 they are complied with in every stage rather than completed in one:
 
 | ADR | Lands in | Nature |
@@ -86,8 +89,9 @@ they are complied with in every stage rather than completed in one:
 | [0005](docs/adr/0005-status-semantics-and-failure-handling.md) status | Stage 1 establishes the channel | **Cross-cutting** — every stage adds statuses |
 | [0006](docs/adr/0006-configuration-surface.md) config surface | Stages 2, 3, 7 | Completed in three parts |
 | [0004](docs/adr/0004-ftl-configuration-mechanism.md) FTL config | Stage 2, **after a spike** | Completed there |
-| [0007](docs/adr/0007-admin-password-handling.md) password | Stage 4 | Completed there |
+| [0007](docs/adr/0007-admin-password-handling.md) password | Stage 1 (Stage 4 was folded into it) | Completed there |
 | [0008](docs/adr/0008-cos-integration.md) COS | Stage 5 | Completed there |
+| [0009](docs/adr/0009-ftl-api-client-module.md) FTL API client | Stage 1 | Completed there |
 
 ### The per-stage loop
 
@@ -121,7 +125,7 @@ tox -e integration
 Pack **once** by hand and reuse via `CHARM_PATH`. Never pack inside a test.
 
 **5. Audit.** Run `charm-reviewer` (read-only). **This is not redundant with step
-4.** A green `tox` says nothing about non-negotiables 1, 2, 4, 6, 7, or 8 — those
+4.** A green `tox` says nothing about non-negotiables 1, 2, 4, 5, 6, 7, or 8 — those
 are architectural and no linter sees them. Do not treat a passing gate as a
 review.
 
@@ -186,8 +190,9 @@ Three layers, mirroring the source design. Do not mix them.
 | Layer | Tool | What you mock |
 |---|---|---|
 | Pure decisions (`compute`, config mapping) | plain `pytest` | **nothing** |
-| State transitions (`charm.py`) | `ops.testing` `Context` + `State` | `src.pihole` — the whole module |
-| Workload (`pihole.py`) | plain `pytest` | `snap.SnapCache`, `subprocess.run`, filesystem |
+| State transitions (`charm.py`) | `ops.testing` `Context` + `State` | `src.pihole` and `src.resolved` — the whole modules |
+| Workload (`pihole.py`) | plain `pytest` | nothing patched: collaborators are injected, so fakes can *lie the way the snap lies* |
+| FTL HTTP client (`ftl_api.py`) | plain `pytest` | `urlopen`, scripted per method and route |
 | Integration | `jubilant` on LXD | nothing |
 
 Put as much logic as possible in the first layer. Every decision that lives there

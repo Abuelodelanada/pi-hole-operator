@@ -9,10 +9,15 @@ requires-python = ">=3.14"
 # have to be added here by hand. See ADR-0002 section 2.5.
 dependencies = [
     "ops~=3.8",
-    "charmlibs-snap",
-    "charmlibs-systemd",
-    "pydantic>=2,<3",
+    # Bounded: charmlibs main has already dropped `snap.SnapError` and
+    # `snap.SnapNotFoundError`, which this charm's retry logic and test
+    # fakes are built on (verified against 1.0.1).
+    "charmlibs-snap>=1,<2",
+    "charmlibs-systemd>=1,<2",
     "tenacity",
+    # pydantic returns with Stage 2, for self.load_config and the FTL
+    # config mapping. Declaring it before anything imports it only
+    # ships an unused dependency in every unit's venv.
 ]
 
 [dependency-groups]

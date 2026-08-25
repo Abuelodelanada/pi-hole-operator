@@ -698,6 +698,86 @@ def test_a_silently_dropped_snap_set_is_caught_by_the_read_back(
     assert fake_snap.set_calls == [{"ftl.webserver.port": "80o,[::]:80o"}]
 
 
+# -- The NTP server the snap opens by default. ------------------------
+
+
+def test_closing_the_ntp_server_verifies_pihole_toml(
+    workload: pihole.Pihole,
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a snap whose configure hook actually applies the values
+    write_pihole_toml(snap_data, ntp_active=False)
+
+    # WHEN the NTP server is closed
+    workload.disable_ntp_server()
+
+    # THEN both keys went through the `ftl.` namespace, as real
+    # booleans rather than strings — a string "False" would not parse
+    # as TOML false on FTL's side
+    assert fake_snap.set_calls == [{"ftl.ntp.ipv4.active": False, "ftl.ntp.ipv6.active": False}]
+
+
+def test_an_ntp_server_still_enabled_after_the_set_is_caught(
+    workload: pihole.Pihole,
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a snap that accepts the keys and keeps the old value — the
+    # verified behaviour of `snap set` on keys it drops
+    write_pihole_toml(snap_data, ntp_active=True)
+
+    # WHEN the NTP server is closed
+    # THEN the charm refuses to believe the exit code
+    with pytest.raises(pihole.PiholeError, match="not proven off"):
+        workload.disable_ntp_server()
+
+
+def test_an_ntp_key_absent_from_the_toml_is_not_evidence_it_is_off(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a pihole.toml where only one of the two keys landed. FTL's
+    # default for both is true, so a missing key can mean the write
+    # never happened — absence is not evidence of a closed port.
+    write_pihole_toml(snap_data, raw="[ntp.ipv4]\nactive = false\n")
+
+    # WHEN the NTP server is closed
+    # THEN the read-back refuses to declare victory on half the answer
+    with pytest.raises(pihole.PiholeError, match="not proven off"):
+        workload.disable_ntp_server()
+
+
+def test_an_unreadable_toml_reports_an_unknown_ntp_state(
+    workload: pihole.Pihole,
+):
+    # GIVEN a machine whose pihole.toml does not exist yet
+    # WHEN the fact is read
+    # THEN it is None, not False: "cannot read" and "confirmed closed"
+    # are different answers, and only the caller that knows the
+    # context may decide what unknown means
+    assert workload.ntp_server_active() is None
+
+
+@pytest.mark.parametrize(
+    ("ntp_active", "expected"),
+    [(False, False), (True, True)],
+    ids=["closed", "open"],
+)
+def test_a_readable_toml_reports_what_it_says(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    ntp_active: bool,
+    expected: bool,
+):
+    # GIVEN a pihole.toml whose NTP keys can be read
+    write_pihole_toml(snap_data, ntp_active=ntp_active)
+
+    # WHEN the fact is read
+    # THEN it answers exactly what the file says, on either key
+    assert workload.ntp_server_active() is expected
+
+
 def test_setting_the_password_uses_the_v6_command_and_never_snap_set(
     fake_snap: FakeSnap,
     snap_data: pathlib.Path,

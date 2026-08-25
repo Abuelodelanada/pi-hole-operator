@@ -11,10 +11,10 @@ ADR-0003 section 2.5.
 `PiholeFacts` collaborator it is handed.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, assert_never, final
+from typing import Protocol, assert_never, cast, final
 
 WEBSERVER_PORT = "80o,[::]:80o"
 """Plain HTTP on 80, and no TLS.
@@ -38,6 +38,23 @@ SNAP_DATA = Path(f"/var/snap/{SNAP_NAME}/current")
 PIHOLE_TOML = Path("etc/pihole/pihole.toml")
 CLI_PW = Path("etc/pihole/cli_pw")
 PWHASH_KEY = "webserver.api.pwhash"
+
+
+def config_value(toml: Mapping[str, object], key: str) -> object | None:
+    """Walk one dotted key through a parsed TOML document.
+
+    Shared by `pihole.py` and `ftl_api.py`, which both read this file
+    and neither of which may import the other. Returns None when the
+    document's shape does not reach the key.
+    """
+    node: object = toml
+    for segment in key.split("."):
+        if not isinstance(node, dict):
+            return None
+        # A parsed TOML table really is a str-keyed mapping of
+        # anything; the cast tells pyright what isinstance cannot.
+        node = cast("Mapping[str, object]", node).get(segment)
+    return node
 
 
 # -- Observed facts. What a read of the machine can come back with. ----
@@ -128,6 +145,7 @@ class SnapPresent:
     admin_password: AdminPasswordState
     api_ready: bool
     stub_listener_disabled: bool
+    ntp_server_active: bool | None
 
 
 type PiholeState = SnapAbsent | SnapPresent
@@ -198,6 +216,12 @@ class SetWebserverPort:
 
 @final
 @dataclass(frozen=True)
+class DisableNtpServer:
+    """Close the NTP server the snap opens on 123/udp by default."""
+
+
+@final
+@dataclass(frozen=True)
 class SetAdminPassword:
     """Close the unauthenticated-API hole before the daemon serves."""
 
@@ -225,7 +249,14 @@ class Noop:
 
 
 type PiholeOutcome = (
-    ReleasePort53 | InstallSnap | SetWebserverPort | SetAdminPassword | StartFtl | AwaitApi | Noop
+    ReleasePort53
+    | InstallSnap
+    | SetWebserverPort
+    | DisableNtpServer
+    | SetAdminPassword
+    | StartFtl
+    | AwaitApi
+    | Noop
 )
 
 
@@ -267,6 +298,16 @@ class PiholeFacts(Protocol):
         """Whether port 53 has been freed for Pi-hole."""
         ...
 
+    def ntp_server_active(self) -> bool | None:
+        """Whether FTL's NTP server is enabled on 123/udp.
+
+        None when it cannot be read. The decision treats unknown as
+        open: the correction is idempotent and its own read-back has
+        the final word, while treating unknown as closed would leave
+        123/udp bound on a machine this charm could have fixed.
+        """
+        ...
+
 
 def fetch(pihole: PiholeFacts, intent: PiholeIntent) -> PiholeState:
     """Read every fact the decision depends on, exactly once.
@@ -297,6 +338,7 @@ def fetch(pihole: PiholeFacts, intent: PiholeIntent) -> PiholeState:
         admin_password=api.admin_password,
         api_ready=api.api_ready,
         stub_listener_disabled=pihole.stub_listener_disabled(),
+        ntp_server_active=pihole.ntp_server_active(),
     )
 
 
@@ -320,16 +362,18 @@ def _bootstrap(intent: PiholeIntent) -> Sequence[PiholeOutcome]:
     section 2.9). Port 53 is freed second, before the daemon starts,
     because `restart-condition: on-failure` turns `EADDRINUSE` into an
     indefinite crash loop (snap-constraints sections 2.1 and 11).
-    `webserver.port` is corrected before the first start or the
-    webserver never binds. The password is applied before the daemon
-    serves, because an empty `pwhash` opens the config API to the
-    network. The API is the readiness gate last, because `snap services`
-    reports active long before Pi-hole answers.
+    `webserver.port` is corrected and the NTP server is closed before
+    the first start — the webserver never binds without the first fix,
+    and the second is attack surface nothing asked for. The password is
+    applied before the daemon serves, because an empty `pwhash` opens
+    the config API to the network. The API is the readiness gate last,
+    because `snap services` reports active long before Pi-hole answers.
     """
     return (
         InstallSnap(),
         ReleasePort53(),
         SetWebserverPort(WEBSERVER_PORT),
+        DisableNtpServer(),
         SetAdminPassword(intent.admin_password),
         StartFtl(),
         AwaitApi(),
@@ -347,17 +391,21 @@ def _converge(state: SnapPresent, intent: PiholeIntent) -> Sequence[PiholeOutcom
     if not state.stub_listener_disabled:
         outcomes.append(ReleasePort53())
 
-    # A port correction restarts FTL (snap-constraints section 4), so
-    # this step brings its own gate rather than leaving an unguarded
+    # A port correction or an NTP correction restarts FTL (the
+    # configure hook restarts only when a value actually changed), so
+    # either step brings its own gate rather than leaving an unguarded
     # bounce for the next status check.
     port_is_wrong = state.webserver_port != WEBSERVER_PORT
+    ntp_is_open = state.ntp_server_active is not False
     if port_is_wrong:
         outcomes.append(SetWebserverPort(WEBSERVER_PORT))
+    if ntp_is_open:
+        outcomes.append(DisableNtpServer())
     if _needs_password(state.admin_password):
         outcomes.append(SetAdminPassword(intent.admin_password))
     if not (state.ftl_enabled and state.ftl_active):
         outcomes.append(StartFtl())
-    if port_is_wrong or not state.api_ready:
+    if port_is_wrong or ntp_is_open or not state.api_ready:
         outcomes.append(AwaitApi())
     return tuple(outcomes) if outcomes else (Noop(),)
 

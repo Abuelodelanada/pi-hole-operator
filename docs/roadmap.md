@@ -78,9 +78,9 @@ Proves the toolchain before any workload risk enters.
 
 **Acceptance**
 
-- [ ] `tox -e lint,static,unit` green; `charmcraft pack` succeeds.
-- [ ] `charmcraft analyse` resolves `language: python` and `framework: operator`.
-- [ ] Deploys on LXD and reaches `active/idle` with **zero relations**.
+- [x] `tox -e lint,static,unit` green; `charmcraft pack` succeeds.
+- [x] `charmcraft analyse` resolves `language: python` and `framework: operator`.
+- [x] Deploys on LXD and reaches `active/idle` with **zero relations**.
 
 ---
 
@@ -117,6 +117,10 @@ stage; everything after it is elaboration.
   charm disables TLS (ADR-0006 §2.10).
 - **`snap set ftl.webserver.port="80o,[::]:80o"` before the first start.** Without
   it the webserver never binds and the API never appears (snap-constraints §5.1).
+- **The NTP server the snap opens by default on 123/udp is closed** —
+  `ntp.ipv4.active` and `ntp.ipv6.active` set false, verified in `pihole.toml`.
+  Third instance of the stage's own rule: a hole opened by the charm's act of
+  starting the daemon is closed here, not later.
 - **An admin password is generated and applied before the daemon serves** — stored
   in a charm-owned, app-level Juju secret, retrieved by label, written only on the
   leader (ADR-0007 §4.1). There must be no window with `pwhash = ""`. There is
@@ -124,7 +128,8 @@ stage; everything after it is elaboration.
 - Readiness gated on the HTTP API (`GET /api/dns/blocking`), **never**
   `snap services` — and only *after* the port fix, or the gate can never pass.
 - **Mandatory ordering** in `compute`'s output sequence:
-  `install → free 53 → set webserver.port → set password → start → gate on API`.
+  `install → free 53 → set webserver.port → close NTP → set password → start
+  → gate on API`.
   Install precedes freeing port 53 so a store failure cannot leave the host without
   a resolver (ADR-0005 §2.9).
 
@@ -138,9 +143,11 @@ stage; everything after it is elaboration.
 - Workload: `ensure` called **and** `start(enable=True)` called — regression test
   for `install-mode: disable`.
 - Workload: resolved drop-in written on install, **deleted on remove**.
-- Pure: the outcome sequence puts `webserver.port` and the password **before**
-  `StartFtl`. This is the whole stage's correctness condition and it is a pure
-  assertion on a tuple — no mocks.
+- Pure: the outcome sequence puts `webserver.port`, the NTP closure and the
+  password **before** `StartFtl`. This is the whole stage's correctness condition
+  and it is a pure assertion on a tuple — no mocks.
+- Pure: an active NTP server yields exactly `DisableNtpServer` plus its own
+  readiness gate, because the configure hook restarts FTL on a changed value.
 - Regression: `set_ports` never opens 443 while TLS is disabled.
 - `ctx.unit_status_history` passes through `Maintenance` rather than jumping to
   `Active`.
@@ -152,6 +159,7 @@ stage; everything after it is elaboration.
 - **`juju remove-application` leaves the host with working DNS.**
 - **Port 80 is bound and the HTTP API answers** on the first boot, with no manual
   intervention.
+- **Nothing listens on 123/udp** after convergence (`ss -ulpn`).
 - **An unauthenticated `PATCH /api/config` from another host is refused.** This is
   the §5.2 regression test and it must run from off-machine, not from localhost.
 - Deploy with `constraints="virt-type=virtual-machine"`: snaps cannot be installed
@@ -164,8 +172,11 @@ stage; everything after it is elaboration.
 
 **Acceptance**
 
-- [ ] All of the above, plus Stage 0's acceptance still holds.
-- [ ] `charm-reviewer` clean.
+- [x] All of the above, plus Stage 0's acceptance still holds. (CI on 3.14
+      lands with `.github/`, deliberately deferred.)
+- [x] `charm-reviewer` clean (2026-08-25, against the tree that closes this
+      stage; the NTP fact is `bool | None` — a future consumer treating it as
+      plain `bool` reopens the fail-open hole).
 
 ---
 
@@ -199,7 +210,8 @@ stage; everything after it is elaboration.
 - `dns.dnssec` needs no special case any more: the API applies it correctly.
 - `$SNAP_DATA` resolved through `current`; never a hardcoded revision.
 - `extra-bindings: dns`; bind address from `self.model.get_binding("dns")`.
-- `ntp-server-enabled` default `false`, and 123/udp only opened when enabled.
+- `ntp-server-enabled` config option to re-enable the NTP server Stage 1
+  disables; 123/udp opened only when enabled.
 
 **Tests**
 
@@ -370,7 +382,7 @@ and would silently collect nothing.
 No stage merges without all of these:
 
 - [ ] `tox -e lint,static,unit` green — **but note this is not evidence of
-      compliance** with non-negotiables 1, 2, 4, 6, 7, or 8. Those are audited by
+      compliance** with non-negotiables 1, 2, 4, 5, 6, 7, or 8. Those are audited by
       `charm-reviewer`. A passing gate is not a review.
 - [ ] `tox -e flaplint` shows no new high-confidence findings (advisory).
 - [ ] Every new reconcile step answers **"what breaks if this runs twice?"** and

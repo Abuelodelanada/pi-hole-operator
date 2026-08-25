@@ -17,6 +17,7 @@ from pihole_state import (
     AdminPasswordState,
     ApiFacts,
     AwaitApi,
+    DisableNtpServer,
     InstallSnap,
     Noop,
     PasswordAccepted,
@@ -51,6 +52,7 @@ def converged(**overrides: object) -> SnapPresent:
         admin_password=PasswordAccepted(),
         api_ready=True,
         stub_listener_disabled=True,
+        ntp_server_active=False,
     )
     return dataclasses.replace(state, **overrides)
 
@@ -73,6 +75,7 @@ class FactsStub:
     password: AdminPasswordState = dataclasses.field(default_factory=PasswordAccepted)
     ready: bool = True
     stub_disabled: bool = True
+    ntp: bool | None = False
     reads: list[str] = dataclasses.field(default_factory=list[str])
     passwords_offered: list[str] = dataclasses.field(default_factory=list[str])
 
@@ -107,6 +110,11 @@ class FactsStub:
         self.reads.append("stub_listener_disabled")
         return self.stub_disabled
 
+    def ntp_server_active(self) -> bool | None:
+        """Report whether FTL's NTP server is enabled."""
+        self.reads.append("ntp_server_active")
+        return self.ntp
+
 
 def test_absent_snap_yields_the_whole_ordered_install_sequence():
     # GIVEN a machine with nothing installed
@@ -121,6 +129,7 @@ def test_absent_snap_yields_the_whole_ordered_install_sequence():
         InstallSnap(),
         ReleasePort53(),
         SetWebserverPort("80o,[::]:80o"),
+        DisableNtpServer(),
         SetAdminPassword(PASSWORD),
         StartFtl(),
         AwaitApi(),
@@ -148,6 +157,10 @@ def test_the_bootstrap_order_is_the_correctness_condition():
     # AND the webserver port is corrected before the first start, or
     # the webserver never binds and there is no HTTP API to gate on
     assert kinds.index(SetWebserverPort) < kinds.index(StartFtl)
+
+    # AND the NTP server is closed before the first start, so 123/udp
+    # is never served, not even briefly
+    assert kinds.index(DisableNtpServer) < kinds.index(StartFtl)
 
     # AND the admin password is applied before the daemon serves, so
     # there is no window in which the config API is open to the network
@@ -213,6 +226,36 @@ def test_correcting_the_port_always_brings_its_own_readiness_gate(port: str):
     assert outcomes == (SetWebserverPort(WEBSERVER_PORT), AwaitApi())
 
 
+def test_closing_the_ntp_server_brings_its_own_readiness_gate():
+    # GIVEN a machine that is converged apart from the NTP server it
+    # serves, and whose API is answering right now
+    state = converged(ntp_server_active=True, api_ready=True)
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN the plan does not end by bouncing the daemon with nothing
+    # waiting for it. The configure hook restarts FTL whenever a value
+    # actually changes, so `api_ready` being true at fetch time says
+    # nothing about the state this plan leaves behind.
+    assert outcomes == (DisableNtpServer(), AwaitApi())
+
+
+def test_an_unknown_ntp_state_is_treated_as_open():
+    # GIVEN a machine whose pihole.toml could not answer — the fact is
+    # None rather than True or False
+    state = converged(ntp_server_active=None, api_ready=True)
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN the correction is planned anyway. Treating unknown as open
+    # costs one idempotent `snap set` whose own read-back has the final
+    # word; treating it as closed would leave 123/udp bound on a
+    # machine this charm could have fixed.
+    assert outcomes == (DisableNtpServer(), AwaitApi())
+
+
 def test_an_unverifiable_password_is_left_alone():
     # GIVEN a machine whose pwhash is set but whose API cannot be asked
     # — the normal state between setting the password and starting FTL
@@ -247,6 +290,7 @@ def test_a_wholly_drifted_machine_keeps_the_bootstrap_order():
         ftl_enabled=False,
         ftl_active=False,
         api_ready=False,
+        ntp_server_active=True,
     )
 
     # WHEN the plan is computed
@@ -256,6 +300,7 @@ def test_a_wholly_drifted_machine_keeps_the_bootstrap_order():
     assert outcomes == (
         ReleasePort53(),
         SetWebserverPort(WEBSERVER_PORT),
+        DisableNtpServer(),
         SetAdminPassword(PASSWORD),
         StartFtl(),
         AwaitApi(),
@@ -310,6 +355,7 @@ def test_fetch_reads_every_fact_exactly_once():
         "api_facts",
         "ftl_status",
         "installed_revision",
+        "ntp_server_active",
         "stub_listener_disabled",
         "webserver_port",
         "workload_version",
@@ -353,3 +399,16 @@ def test_an_unreadable_webserver_port_is_not_mistaken_for_the_right_one():
     # THEN the port is set rather than assumed correct, and the restart
     # that setting it causes is waited out
     assert outcomes == (SetWebserverPort(WEBSERVER_PORT), AwaitApi())
+
+
+def test_an_unknown_ntp_fact_passes_through_fetch_unchanged():
+    # GIVEN a machine whose pihole.toml cannot answer about NTP — the
+    # workload fact is None, and fetch must not guess on its way past
+    facts = FactsStub(ntp=None)
+
+    # WHEN the world is read
+    state = fetch(facts, INTENT)
+
+    # THEN the unknown reaches the pure core intact, where it is
+    # treated as open rather than silently resolved to closed
+    assert state == converged(ntp_server_active=None)

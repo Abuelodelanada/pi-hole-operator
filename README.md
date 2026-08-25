@@ -7,8 +7,9 @@ v6 on Ubuntu machines — LXD, MAAS, or a public cloud — using the
 Not a Kubernetes charm: no Pebble, no OCI image.
 
 > **Status: Stage 1.** The charm installs the snap, frees port 53, starts FTL,
-> owns the admin password, and restores the host resolver on removal. It has no
-> config options and no relations yet. See [`docs/roadmap.md`](docs/roadmap.md).
+> owns the admin password, closes the NTP server the snap opens by default, and
+> restores the host resolver on removal. It has no config options and no
+> relations yet. See [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Deploy
 
@@ -29,23 +30,23 @@ example that has nothing to do with Pi-hole, and lists the three ways to get it
 wrong.
 
 If you would rather read the real thing, these five parts in this order are the
-short path. Steps 1, 2 and 4 are 110 lines of code between them.
+short path. Steps 1, 2 and 4 are 122 lines of code between them.
 
 | # | Read | Lines | What it teaches |
 |---|---|---|---|
 | 1 | `_reconcile` in [`src/charm.py`](src/charm.py) | 29 | The whole loop: fetch the world once, decide, apply. Every observed event lands here. |
-| 2 | `compute`, `_bootstrap`, `_converge` in [`src/pihole_state.py`](src/pihole_state.py) | 56 | **Everything this charm does**, as pure functions — no IO, no `ops`, no snap. That is what lets step 5 test it without mocks. |
+| 2 | `compute`, `_bootstrap`, `_converge` in [`src/pihole_state.py`](src/pihole_state.py) | 66 | **Everything this charm does**, as pure functions — no IO, no `ops`, no snap. That is what lets step 5 test it without mocks. |
 | 3 | The three unions in [`src/pihole_state.py`](src/pihole_state.py) — `PiholeIntent`, `PiholeState`, `PiholeOutcome`, each under its own `# --` divider | — | Making illegal states unrepresentable. Note `SnapAbsent` carries no fields and `SnapPresent` carries the ones that only exist once installed. |
-| 4 | `_apply` in [`src/charm.py`](src/charm.py) | 25 | The imperative shell. Deliberately stupid: one `match`, one effect per branch, and `assert_never` so a new outcome fails `tox -e static` instead of being silently ignored. |
+| 4 | `_apply` in [`src/charm.py`](src/charm.py) | 27 | The imperative shell. Deliberately stupid: one `match`, one effect per branch, and `assert_never` so a new outcome fails `tox -e static` instead of being silently ignored. |
 | 5 | [`tests/unit/test_pihole_state.py`](tests/unit/test_pihole_state.py) | — | What the split buys: the decision logic is tested with **zero mocks**. Start at `test_the_bootstrap_order_is_the_correctness_condition`. |
 
-**On the size ratio.** The pure core is 354 lines; the workload adapters
-(`pihole.py`, `ftl_api.py`, `resolved.py`) are 1,270. That is the point, not a
+**On the size ratio.** The pure core is 427 lines; the workload adapters
+(`pihole.py`, `ftl_api.py`, `resolved.py`) are 1,321. That is the point, not a
 defect. This workload is hostile — `snap set` returns 0 on keys it silently
 drops, `pihole -a -p` prints usage and exits 0, FTL reports `active` long before
 it serves, its session tokens rotate on restart, and its password hash is salted
 so it cannot be compared. The pattern **quarantines all of that in the adapters**
-so the decisions stay in 56 auditable lines. A charm that looks tidier than this
+so the decisions stay in 66 auditable lines. A charm that looks tidier than this
 is usually one that trusts an exit code.
 
 The reasoning behind each decision is in [`docs/adr/`](docs/adr/), numbered and
