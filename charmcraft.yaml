@@ -92,8 +92,12 @@ config:
       type: string
       default: ""
       description: |
-        FTL listening mode: LOCAL, SINGLE, BIND, ALL, or NONE.
-        Empty means the charm does not manage this setting.
+        FTL listening mode: LOCAL (loopback only), ALL (every
+        interface), or NONE (no DNS). Empty means the charm does not
+        manage this setting.
+
+        FTL's SINGLE and BIND are not offered: they need an interface
+        to bind to, which this charm does not manage yet.
     blocking-enabled:
       type: boolean
       default: true
@@ -109,5 +113,3 @@ config:
         Whether the FTL NTP server on 123/udp is enabled.
         The charm default is false, diverging from the snap's default
         of true. See the README.
-extra-bindings:
-  dns:

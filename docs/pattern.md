@@ -504,9 +504,9 @@ pattern has to earn its place.
 |---|---|
 | `Intent` | `PiholeIntent` in [`src/pihole_state.py`](../src/pihole_state.py) |
 | `State` | `PiholeState`, which is `SnapAbsent \| SnapPresent` |
-| `Outcome` | `PiholeOutcome`, with seven variants |
+| `Outcome` | `PiholeOutcome`, one variant per effect the charm can decide on |
 | `Facts` | `PiholeFacts`, implemented by `Pihole` and by `FactsStub` in the tests |
-| `fetch` | `fetch`, which also takes the intent — see the note above |
+| `fetch` | `fetch`, which also takes a password to measure with — see the note above |
 | `compute` | `compute`, which calls `_bootstrap` or `_converge` |
 | `_apply` | `_apply` in [`src/charm.py`](../src/charm.py) |
 

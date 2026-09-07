@@ -21,7 +21,7 @@ import tomllib
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, final
+from typing import Protocol, cast, final
 
 import tenacity
 from charmlibs import snap
@@ -264,7 +264,7 @@ class Pihole:
         """Return `dns.upstreams` as a tuple, or None if unreadable."""
         value = config_value(self._read_toml(), UPSTREAM_DNS_KEY)
         if isinstance(value, list):
-            return tuple(str(item) for item in value)  # type: ignore[arg-type]
+            return tuple(str(item) for item in cast("list[object]", value))
         return None
 
     def listening_mode(self) -> str | None:
@@ -597,7 +597,7 @@ class Pihole:
                 )
             # Type-appropriate comparison
             if isinstance(expected, bool):
-                if not isinstance(actual, bool):  # type: ignore[reportUnnecessaryIsInstance]
+                if not isinstance(actual, bool):
                     raise PiholeError(
                         operation=f"applying {key}",
                         expected=f"{key} = {expected}",
@@ -613,7 +613,7 @@ class Pihole:
                     )
             elif isinstance(expected, tuple):
                 if isinstance(actual, list):
-                    if expected != tuple(actual):  # type: ignore[reportUnknownArgumentType]
+                    if expected != tuple(cast("list[object]", actual)):
                         raise PiholeError(
                             operation=f"applying {key}",
                             expected=f"{key} = {expected!r}",

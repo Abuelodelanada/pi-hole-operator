@@ -66,7 +66,7 @@ PASSWORD_SETTLE_WINDOW = 5.0
 
 `setpassword` reports success before FTL reloads the hash it just
 wrote, so an immediate 401 is not a verdict. See ADR-0007 section 4.3
-and snap-constraints section 7.2.8.
+and snap-constraints section 7.2.5.
 """
 
 PASSWORD_SETTLE_INTERVAL = 0.5
@@ -81,7 +81,7 @@ FTL's 16-session budget. See snap-constraints section 7.2.4.
 # crosses an event-handler boundary, ops' `_event_context` assigns
 # `exc.__traceback__`, and that assignment raises `FrozenInstanceError`
 # on a frozen instance — replacing the real error with a crash. Verified
-# against a deployed unit; see snap-constraints section 7.2.8.
+# against a deployed unit.
 def _nested(mapping: Mapping[str, object]) -> dict[str, object]:
     """Convert flat dotted keys into the tree the PATCH body needs.
 
@@ -389,7 +389,7 @@ class FtlApi:
         session is read-only for config and is answered with 403
         "The current CLI session is not allowed to modify Pi-hole
         config settings" (verified on a deployed unit — snap-constraints
-        section 7.2.5). A 400 surfaces FTL's `hint` verbatim; any other
+        section 7.2.8). A 400 surfaces FTL's `hint` verbatim; any other
         unexpected status raises `ApiUnavailableError`.
 
         Raises:
@@ -498,7 +498,7 @@ class FtlApi:
         `pihole setpassword` reports success about a second before FTL
         validates against the hash it just wrote, so the first refusal
         after a write is the workload's old answer rather than its
-        verdict. Source in snap-constraints section 7.2.8.
+        verdict. Source in snap-constraints section 7.2.5.
 
         A 200 on the first attempt costs one request, so the healthy
         path never waits; a 429, an unreachable API and an empty

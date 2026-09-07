@@ -35,8 +35,6 @@ DEFERRABLE_EVENTS = (
     "leader_elected",
 )
 
-"""The packaged default, whose TLS entries kill the whole webserver."""
-
 EFFECTS = frozenset(
     {
         "install",

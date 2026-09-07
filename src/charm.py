@@ -158,10 +158,7 @@ class PiholeCharm(ops.CharmBase):
         with the rest of the model-facing code.
         """
         self.unit.set_ports(
-            *(
-                ops.Port(proto, num)  # type: ignore[arg-type]
-                for proto, num in pihole_state.open_ports(intent)
-            )
+            *(ops.Port(proto, num) for proto, num in pihole_state.open_ports(intent))
         )
 
     def _report_version(self, state: pihole_state.PiholeState) -> None:
@@ -333,7 +330,7 @@ def _intent_from(
         return pihole_state.NoIntentYet()
     if config is None:
         return pihole_state.PiholeIntent(admin_password=password)
-    return pihole_state.PiholeIntent(admin_password=password, **config.intent_fields())  # type: ignore[arg-type]
+    return pihole_state.PiholeIntent(admin_password=password, **config.intent_fields())
 
 
 def _machine_status(

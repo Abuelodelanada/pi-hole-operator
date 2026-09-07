@@ -14,7 +14,7 @@ ADR-0003 section 2.5.
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, assert_never, cast, final
+from typing import Literal, Protocol, assert_never, cast, final
 
 API_READY_TIMEOUT = 120.0
 """Seconds to wait for the HTTP API after starting the daemon."""
@@ -55,15 +55,19 @@ PIHOLE_TOML = Path("etc/pihole/pihole.toml")
 CLI_PW = Path("etc/pihole/cli_pw")
 PWHASH_KEY = "webserver.api.pwhash"
 
-DNS_PORTS = (("tcp", 53), ("udp", 53))
+type PortProtocol = Literal["tcp", "udp"]
+"""What `ops.Port` accepts. Typed here so a typo fails `tox -e static`
+rather than at `set_ports` time — the core still imports no `ops`."""
+
+DNS_PORTS: tuple[tuple[PortProtocol, int], ...] = (("tcp", 53), ("udp", 53))
 """DNS on both protocols — a bare int would mean TCP only."""
 
-WEB_PORTS = (("tcp", 80), ("tcp", 443))
+WEB_PORTS: tuple[tuple[PortProtocol, int], ...] = (("tcp", 80), ("tcp", 443))
 """The admin UI and HTTP API on the snap's stock `webserver.port`. 443
 serves the self-signed certificate the snap's launcher generates on
 first boot."""
 
-NTP_PORTS = (("udp", 123),)
+NTP_PORTS: tuple[tuple[PortProtocol, int], ...] = (("udp", 123),)
 """The NTP server, only advertised when the operator enabled it."""
 
 
@@ -595,7 +599,7 @@ def _needs_password(password: AdminPasswordState) -> bool:
             assert_never(unreachable)
 
 
-def open_ports(intent: PiholeIntent) -> tuple[tuple[str, int], ...]:
+def open_ports(intent: PiholeIntent) -> tuple[tuple[PortProtocol, int], ...]:
     """The ports this intent serves: DNS and web always, NTP when on.
 
     Takes the whole intent rather than one extracted flag so later

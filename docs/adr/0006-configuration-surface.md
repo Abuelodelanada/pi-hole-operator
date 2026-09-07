@@ -6,6 +6,7 @@
 **Amended:** 2026-08-08 — `web-password` moved from accepted to rejected, per [ADR-0007 §3](0007-admin-password-handling.md).
 **Amended:** 2026-09-05 — `snap-channel` and `snap-revision` moved from accepted to rejected: the revision is charm policy, pinned per release and held against auto-refresh, per [ADR-0010](0010-snap-revision-is-charm-policy.md).
 **Amended:** 2026-09-05 — §2.10 removed and §2.8 rewritten: the snap self-signs TLS and self-protects its API since upstream PRs #15/#16 (byte-identical in the pinned revision 1400), so the charm no longer manages `webserver.port`.
+**Amended:** 2026-09-07 — `dns-listening-mode` narrowed to `LOCAL | ALL | NONE`; the two dropped values and the widen-vs-narrow asymmetry are recorded in the new §2.11.
 **Related:** [ADR-0001: Charm Scope and Specification](0001-charm-scope-and-specification.md), [ADR-0004: FTL Configuration Mechanism](0004-ftl-configuration-mechanism.md), [ADR-0007: Admin Password Handling](0007-admin-password-handling.md)
 
 ---
@@ -35,7 +36,7 @@ re-added.
 | Option | Type | Justification against §1 |
 |---|---|---|
 | `upstream-dns` | string (CSV in, JSON array out) | Core workload intent, and operator intent rather than data another charm owns. See §2.4. |
-| `dns-listening-mode` | string enum | An enum, not a raw FTL string, so the charm owns the vocabulary. FTL's values are `LOCAL \| SINGLE \| BIND \| ALL \| NONE` (default `LOCAL`) — **not** `LISTEN_LOCAL`/`LISTEN_ALL` as an earlier draft stated; corrected from the annotated `pihole.toml`. |
+| `dns-listening-mode` | string enum | An enum, not a raw FTL string, so the charm owns the vocabulary — and a **narrower** one: `LOCAL \| ALL \| NONE`. See §2.11. |
 | `blocking-enabled` | boolean | Reachable, cheap, genuinely operational. |
 | `ntp-server-enabled` | boolean, **default `false`** | See §2.3. |
 | `dnssec-enabled` | boolean | Must route through the ADR-0004 fallback — `snap set` silently drops it. |
@@ -51,7 +52,7 @@ retry a hook that can only fail again — consistent with
 
 | Rejected | Instead | Rule applied |
 |---|---|---|
-| `listen-interface` / `bind-address` | **`extra-bindings: dns`** + `self.model.get_binding("dns")`, using `network.bind_address` to bind and `network.ingress_address` to advertise. | #2 — network placement. Juju spaces own this. This is non-negotiable #4 in its purest form. |
+| `listen-interface` / `bind-address` | **`extra-bindings: dns`** + `self.model.get_binding("dns")`, using `network.bind_address` to bind and `network.ingress_address` to advertise. **Not declared yet** (deferred 2026-09-05): it ships with `dns.interface`, the key that consumes it. | #2 — network placement. Juju spaces own this. This is non-negotiable #4 in its purest form. |
 | `web-port` as an *operator* option | Nothing. The snap's stock `webserver.port` binds 80 and 443 and the charm leaves it alone. | A port the charm does not need to manage is not a deployment choice either. |
 | `install-timeout`, `readiness-timeout` | Constants in `pihole.py`. | A permanent public API for a transient problem is a bad trade. |
 | `blocklists` / `adlists` | **Deferred** — see [BACKLOG.md](../BACKLOG.md). | Adlists live in the `adlist` table of `gravity.db`, not in config. Not declarative, not transactional, not idempotent. **Do not add a config option whose implementation has not been proven.** |
@@ -212,17 +213,38 @@ not valid"*, and `restart-condition: on-failure` turns that into a crash loop
 rather than a degraded service.
 
 
+### 2.11 The enum is narrower than FTL's, deliberately
+
+FTL accepts `LOCAL | SINGLE | BIND | ALL | NONE`, default `LOCAL` — not
+`LISTEN_LOCAL`/`LISTEN_ALL` as an earlier draft stated
+([snap-constraints §4.1](../snap-constraints.md)). The charm exposes three of the
+five.
+
+`SINGLE` and `BIND` both bind to one interface named by `dns.interface`, which
+this charm does not manage. Setting either without it lets FTL stop answering DNS
+while the readiness gate — which talks to the API on port 80 — still reports
+`ActiveStatus`: the worst failure shape this charm has, a silent one that looks
+converged. They can be accepted later, together with an option that names the
+interface.
+
+The asymmetry is the reason to start narrow: **widening an enum is backward
+compatible, narrowing one is not.** A value this charm never accepted cannot be
+in anyone's deployment, whereas removing `SINGLE` after a release breaks every
+model that set it — the §1 irreversibility that governs the whole surface.
+
 ---
 
 ## 3. Consequences
 
 ### Positive
 
-- Nine options, each with a written justification, and five rejections with named
-  alternatives. Future "can we just add an option for X" requests have a rubric to
-  be measured against.
-- Using `extra-bindings` instead of a `listen-interface` option means DNS
-  placement is a Juju space concern, which is where operators already manage it.
+- Every accepted option carries a written justification and every rejection names
+  its alternative, so "can we just add an option for X" has a rubric to be
+  measured against. (§2.1 is the list; this section quotes no count, because four
+  rounds of edits made every count here wrong.)
+- Rejecting a `listen-interface` option leaves DNS placement to Juju spaces, which
+  is where operators already manage it — though the binding that would express
+  that is not declared yet (§2.2).
 - The `upstream-dns` decision now rests on a checked fact — no resolver charm, no
   interface — rather than on speculation about a charm that does not exist.
 - Deciding `limit: 1` on `cos-agent` now avoids breaking `juju refresh` later.
@@ -231,8 +253,8 @@ rather than a degraded service.
 
 ### Negative
 
-- Nine options is a large permanent API surface for a first release. Each one is
-  a compatibility commitment we cannot walk back.
+- Even a handful of options is a large permanent API surface for a first release.
+  Each one is a compatibility commitment we cannot walk back.
 - `ntp-server-enabled=false` diverges from the workload's own default, so an
   operator comparing the charm against a manual install will see different
   behaviour. Documented, but still a surprise.

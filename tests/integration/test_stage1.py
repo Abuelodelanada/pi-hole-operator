@@ -63,10 +63,11 @@ def test_the_webserver_binds_port_80_on_the_first_boot(deployed: jubilant.Juju):
     # WHEN the listening sockets are read
     result = deployed.exec("ss -tlpn", unit=f"{APP_NAME}/0")
 
-    # THEN port 80 is bound. The packaged default requests TLS, FTL
-    # cannot generate a certificate in this snap, and the SSL failure
-    # aborts the whole webserver — so without the charm's correction
-    # there would be no admin UI and no HTTP API at all.
+    # THEN port 80 is bound, with no help from the charm: the snap's
+    # launcher self-signs its certificate so the webserver comes up on
+    # its own (upstream PR #15). Before that fix a stock install had no
+    # admin UI and no HTTP API at all, and this assertion is what would
+    # notice a regression.
     assert ":80 " in result.stdout
 
 
@@ -250,12 +251,18 @@ def test_an_unauthenticated_config_write_is_refused_from_another_host(
     # redirects DNS for every device using this resolver.
     assert result.stdout.strip() != "200"
 
-    # AND the value never landed
-    written = deployed.exec(
-        "grep -A3 upstreams /var/snap/pihole-by-rajannpatel/current/etc/pihole/pihole.toml",
-        unit=f"{APP_NAME}/0",
+    # AND the value never landed. Parsed, not grepped: FTL writes
+    # arrays across lines, so a `grep` that matched only the comment
+    # block would satisfy a *negative* assertion without ever reading
+    # the array — a test that passes by looking away.
+    script = (
+        "import json, tomllib; "
+        "print(json.dumps(tomllib.load(open("
+        "'/var/snap/pihole-by-rajannpatel/current/etc/pihole/pihole.toml', 'rb'"
+        "))['dns']['upstreams']))"
     )
-    assert "198.51.100.66" not in written.stdout
+    written = deployed.exec(f'python3 -c "{script}"', unit=f"{APP_NAME}/0")
+    assert "198.51.100.66" not in json.loads(written.stdout)
 
 
 def test_removing_the_application_leaves_the_host_with_working_dns(

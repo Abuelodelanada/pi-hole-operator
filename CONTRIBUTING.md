@@ -47,6 +47,7 @@ src/
   pihole_config.py   # pydantic model of the charm's config options. No ops.
   resolved.py        # systemd-resolved drop-in. Never imports ops.
 docs/
+  overview.md        # two-minute map of the pattern and the src/ layout
   adr/               # decisions — why the charm is shaped this way
   roadmap.md         # stages, acceptance criteria, open spikes
   snap-constraints.md# verified facts about the workload

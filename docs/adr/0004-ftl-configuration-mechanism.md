@@ -155,7 +155,7 @@ robust discovery mechanism if the stock port ever stops being dependable.)*
 ### 5.2 Authentication
 
 ```
-POST /api/auth   {"password": "<cli_pw>", "totp": null}   ->  {"session": {"sid": ...}}
+POST /api/auth   {"password": "<admin password>"}         ->  {"session": {"sid": ...}}
 PATCH /api/config                                          header: sid: <sid>
 DELETE /api/auth                                           header: sid: <sid>
 ```
@@ -182,7 +182,7 @@ Nested, mirroring `pihole.toml`, not dotted:
 
 Multiple keys can be sent in one request, which means one round trip per
 reconcile rather than one per key. `compute` should therefore emit a single
-`ApplyFtlConfig` outcome carrying the whole desired mapping.
+`SetFtlConfig` outcome carrying the whole desired mapping.
 
 ### 5.4 Read-back is still mandatory
 
@@ -252,7 +252,7 @@ Run 2026-08-07 on an Ubuntu 26.04 LXD VM, snap rev 1348.
 
 ### Positive
 
-- **One mechanism for 165 of 166 keys.** No routing predicate, no per-key
+- **One mechanism for all 166 keys.** No routing predicate, no per-key
   exception, no `_is_snapd_safe_key`, and the `dns.dnssec` special case
   evaporates because the API applies it correctly.
 - **No DNS blip on config change.** `PATCH` does not restart FTL, so the charm
@@ -263,8 +263,8 @@ Run 2026-08-07 on an Ubuntu 26.04 LXD VM, snap rev 1348.
 - **Better error messages than we could have written.** FTL's `400` hints name
   the key and the violated constraint.
 - Multiple keys per request means one round trip per reconcile.
-- The bootstrap/steady-state split is a distinction with operational meaning, so
-  it should stay stable as FTL's key set changes.
+- One mechanism means one failure mode to understand, and it stays stable as
+  FTL's key set changes.
 
 ### Negative
 

@@ -5,21 +5,21 @@ Imports pydantic and stdlib only — no `ops` import, so it is testable
 without a harness. See ADR-0006 section 2.1.
 """
 
-from collections.abc import Mapping
 from enum import StrEnum
+from typing import TypedDict
 
 import pydantic
 
 
 class ListeningMode(StrEnum):
-    """FTL's `dns.listeningMode` vocabulary.
+    """The `dns.listeningMode` values this charm can honour.
 
-    See ADR-0006 section 2.1 and snap-constraints section 4.1.
+    Narrower than FTL's five: `SINGLE` and `BIND` need `dns.interface`,
+    which the charm does not manage. See ADR-0006 section 2.11 for why
+    that is a silent failure, and why widening later is safe.
     """
 
     LOCAL = "LOCAL"
-    SINGLE = "SINGLE"
-    BIND = "BIND"
     ALL = "ALL"
     NONE = "NONE"
 
@@ -33,6 +33,21 @@ def _parse_upstream_csv(value: str) -> tuple[str, ...]:
     if not value.strip():
         return ()
     return tuple(entry for raw in value.split(",") if (entry := raw.strip()))
+
+
+class IntentFields(TypedDict):
+    """The `PiholeIntent` fields a config value can set.
+
+    Mirrors `PiholeIntent` minus `admin_password`, which the charm owns
+    rather than the operator. Keeping it a `TypedDict` rather than a
+    plain dict is what lets pyright check the seam.
+    """
+
+    upstream_dns: tuple[str, ...] | None
+    listening_mode: str | None
+    blocking_enabled: bool
+    dnssec_enabled: bool
+    ntp_server_enabled: bool
 
 
 class PiholeConfig(pydantic.BaseModel):
@@ -54,7 +69,8 @@ class PiholeConfig(pydantic.BaseModel):
     dns_listening_mode: ListeningMode | None = pydantic.Field(
         default=None,
         description=(
-            "FTL listening mode: LOCAL, SINGLE, BIND, ALL, or NONE. Unset means unmanaged."
+            "FTL listening mode: LOCAL, ALL, or NONE. Unset means unmanaged. "
+            "FTL's SINGLE and BIND need an interface the charm does not manage."
         ),
     )
     blocking_enabled: bool = pydantic.Field(
@@ -86,11 +102,16 @@ class PiholeConfig(pydantic.BaseModel):
             return None
         return value
 
-    def intent_fields(self) -> Mapping[str, object]:
+    def intent_fields(self) -> IntentFields:
         """Return the kwargs for PiholeIntent, minus admin_password.
 
         Empty upstream_dns and None listening_mode are mapped to None
         so the charm treats them as unmanaged.
+
+        The `TypedDict` return is what makes the config-to-intent seam
+        checkable: `PiholeIntent(admin_password=..., **fields)` is
+        verified key by key, so renaming a field on either side fails
+        `tox -e static` instead of every hook at runtime.
         """
         upstreams = _parse_upstream_csv(self.upstream_dns)
         return {

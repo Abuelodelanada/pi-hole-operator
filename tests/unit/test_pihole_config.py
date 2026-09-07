@@ -55,7 +55,7 @@ def test_whitespace_only_upstream_dns_maps_to_none():
 
 def test_none_upstream_dns_normalises_to_empty():
     # GIVEN None as upstream_dns (Juju may send None for unset)
-    config = PiholeConfig(upstream_dns=None)  # type: ignore[arg-type]
+    config = PiholeConfig.model_validate({"upstream_dns": None})
 
     # WHEN the model is constructed
     # THEN it normalises to empty string
@@ -73,11 +73,24 @@ def test_comma_only_upstream_dns_yields_empty_tuple():
     assert fields["upstream_dns"] is None
 
 
-def test_listening_mode_accepts_ftl_vocabulary():
-    """Every FTL value is accepted."""
-    for mode in ("LOCAL", "SINGLE", "BIND", "ALL", "NONE"):
-        config = PiholeConfig(dns_listening_mode=mode)  # type: ignore[arg-type]
+def test_listening_mode_accepts_the_modes_the_charm_can_honour():
+    # GIVEN each mode the charm offers
+    # WHEN it is parsed
+    # THEN it is accepted
+    for mode in ("LOCAL", "ALL", "NONE"):
+        config = PiholeConfig.model_validate({"dns_listening_mode": mode})
         assert config.dns_listening_mode == ListeningMode(mode)
+
+
+def test_listening_mode_rejects_the_modes_that_need_an_interface():
+    # GIVEN FTL's SINGLE and BIND, which need `dns.interface`
+    # WHEN either is offered
+    # THEN it is refused, rather than accepted and silently unable to
+    # work. FTL in SINGLE with no interface can stop answering DNS
+    # while the charm's readiness gate still reports Active.
+    for mode in ("SINGLE", "BIND"):
+        with pytest.raises(pydantic.ValidationError):
+            PiholeConfig.model_validate({"dns_listening_mode": mode})
 
 
 def test_listening_mode_accepts_none():
@@ -96,12 +109,12 @@ def test_listening_mode_rejects_invalid():
     # WHEN the model is constructed
     # THEN pydantic rejects it
     with pytest.raises(pydantic.ValidationError):
-        PiholeConfig(dns_listening_mode="INVALID")  # type: ignore[arg-type]
+        PiholeConfig.model_validate({"dns_listening_mode": "INVALID"})
 
 
 def test_listening_mode_empty_string_yields_none():
     # GIVEN an empty string for listening_mode
-    config = PiholeConfig(dns_listening_mode="")  # type: ignore[arg-type]
+    config = PiholeConfig.model_validate({"dns_listening_mode": ""})
 
     # WHEN intent_fields is called
     fields = dict(config.intent_fields())
@@ -146,4 +159,4 @@ def test_model_is_frozen():
     """PiholeConfig is immutable, like the rest of the pure core."""
     config = PiholeConfig()
     with pytest.raises((ValueError, TypeError, AttributeError)):
-        config.blocking_enabled = False  # type: ignore[misc]
+        config.blocking_enabled = False

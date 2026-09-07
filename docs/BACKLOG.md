@@ -96,7 +96,43 @@ Ordered by estimated value — user impact against implementation risk.
    needs its own handler. (ADR-0007)
 10. **`app_pwhash`** for non-2FA-aware API clients. No demand yet. (ADR-0007)
 
+## Accepted debt — reviewed, tracked, not blocking
+
+Four items the reviewer raised and Stage 2 shipped with, each with what would
+make it worth doing:
+
+- **The read-back verifier in `pihole.py` is 54 lines with six near-identical
+  `raise` blocks**, and re-parses `pihole.toml` once per key. **Trigger:** the
+  next key whose comparison is not string/bool/array, or the first time someone
+  has to change the failure message in six places. The shape it wants is a pure
+  `_mismatch(key, expected, actual) -> str | None` called from a three-line loop,
+  with `_read_toml()` hoisted out.
+- **`_machine_status(facts, intent)` takes the whole intent to use one field.**
+  `fetch` was narrowed to `admin_password` for exactly this reason (rule 8,
+  narrowest collaborator); the status path was not. **Trigger:** any change to
+  that function, or the first time it reaches for a second intent field.
+- **`pinned_revision` is derived twice** — once as a fact for the plan, once
+  inside `install()` for the effect. They cannot diverge today (both call
+  `revision_for(self._machine())` on the same instance), but the plan and the
+  effect consult the same policy independently. **Trigger:** the pin becoming
+  anything but a pure function of the architecture.
+- **ADR-0003's illustrative union still shows `ApplyFtlConfig(via_snap_set,
+  via_ftl_config)`** and a bootstrap order that ADR-0005 §2.9 later inverted. It
+  is an illustration inside an Accepted ADR, so correcting it is a judgement call
+  about how much history to rewrite. **Trigger:** the next reader who is confused
+  by it, or a new ADR that supersedes 0003.
+
 ## Deferred from ADRs
+
+- **`extra-bindings: dns` and `dns.interface`.** ADR-0006 §2.2 rejects
+  `listen-interface`/`bind-address` as config options in favour of a Juju space,
+  and that rejection stands. But the binding was declared without a consumer —
+  public surface promising something the charm does not do — so it was withdrawn
+  on 2026-09-05. **Trigger:** the work that manages `dns.interface`, the FTL key
+  the bind address feeds. That key is also what would make
+  `dns-listening-mode`'s `SINGLE` and `BIND` mean anything; until then the enum
+  rejects both and the unit goes `Blocked` (ADR-0006 §2.11), so widening the enum
+  belongs in the same change.
 
 - **Operator-supplied admin password.** The charm always generates one (ADR-0007 §3);
   there is deliberately no config option. If a real requirement appears — integrating
@@ -161,7 +197,7 @@ The two draft files in the repository root can go.
 
 - **`charm-reviewer` audit at every stage boundary.** A green
   `tox -e lint,static,unit` is **not** evidence of compliance with non-negotiables
-  1, 2, 4, 6, 7, or 8. Do not treat a passing gate as a review.
+  1, 2, 4, 5, 6, 7, or 8. Do not treat a passing gate as a review.
 - **CI on 3.14 only** from Stage 0 — the sole interpreter in the 26.04 archive.
   Testing 3.12 would exercise a configuration that never exists in production and
   would silently forbid 3.13+ syntax. (ADR-0002 §2.2.4)

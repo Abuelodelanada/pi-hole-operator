@@ -7,8 +7,8 @@ This is not a Kubernetes charm. There is no Pebble, no `lightkube`, no OCI image
 
 ## Where we are
 
-**Stage 1 is closed; Stage 2 is implemented and awaiting its integration
-run.** The charm installs the snap **pinned to `SNAP_REVISIONS` and held against
+**Stages 1 and 2 are closed** — Stage 2's acceptance is green on LXD and its
+`charm-reviewer` audit is clean (2026-09-07). The charm installs the snap **pinned to `SNAP_REVISIONS` and held against
 auto-refresh** (ADR-0010 — the snap never updates itself), frees port 53, starts
 FTL, closes the snap's default NTP server on 123/udp, owns the admin password,
 applies declarative config through `PATCH /api/config` with a read-back against
@@ -19,7 +19,8 @@ missing feature as a defect rather than as unstarted work.
 The public interface today: two actions (`get-admin-password`,
 `rotate-admin-password`), **five config options** (`upstream-dns`,
 `dns-listening-mode`, `blocking-enabled`, `dnssec-enabled`,
-`ntp-server-enabled`) and `extra-bindings: dns`. **Zero relations.** Each option
+`ntp-server-enabled`). **Zero relations, and no bindings** — `extra-bindings:
+dns` was withdrawn until something consumes it (BACKLOG). Each option
 is justified in [ADR-0006](docs/adr/0006-configuration-surface.md) §2.1 against
 rule 4's three alternatives; the sixth and seventh (`snap-channel`,
 `snap-revision`) were **removed** because the revision is charm policy, not
@@ -136,6 +137,7 @@ pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, tenacity
 uv.lock
 tox.ini
 docs/
+  overview.md             # two-minute map: the pattern, and what each src/ file is for
   pattern.md              # how the charm decides what to do, taught with a small example
   adr/                    # numbered decision records. Load `new-adr` before adding one.
   implementation/         # how an existing module works. One file per module, as it lands.
