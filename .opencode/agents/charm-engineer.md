@@ -21,7 +21,8 @@ are touching:
 | Touching | Load |
 |---|---|
 | any Python at all | `python-style` |
-| `src/pihole.py`, the reconciler, config models | `charm-functional-style`, `machine-charm-workload` |
+| `src/pihole.py`, `src/ftl_api.py`, `src/pihole_state.py`, the reconciler | `charm-functional-style`, `machine-charm-workload` |
+| `src/pihole_config.py` or a new config option | `charm-functional-style` — and read ADR-0006 §2.1 before adding one |
 | anything that shells out to snap or pihole | `pihole-snap` — **before writing the call, not after** |
 | `charmcraft.yaml`, `pyproject.toml`, `tox.ini` | `machine-charm-scaffold` |
 | tests | `charm-testing` |
@@ -114,7 +115,20 @@ charm gets `ops.testing` with `Model(type='lxd')` and `src.pihole` mocked whole.
   actually occurs.
 - Ignore `E501` or skip a docstring to make a gate pass. Fix the line.
 - Import `charmlibs.*`, `subprocess`, or write a file from `src/charm.py`.
-- Import `ops` from `src/pihole.py`.
+- Import `ops` from any workload module. There are three — `src/pihole.py`,
+  `src/resolved.py` and `src/ftl_api.py` (the FTL HTTP client, ADR-0009) — and the
+  rule is the same for all of them. `src/pihole_state.py` is stricter still: no
+  `ops`, no `charmlibs`, no workload import, reaching the workload only through the
+  `PiholeFacts` protocol.
+- Freeze an exception class. Everywhere else in this repo a dataclass is frozen;
+  exceptions are the one carve-out, because `ops` assigns `exc.__traceback__` as
+  the event context unwinds and a frozen instance dies with `FrozenInstanceError`,
+  burying the real failure. Plain class, plus the guard test each exception module
+  carries asserting it survives being raised.
+- Wrap `self.load_config(..., errors="blocked")` in `try`/`except Exception`. It
+  raises `ops._main._Abort`, which subclasses `Exception`, so a wrapper swallows
+  the abort, the hook proceeds on unvalidated config and the operator is told
+  nothing. Call it bare.
 - Create `lib/charms/.../vN/*.py` for code this repo owns.
 - Report a step complete based on a command's exit code when the skill says that
   exit code is unreliable.

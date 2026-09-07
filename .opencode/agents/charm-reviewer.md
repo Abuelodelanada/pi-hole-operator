@@ -33,6 +33,10 @@ permission:
     'tox -e static*': allow
     'tox -e unit*': allow
     'tox -e flaplint*': allow
+    # `tox -e lint*` also matches `tox -e lint,fmt`, and `fmt` runs
+    # `ruff format`, which writes. Last matching rule wins, so this
+    # final deny closes that without costing `static`'s posargs.
+    '*fmt*': deny
 ---
 
 # Charm Reviewer
@@ -159,13 +163,20 @@ the `ops` definition is just an opinion. The triggers:
 - Does `src/charm.py` import `subprocess`, `charmlibs.snap`, `charmlibs.systemd`,
   `pathlib` writes, or touch `/var/snap`? All of that belongs in a workload
   module.
-- Do the workload modules — `src/pihole.py` and `src/resolved.py` — import `ops`
-  or reference charm config/relations directly? They should take plain arguments
-  and return plain values. Note there are two of them: systemd-resolved work
-  belongs in `resolved.py`, not folded into `pihole.py`.
+- Do the workload modules import `ops` or reference charm config/relations
+  directly? They should take plain arguments and return plain values. **There are
+  three**, and the split is deliberate: `src/pihole.py` (snap, systemd, files),
+  `src/resolved.py` (systemd-resolved — never folded into `pihole.py`), and
+  `src/ftl_api.py` (the FTL HTTP client, ADR-0009). A finding here on `ftl_api.py`
+  is as blocking as one on `pihole.py`; it is the newest module and the easiest to
+  forget.
 - Does `src/pihole_state.py` import `ops`, `charmlibs`, or a workload module? It
   is the pure core and must import none of them — it reaches the workload only
   through the `PiholeFacts` protocol.
+- Does `src/pihole_config.py` import `ops` or a workload module? It is the
+  pydantic model of the config options and needs neither: the charm calls
+  `self.load_config(PiholeConfig)` and the model hands back an `IntentFields`
+  `TypedDict`. An `import ops` there means the config seam has been inverted.
 
 **Verification discipline**
 - Every `snap set`, `snap connect`, `snap start`, and `pihole` invocation: is the
@@ -191,6 +202,11 @@ the `ops` definition is just an opinion. The triggers:
   pydantic model would do?
 - Manual `self.config[...]` parsing where `self.load_config(cls, errors="blocked")`
   would do? Same for `event.params` vs `event.load_params(cls)`.
+- **Is that `load_config` call wrapped in `try`/`except Exception`?** Blocking.
+  With `errors="blocked"` it sets `BlockedStatus` and raises `ops._main._Abort`,
+  which subclasses `Exception` — so a wrapper swallows it, the hook keeps running
+  with unvalidated config, and `_main` never reaches `_evaluate_status`, meaning
+  the operator is told nothing. The call must be bare.
 - `self.model.get_secret(...)` called positionally? It is keyword-only.
 - `get_content()` without `refresh=True` inside a `secret_changed` handler? Without
   the refresh, Juju never starts tracking the new revision.
@@ -230,6 +246,13 @@ the `ops` definition is just an opinion. The triggers:
   pass` in that position is the finding: it swallows a variant added later.
 - Any `dict`, `list`, or `set` in a function signature or a frozen dataclass
   field where `Mapping`, `Sequence`, or `FrozenSet` belongs?
+- **A frozen exception class.** This is the one place the frozen-dataclass habit
+  this section otherwise demands is a runtime bug: `ops`' `_event_context` assigns
+  `exc.__traceback__` on the way out, so a frozen exception dies with
+  `FrozenInstanceError` and buries the real failure. Every exception in this repo
+  is a plain (unfrozen) class, and each module carries a guard test asserting it
+  can take a traceback. Flag a frozen exception as Blocking, and flag a new
+  exception module that ships without its guard test.
 - Any mutation of a value that was passed in? Prefer a modified copy.
 
 **Composition over inheritance**
@@ -257,6 +280,13 @@ the `ops` definition is just an opinion. The triggers:
 - Was `PLC0415` removed from `select`? Without it, `E402` lets
   `def f(): import x` through silently, and the AGENTS.md rule becomes
   unenforced prose.
+- Were `enableTypeIgnoreComments = false` or
+  `reportUnnecessaryTypeIgnoreComment = "error"` removed from `[tool.pyright]`?
+  Same shape as the item above: strict mode leaves both permissive, so without
+  them a `# type: ignore[reportFoo]` — mypy's spelling, which pyright does not
+  parse — blanket-suppresses its whole line and is never reported when it goes
+  stale. With them, the only honoured form is `# pyright: ignore[rule]` and an
+  unnecessary one fails the gate. Any *new* `# type: ignore` is a finding.
 - Missing type annotations.
 - `print` instead of `logging`.
 - Bare `except:`, or `except Exception:` where a narrower exception is what
@@ -268,6 +298,36 @@ the `ops` definition is just an opinion. The triggers:
   must handle it.
 - Names that describe implementation rather than usage.
 - Parsed or serialised data not going through a pydantic model.
+
+**Docs that contradict the code**
+
+The dominant defect class of Stage 2, by count: roughly a dozen places asserting
+the opposite of the tree, found across three passes. It is invisible to every
+gate, it outlives the code it describes, and it is worse than a missing doc
+because a reader who finds it stops looking. **Check these pairs on every diff
+that touches `src/`, `charmcraft.yaml`, or `docs/` — do not wait to be asked.**
+
+- A config option's `description` in `charmcraft.yaml` against the pydantic
+  `Field(description=...)` against the enum members or validator that actually
+  accept values. Three copies of one vocabulary; Stage 2 shipped two of them
+  disagreeing.
+- Every `ADR-00NN section X` cited from `src/`, a docstring, or another doc:
+  does that section still exist and still say that? Sections get removed and
+  renumbered, and the citation keeps pointing confidently at the gap.
+- Names in prose against names in the code: an outcome, status, function, or test
+  that prose calls by a name the union or the file does not have. Grep the name
+  before accepting the sentence.
+- A roadmap acceptance line against the test it claims as evidence: does that test
+  exist under that name, and does it assert what the line says?
+- **Any count in prose** — "nine options", "six facts", "165 of 166 tests". This
+  repo has been wrong on counts four rounds running, so the standing rule is that
+  docs describe *shape*, not numbers. A diff that adds a new count is a finding
+  even when the number is currently right.
+- An ADR being edited without a new dated `Amended:` line, or worse, with an
+  existing one retro-edited so the record no longer says what changed when.
+- A `README`/`docs` table whose rows do not all have the header's column count.
+  GFM silently drops the surplus cell, so a whole sentence stops rendering and
+  the diff looks fine.
 
 **Ordering churn (flaplint)**
 - Any `set`, `frozenset`, set comprehension, `glob`, `listdir`, `relation.units`,
@@ -285,6 +345,18 @@ the `ops` definition is just an opinion. The triggers:
   "Should fix" unless the code is new, in which case they are Blocking.
 
 **Tests**
+- **For each new or changed test: name the mutation that makes it fail.** If you
+  cannot, that is the finding. A test whose observable does not move when the
+  behaviour under test breaks is worse than no test, because it gets cited as
+  evidence in a roadmap acceptance box and then nobody looks again. Two real
+  instances from Stage 2, both of which reached a ticked box before being caught:
+  an integration test asserting FTL's PID was unchanged to prove "no redundant
+  re-apply" — but a `PATCH` never restarts FTL, so the PID is stable either way;
+  and a revision test that accepted *any* revision present in `SNAP_REVISIONS`,
+  so an amd64 unit running the arm64 build passed. Treat a vacuous **acceptance**
+  test as Blocking, not as a nit. The repo's own standard is higher than "it
+  passes": a regression test should be demonstrated failing by reintroducing the
+  bug.
 - New behaviour without a test.
 - `ops.testing.State` without `Model(type='lxd')` — the default is `kubernetes`
   and will silently give you the wrong environment.

@@ -67,6 +67,15 @@ exclude = ["lib"]
 pythonVersion = "3.14"
 pythonPlatform = "Linux"
 typeCheckingMode = "strict"
+# strict leaves both of these permissive, so neither is redundant. Without
+# them a `# type: ignore[reportFoo]` — mypy's spelling, which pyright does
+# not parse — silently suppresses *every* error on its line and is never
+# reported when it goes stale. Four of the seven this repo accumulated were
+# unnecessary. `false` makes that spelling stop working, so the only
+# suppression pyright honours is `# pyright: ignore[rule]`, which it
+# validates; the report then fails the gate when one is no longer needed.
+enableTypeIgnoreComments = false
+reportUnnecessaryTypeIgnoreComment = "error"
 
 [tool.pytest.ini_options]
 minversion = "8.0"

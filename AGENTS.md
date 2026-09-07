@@ -117,6 +117,12 @@ tox -e lock       # regenerate uv.lock after changing pyproject.toml
 tox -e flaplint   # advisory: relation-databag ordering churn. Not in envlist.
 ```
 
+`tox.ini` sets `work_dir` outside the tree (override with `TOX_WORK_DIR`). That is
+not a preference: tox builds its venvs with symlinks, a working tree on a network
+mount may not allow them, and the half-built `.tox/` it leaves behind then lands in
+`charmcraft pack`'s build context and breaks the pack. With it, the commands above
+run verbatim anywhere.
+
 **A change is not done until `fmt`, `lint`, `static` and `unit` are green.** That
 is the floor, not the finish line — reread the non-negotiables above, because none
 of those four gates can see rules 1, 2, 4, 5, 6, 7 or 8. Run `flaplint` as well
@@ -149,7 +155,7 @@ src/
   pihole.py               # workload: snap install/start, config apply, readiness
   ftl_api.py              # workload: FTL HTTP API client (ADR-0009)
   pihole_state.py         # functional core: intent, state, outcome ADT, fetch/compute
-  pihole_config.py        # pydantic model of the charm's config options
+  pihole_config.py        # pydantic config model + the IntentFields TypedDict
   resolved.py             # workload: systemd-resolved port 53 orchestration
 tests/
   unit/                   # ops.testing, Model(type='lxd'), mocks src.pihole
@@ -199,6 +205,17 @@ Machine-checked:
   758's unparenthesized form, which makes `flaplint` skip the module without
   saying so. Give multi-type `except` clauses an `as err:` binding — see
   `python-style`.
+- **Type suppressions are checked, and only one spelling works.** `[tool.pyright]`
+  sets `enableTypeIgnoreComments = false` and
+  `reportUnnecessaryTypeIgnoreComment = "error"`, neither of which `strict` gives
+  you. So `# type: ignore[...]` — mypy's spelling — suppresses nothing, and the one
+  honoured form, `# pyright: ignore[rule]`, fails the gate once it is no longer
+  needed. Before these settings the repo carried seven of the mypy form, four of
+  them unnecessary and all of them silently blanket-suppressing their whole line.
+- **Frozen dataclasses everywhere except exceptions.** `ops` assigns
+  `exc.__traceback__` as the event context unwinds, so a frozen exception raises
+  `FrozenInstanceError` and buries the real failure. Each exception module carries
+  a guard test asserting its exceptions survive being raised.
 
 Not machine-checked — the reviewer's job:
 
