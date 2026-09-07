@@ -903,3 +903,145 @@ class RestartingApi:
         if request.get_header("Sid") == "sid-1":
             raise http_error(401, {"error": {"key": "unauthorized"}}).build()
         return FakeResponse(200, {"blocking": "enabled", "timer": None})
+
+
+# -- apply_config: the error paths. ------------------------------------
+
+
+def test_apply_config_authenticates_with_the_admin_password(
+    ftl: ftl_api.FtlApi,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a reachable API — and no cli_pw on disk at all, because
+    # config modification must not depend on the CLI credential
+    fake = api(monkeypatch, {**AUTH_OK, **LOGOUT_OK, "PATCH config": FakeResponse(200, {})})
+
+    # WHEN the config is applied
+    ftl.apply_config(PASSWORD, {"dns.blocking.active": True})
+
+    # THEN the session was opened with the admin password, and the
+    # PATCH body is the nested tree the API expects, not flat keys
+    assert fake.requests[0].body == {"password": PASSWORD}
+    assert fake.requests[1].body == {"config": {"dns": {"blocking": {"active": True}}}}
+
+
+def test_apply_config_wraps_an_unreachable_auth(
+    ftl: ftl_api.FtlApi,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN the API cannot be reached at all
+    write_cli_pw(snap_data, CLI_PW)
+    api(monkeypatch, {"POST auth": urllib.error.URLError("connection refused")})
+
+    # WHEN the config is applied
+    # THEN the wrap says which step failed
+    with pytest.raises(ftl_api.ApiUnavailableError, match="could not authenticate"):
+        ftl.apply_config(PASSWORD, {"dns.blocking.active": True})
+
+
+def test_apply_config_reports_a_failed_auth_status(
+    ftl: ftl_api.FtlApi,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN auth answers, but not with a 200
+    write_cli_pw(snap_data, CLI_PW)
+    fake = api(monkeypatch, {"POST auth": FakeResponse(503, {})})
+
+    # WHEN the config is applied
+    # THEN the status reaches the message, and with no session to
+    # drop there is no logout request either
+    with pytest.raises(ftl_api.ApiUnavailableError, match="HTTP 503"):
+        ftl.apply_config(PASSWORD, {"dns.blocking.active": True})
+    assert [request.route for request in fake.requests] == ["POST auth"]
+
+
+def test_apply_config_wraps_an_unreachable_patch(
+    ftl: ftl_api.FtlApi,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN auth succeeds but the PATCH cannot be delivered
+    write_cli_pw(snap_data, CLI_PW)
+    api(monkeypatch, {**AUTH_OK, "PATCH config": urllib.error.URLError("reset")})
+
+    # WHEN the config is applied
+    # THEN the wrap names the PATCH as the step that failed
+    with pytest.raises(ftl_api.ApiUnavailableError, match="PATCH /api/config could not"):
+        ftl.apply_config(PASSWORD, {"dns.blocking.active": True})
+
+
+def test_apply_config_reports_an_unexpected_patch_status(
+    ftl: ftl_api.FtlApi,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN the PATCH answers with a status that is neither 200 nor 400
+    write_cli_pw(snap_data, CLI_PW)
+    api(monkeypatch, {**AUTH_OK, **LOGOUT_OK, "PATCH config": FakeResponse(500, {})})
+
+    # WHEN the config is applied
+    # THEN it is reported as unexpected rather than parsed as an answer
+    with pytest.raises(ftl_api.ApiUnavailableError, match="unexpected HTTP 500"):
+        ftl.apply_config(PASSWORD, {"dns.blocking.active": True})
+
+
+def test_a_non_string_hint_falls_back_to_a_generic_message(
+    ftl: ftl_api.FtlApi,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a 400 whose hint is not a string — FTL's own shape is not
+    # contractually frozen, so the client must not assume
+    write_cli_pw(snap_data, CLI_PW)
+    api(monkeypatch, {**AUTH_OK, "PATCH config": http_error(400, {"hint": 123})})
+
+    # WHEN the config is applied
+    # THEN the fallback text stands in for the missing hint
+    with pytest.raises(ftl_api.ApiConfigError) as exc_info:
+        ftl.apply_config(PASSWORD, {"dns.blocking.active": True})
+    assert exc_info.value.hint == "FTL rejected the config (HTTP 400)"
+
+
+def test_the_config_error_renders_the_hint_verbatim():
+    # GIVEN a config error carrying FTL's hint
+    err = ftl_api.ApiConfigError(hint="dhcp.start is not a valid address")
+
+    # WHEN it is rendered, as the BlockedStatus builder does
+    # THEN the hint is the whole message — it was written for a human
+    assert str(err) == "dhcp.start is not a valid address"
+
+
+def test_api_exceptions_survive_the_ops_event_boundary():
+    # GIVEN every exception this module can raise across a handler
+    errors = [
+        ftl_api.ApiUnavailableError(reason="unreachable"),
+        ftl_api.ApiTimeoutError(timeout=120.0),
+        ftl_api.ApiConfigError(hint="a hint"),
+    ]
+
+    # WHEN ops' `_event_context` assigns `__traceback__` on the way out
+    for err in errors:
+        err.__traceback__ = err.__traceback__
+
+    # THEN none of them is a frozen dataclass — the assignment would
+    # raise `FrozenInstanceError` and mask the real failure
+
+
+def test_keys_sharing_a_prefix_share_a_table_in_the_body(
+    ftl: ftl_api.FtlApi,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN two config keys that live under the same TOML table
+    write_pihole_toml(snap_data, dnssec=True, listening_mode="ALL")
+    fake = api(monkeypatch, {**AUTH_OK, **LOGOUT_OK, "PATCH config": FakeResponse(200, {})})
+
+    # WHEN they are applied in one PATCH
+    ftl.apply_config(PASSWORD, {"dns.dnssec": True, "dns.listeningMode": "ALL"})
+
+    # THEN the body nests them under one `dns` table, mirroring the
+    # file the API writes — not two parallel trees
+    assert fake.requests[1].body == {"config": {"dns": {"dnssec": True, "listeningMode": "ALL"}}}

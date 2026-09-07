@@ -26,7 +26,8 @@ from tests.integration.conftest import APP_NAME, BASE, DEPLOY_TIMEOUT, VM_CONSTR
 
 RESOLVED_DROP_IN = "/etc/systemd/resolved.conf.d/pihole.conf"
 STOCK_WEBSERVER_PORT = "443os"
-"""The TLS entry the charm must have removed before the first start."""
+"""The TLS entry the snap's launcher keeps once it self-signs a
+certificate. The charm does not touch `webserver.port`."""
 
 
 def unit_address(juju: jubilant.Juju) -> str:
@@ -62,25 +63,37 @@ def test_the_webserver_binds_port_80_on_the_first_boot(deployed: jubilant.Juju):
     # WHEN the listening sockets are read
     result = deployed.exec("ss -tlpn", unit=f"{APP_NAME}/0")
 
-    # THEN port 80 is bound. The packaged default requests TLS, FTL
-    # cannot generate a certificate in this snap, and the SSL failure
-    # aborts the whole webserver — so without the charm's correction
-    # there would be no admin UI and no HTTP API at all.
+    # THEN port 80 is bound, with no help from the charm: the snap's
+    # launcher self-signs its certificate so the webserver comes up on
+    # its own (upstream PR #15). Before that fix a stock install had no
+    # admin UI and no HTTP API at all, and this assertion is what would
+    # notice a regression.
     assert ":80 " in result.stdout
 
 
-def test_the_webserver_port_no_longer_requests_tls(deployed: jubilant.Juju):
+def test_the_webserver_port_is_the_snaps_own_and_serves_tls(deployed: jubilant.Juju):
+    """The charm no longer manages `webserver.port`; the snap does.
+
+    Anchor the match to the key. A bare `grep -A2 '^[webserver]'`
+    matches the comment block FTL writes above every key and never
+    reaches `port` at all — which is how the previous version of this
+    test passed while asserting nothing.
+    """
     # GIVEN a converged unit
-    # WHEN the value that actually landed is read back, rather than the
-    # exit code of the command that set it
-    result = deployed.exec(
-        "grep -A2 '^\\[webserver\\]' "
+    # WHEN the value the snap itself wrote is read back
+    port_line = deployed.exec(
+        "grep -E '^[[:space:]]+port = ' "
         "/var/snap/pihole-by-rajannpatel/current/etc/pihole/pihole.toml",
         unit=f"{APP_NAME}/0",
     )
 
-    # THEN the TLS entries are gone
-    assert STOCK_WEBSERVER_PORT not in result.stdout
+    # THEN the TLS entry is still there — the charm strips nothing —
+    # and 443 really answers. The pair matters: if certificate
+    # generation ever fails, PR #15's launcher falls back to HTTP-only,
+    # and then the charm would be advertising a port with no listener.
+    assert STOCK_WEBSERVER_PORT in port_line.stdout
+    listeners = deployed.exec("ss -tlpn", unit=f"{APP_NAME}/0")
+    assert ":443 " in listeners.stdout
 
 
 def test_nothing_listens_on_the_ntp_port(deployed: jubilant.Juju):
@@ -187,18 +200,23 @@ def test_rotating_the_password_replaces_it(deployed: jubilant.Juju):
     assert result.stdout.strip() == "200"
 
 
-def test_443_is_not_advertised(deployed: jubilant.Juju):
+def test_every_advertised_port_has_a_listener(deployed: jubilant.Juju):
     # GIVEN a converged unit
     # WHEN its opened ports are read
     ports = deployed.status().apps[APP_NAME].units[f"{APP_NAME}/0"].open_ports
 
-    # THEN DNS is advertised on both protocols, and 443 is not
-    # advertised at all, because the charm disables TLS and there is no
-    # listener there to document
+    # THEN DNS is advertised on both protocols, and so are both
+    # webserver ports: the snap's launcher self-signs a certificate and
+    # serves 443, so advertising it documents a listener that exists
     assert "53/tcp" in ports
     assert "53/udp" in ports
     assert "80/tcp" in ports
-    assert not [port for port in ports if port.startswith("443/")]
+    assert "443/tcp" in ports
+
+    # AND 80 is really listening. 443 is checked where its TOML entry
+    # is, so the two halves of that claim stay together.
+    listeners = deployed.exec("ss -tlpn", unit=f"{APP_NAME}/0")
+    assert ":80 " in listeners.stdout
 
 
 def test_the_workload_version_is_pi_holes(deployed: jubilant.Juju):
@@ -233,12 +251,18 @@ def test_an_unauthenticated_config_write_is_refused_from_another_host(
     # redirects DNS for every device using this resolver.
     assert result.stdout.strip() != "200"
 
-    # AND the value never landed
-    written = deployed.exec(
-        "grep -A3 upstreams /var/snap/pihole-by-rajannpatel/current/etc/pihole/pihole.toml",
-        unit=f"{APP_NAME}/0",
+    # AND the value never landed. Parsed, not grepped: FTL writes
+    # arrays across lines, so a `grep` that matched only the comment
+    # block would satisfy a *negative* assertion without ever reading
+    # the array — a test that passes by looking away.
+    script = (
+        "import json, tomllib; "
+        "print(json.dumps(tomllib.load(open("
+        "'/var/snap/pihole-by-rajannpatel/current/etc/pihole/pihole.toml', 'rb'"
+        "))['dns']['upstreams']))"
     )
-    assert "198.51.100.66" not in written.stdout
+    written = deployed.exec(f'python3 -c "{script}"', unit=f"{APP_NAME}/0")
+    assert "198.51.100.66" not in json.loads(written.stdout)
 
 
 def test_removing_the_application_leaves_the_host_with_working_dns(

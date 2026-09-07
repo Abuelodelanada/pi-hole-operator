@@ -250,7 +250,7 @@ Verified with `ss -tulpn`:
 |---|---|---|
 | 53 tcp+udp | DNS | `ftl.dns.port` |
 | 80 tcp | admin UI + API | default `webserver.port = "80o,443os,[::]:80o,[::]:443os"`; the `o` suffix means *optional* — it does not fail if taken |
-| 443 tcp | HTTPS | the `s` suffix; needs `webserver.tls.cert` |
+| 443 tcp | HTTPS | self-signed: the launcher generates `tls.pem` on first boot (PR #15, in revision 1400); `webserver.tls.cert` overrides |
 | **123 udp** | **NTP server — active by default** | `ntp.ipv4.active` / `ntp.ipv6.active` default `true`. Unexpected attack surface. Both keys are reachable, so the charm should either open it deliberately or set them `false`. |
 | 67 / 547 udp | DHCP / DHCPv6 | only when `dhcp.active=true` |
 | 4711 | **not used** | that was FTL v5's telnet API. v6 serves the API over HTTP on `webserver.port`. |
@@ -379,7 +379,8 @@ responding, and optionally on `gravity.db` exceeding a sane size.
 3. `snap connect` the manual plugs that apply.
 4. `snap alias`, or commit to the fully qualified command name.
 5. Apply config: `snap set ftl.*` for reachable keys, `pihole-FTL --config` for
-   the rest.
+   the rest. (Nothing is *required* before the first start any more: the
+   webserver self-signs and serves from boot — PR #15.)
 6. `snap start --enable pihole-by-rajannpatel.pihole-ftl`.
 7. Poll readiness via the HTTP API, not via systemd.
 

@@ -29,8 +29,11 @@ type ServiceRestarter = Callable[[str], bool]
 """The shape of `systemd.service_restart`, injected for tests."""
 
 
+# Not frozen for the same reason as `pihole.PiholeError`: ops assigns
+# `exc.__traceback__` when an exception leaves a handler, and this one
+# is deliberately re-raised in the `remove` handler.
 @final
-@dataclass(frozen=True)
+@dataclass
 class ResolvedError(Exception):
     """A change to systemd-resolved did not take effect.
 
@@ -49,10 +52,12 @@ class ResolvedError(Exception):
         return f"{detail}; {self.remedy}" if self.remedy else detail
 
 
-def is_stub_disabled(drop_in: Path = DROP_IN) -> bool:
-    """Report whether this charm's drop-in is in place, byte for byte.
+def is_port53_released(drop_in: Path = DROP_IN) -> bool:
+    """Report whether port 53 is free for Pi-hole.
 
-    A partial or hand-edited file counts as absent: the charm rewrites
+    The check is this charm's drop-in being in place, byte for byte —
+    disabling resolved's stub listener is *how* the port is freed. A
+    partial or hand-edited file counts as absent: the charm rewrites
     it rather than guessing what somebody meant.
     """
     return _read_drop_in(drop_in) == DROP_IN_CONTENT

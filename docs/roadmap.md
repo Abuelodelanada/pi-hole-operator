@@ -1,7 +1,7 @@
 # Implementation roadmap
 
-**Status:** Proposed
-**Last updated:** 2026-08-07
+**Status:** Accepted — Stages 0-2 closed
+**Last updated:** 2026-09-07
 **Audience:** `charm-engineer`
 
 Staged delivery plan for the charm specified in
@@ -17,6 +17,7 @@ defines acceptance. For *why*, follow the ADR links.
 
 | Doc | Answers |
 |---|---|
+| [`overview.md`](overview.md) | A two-minute map: the pattern, and what each file in `src/` is for. |
 | [`pattern.md`](pattern.md) | How the charm decides what to do, taught with a small example that is not Pi-hole. |
 | [`adr/`](adr/) | Why the charm is shaped this way. Decisions, alternatives, consequences. |
 | [`snap-constraints.md`](snap-constraints.md) | What the workload actually does. Verified facts, cited by the ADRs. |
@@ -113,8 +114,8 @@ stage; everything after it is elaboration.
 - `src/pihole_state.py` — `SnapAbsent | SnapPresent`, a minimal outcome union,
   `fetch()`, `compute()`.
 - `charm.py` — `_reconcile` wired to real outcomes; `_on_remove` calling
-  `resolved.restore()`; `set_ports` for 53/tcp+udp and 80/tcp. **Not 443** — the
-  charm disables TLS (ADR-0006 §2.10).
+  `resolved.restore()`; `set_ports` for 53/tcp+udp and 80/tcp. (443 was added
+  later, once the snap began self-signing its certificate — ADR-0006 §2.8.)
 - **`snap set ftl.webserver.port="80o,[::]:80o"` before the first start.** Without
   it the webserver never binds and the API never appears (snap-constraints §5.1).
 - **The NTP server the snap opens by default on 123/udp is closed** —
@@ -146,9 +147,11 @@ stage; everything after it is elaboration.
 - Pure: the outcome sequence puts `webserver.port`, the NTP closure and the
   password **before** `StartFtl`. This is the whole stage's correctness condition
   and it is a pure assertion on a tuple — no mocks.
-- Pure: an active NTP server yields exactly `DisableNtpServer` plus its own
-  readiness gate, because the configure hook restarts FTL on a changed value.
-- Regression: `set_ports` never opens 443 while TLS is disabled.
+- Pure: an NTP server that does not match intent yields exactly
+  `SetNtpServer(active=…)` plus its own readiness gate, because the configure hook
+  restarts FTL on a changed value.
+- Regression: `set_ports` opens exactly what the charm serves. (Stage 1 asserted
+  443 was *absent*; that inverted when the snap started serving it — ADR-0006 §2.8.)
 - `ctx.unit_status_history` passes through `Maintenance` rather than jumping to
   `Active`.
 - pytest runs with `-W error`.
@@ -196,11 +199,14 @@ stage; everything after it is elaboration.
 
 - `src/pihole_config.py` — pydantic model via
   `self.load_config(PiholeConfig, errors="blocked")`. CSV in, **JSON array out**
-  for `dns.upstreams` and friends. Deterministic ordering: serialise from a sorted
-  tuple.
-- An HTTP client in `pihole.py` using stdlib `urllib.request`: `POST /api/auth`
-  with a freshly read `cli_pw`, then a single `PATCH /api/config` carrying the whole
-  desired mapping, then `DELETE /api/auth`.
+  for `dns.upstreams` and friends. The **mapping** is serialised from a tuple
+  sorted by key, so an unchanged config never produces a spurious diff; the
+  **values** of an array keep the operator's order, because resolver order is a
+  preference and not noise.
+- An HTTP client using stdlib `urllib.request`: `POST /api/auth` with the **admin
+  password** — a `cli_pw` session is answered 403 for config (snap-constraints
+  §7.2.8) — then a single `PATCH /api/config` carrying the whole desired mapping,
+  then `DELETE /api/auth`. It lives in `ftl_api.py` (ADR-0009).
 - **Re-read `cli_pw` on every use.** It rotates on every FTL restart (verified).
 - `apply_ftl_config()` with mandatory read-back against `pihole.toml` via stdlib
   `tomllib`, raising `PiholeError(key, expected, actual)` — because **an unknown key
@@ -209,7 +215,11 @@ stage; everything after it is elaboration.
   written for a human.
 - `dns.dnssec` needs no special case any more: the API applies it correctly.
 - `$SNAP_DATA` resolved through `current`; never a hardcoded revision.
-- `extra-bindings: dns`; bind address from `self.model.get_binding("dns")`.
+- ~~`extra-bindings: dns`~~ — **deferred 2026-09-05.** It was declared and never
+  consumed, which is public surface that promises something the charm does not
+  do. It lands with the work that needs it: `dns.interface`, the FTL key that
+  makes `dns-listening-mode`'s `SINGLE` and `BIND` mean anything. See
+  [BACKLOG.md](BACKLOG.md).
 - `ntp-server-enabled` config option to re-enable the NTP server Stage 1
   disables; 123/udp opened only when enabled.
 
@@ -224,16 +234,42 @@ stage; everything after it is elaboration.
 - `cli_pw` is re-read on every call, never cached.
 - The charm never emits `pihole -a -p` or `pihole restartdns` — both are v5 syntax
   that print usage and **exit 0**.
-- `compute` emits `RestartFtl` **only** when a value actually changed.
+- `compute` emits `SetFtlConfig` **only** when a value actually changed. (There is
+  no `RestartFtl`: the PATCH applies live — ADR-0004 §6 and §8.)
 - Collections sorted **at construction**, never in the assertion.
 
 **Acceptance**
 
-- [ ] `dns.listeningMode=ALL` is observable in `pihole.toml` and FTL was **not**
-      restarted (PID unchanged).
-- [ ] `juju config pihole upstream-dns=...` is observable in `pihole.toml` **and**
-      in a `dig` result.
-- [ ] Setting the same config twice does not restart FTL (check the PID).
+- [x] `dns.listeningMode=ALL` is observable in `pihole.toml` and FTL was **not**
+      restarted (PID unchanged). — `test_a_camelcase_key_lands_without_restarting_ftl`,
+      green on LXD 2026-09-05. The PID comes from systemd's `MainPID`, so it
+      changes if and only if the service restarted.
+- [x] `juju config pihole upstream-dns=...` is observable in `pihole.toml` **and**
+      in a `dig` result. — `test_upstream_dns_reaches_both_the_toml_and_resolution`.
+      The TOML is read with `tomllib` on the unit, not grepped: FTL writes arrays
+      across lines, and an anchored `grep` returns `upstreams = [` and nothing
+      else.
+- [x] Setting the same config twice does not restart FTL (check the PID). —
+      `test_a_converged_machine_applies_nothing_and_restarts_nothing`. The PID
+      alone cannot earn this box: a PATCH never restarts FTL, so the PID is stable
+      whether the charm re-applied or not. The test counts the charm's own
+      `Applied FTL config` log lines across extra reconciles driven by a 10s
+      `update-status-hook-interval`, which observes `(Noop(),)` directly. It also
+      asserts the `applying Noop().` count *rose*, so a hook interval that never
+      took effect fails the test instead of passing it.
+- [x] Beyond the stage's own list, ADR-0010 gained its first end-to-end evidence:
+      `test_the_installed_revision_is_the_one_pinned_for_this_architecture` reads
+      `dpkg --print-architecture` and compares the installed revision to
+      `SNAP_REVISIONS[arch]` **by equality** — accepting either number would pass
+      an amd64 unit running the arm64 build — and
+      `test_the_snap_is_held_against_auto_refresh` proves the hold.
+- [x] `charm-reviewer` clean (2026-09-07, fourth pass over the tree that closes
+      this stage). Two earlier passes found the acceptance evidence itself to be
+      the weak part — a revision test that accepted any pinned number and a
+      converged-machine test that could not fail — which is why three of the boxes
+      above describe what their test *cannot* be fooled by. Four items are carried
+      as `docs/BACKLOG.md` **Accepted debt**, each with a trigger; the API-origin
+      port and Stage 1's historical webserver-port note are deferred on the record.
 
 ---
 

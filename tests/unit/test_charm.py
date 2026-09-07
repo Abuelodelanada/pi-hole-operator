@@ -35,17 +35,15 @@ DEFERRABLE_EVENTS = (
     "leader_elected",
 )
 
-STOCK_WEBSERVER_PORT = "80o,443os,[::]:80o,[::]:443os"
-"""The packaged default, whose TLS entries kill the whole webserver."""
-
 EFFECTS = frozenset(
     {
         "install",
-        "set_webserver_port",
-        "disable_ntp_server",
+        "hold_refresh",
+        "set_ntp_server",
         "set_password",
         "start",
         "await_api",
+        "apply_ftl_config",
     }
 )
 """The mutating calls, so a call log can exclude the fact reads."""
@@ -116,14 +114,14 @@ def test_reconcile_is_idempotent(
     # converged machine yields Noop, so no effect is reachable
     assert state.unit_status == testing.ActiveStatus()
     mock_pihole.install.assert_not_called()
+    mock_pihole.hold_refresh.assert_not_called()
     mock_pihole.start.assert_not_called()
-    mock_pihole.set_webserver_port.assert_not_called()
-    mock_pihole.disable_ntp_server.assert_not_called()
+    mock_pihole.set_ntp_server.assert_not_called()
     mock_pihole.set_password.assert_not_called()
     mock_resolved.disable_stub_listener.assert_not_called()
 
 
-def test_ports_never_include_443(
+def test_ports_advertise_the_self_signed_443(
     ctx: testing.Context[charm.PiholeCharm],
     base_state: testing.State,
     mock_pihole: MagicMock,
@@ -134,17 +132,18 @@ def test_ports_never_include_443(
     state_out = ctx.run(ctx.on.start(), base_state)
 
     # THEN DNS is advertised on both protocols — a bare int would mean
-    # tcp only — and the admin UI on 80. 443 is never opened, because
-    # the charm disables TLS and there is no listener there.
+    # tcp only — the admin UI on 80, and 443 too: the snap's launcher
+    # self-signs a certificate there on first boot, so it is a real
+    # listener, self-signed and all.
     assert state_out.opened_ports == {
         testing.TCPPort(53),
         testing.UDPPort(53),
         testing.TCPPort(80),
+        testing.TCPPort(443),
     }
-    assert testing.TCPPort(443) not in state_out.opened_ports
 
 
-def test_ports_never_include_the_ntp_server(
+def test_ports_never_include_the_ntp_server_by_default(
     ctx: testing.Context[charm.PiholeCharm],
     base_state: testing.State,
     mock_pihole: MagicMock,
@@ -157,6 +156,22 @@ def test_ports_never_include_the_ntp_server(
     # THEN 123/udp is not advertised: the server is disabled, not
     # exposed, so there is no listener to document
     assert testing.UDPPort(123) not in state_out.opened_ports
+
+
+def test_ports_include_ntp_when_enabled(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a machine with ntp-server-enabled=true
+    state_in = dataclasses.replace(base_state, config={"ntp-server-enabled": True})
+
+    # WHEN it reconciles
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN 123/udp is opened
+    assert testing.UDPPort(123) in state_out.opened_ports
 
 
 def test_a_fresh_machine_is_installed_started_and_gated(
@@ -175,19 +190,23 @@ def test_a_fresh_machine_is_installed_started_and_gated(
     effects = [name for name, _, _ in absent_snap.mock_calls if name in EFFECTS]
     assert effects == [
         "install",
-        "set_webserver_port",
-        "disable_ntp_server",
+        "hold_refresh",
+        "set_ntp_server",
         "set_password",
         "start",
         "await_api",
+        "apply_ftl_config",
     ]
 
     # AND the daemon was explicitly enabled, because the snap ships
     # install-mode: disable and would otherwise never run
     absent_snap.start.assert_called_once_with(enable=True)
-    absent_snap.set_webserver_port.assert_called_once_with("80o,[::]:80o")
-    absent_snap.disable_ntp_server.assert_called_once_with()
+    absent_snap.set_ntp_server.assert_called_once_with(active=False)
     absent_snap.set_password.assert_called_once_with(ADMIN_PASSWORD)
+    absent_snap.apply_ftl_config.assert_called_once_with(
+        password=ADMIN_PASSWORD,
+        config={"dns.blocking.active": True, "dns.dnssec": False},
+    )
 
 
 def test_the_snap_is_fetched_before_the_host_loses_its_resolver(
@@ -219,12 +238,13 @@ def test_the_snap_is_fetched_before_the_host_loses_its_resolver(
     ordered = [name for name, _, _ in recorder.mock_calls if name in ORDERED_EFFECTS]
     assert ordered == [
         "pihole.install",
+        "pihole.hold_refresh",
         "resolved.disable_stub_listener",
-        "pihole.set_webserver_port",
-        "pihole.disable_ntp_server",
+        "pihole.set_ntp_server",
         "pihole.set_password",
         "pihole.start",
         "pihole.await_api",
+        "pihole.apply_ftl_config",
     ]
 
 
@@ -238,28 +258,11 @@ def test_the_password_is_never_offered_to_snap_set(
     # WHEN it is bootstrapped
     ctx.run(ctx.on.install(), base_state)
 
-    # THEN the only value ever handed to the snapd configuration path is
-    # the webserver port. A password in snapd state is readable by
-    # anyone with snapd access, which is why setpassword exists.
-    for call in absent_snap.set_webserver_port.call_args_list:
+    # THEN no value ever handed to the snapd configuration path carries
+    # the password. A password in snapd state is readable by anyone with
+    # snapd access, which is why setpassword exists.
+    for call in absent_snap.set_ntp_server.call_args_list:
         assert ADMIN_PASSWORD not in call.args
-
-
-def test_a_stock_webserver_port_is_corrected(
-    ctx: testing.Context[charm.PiholeCharm],
-    base_state: testing.State,
-    mock_pihole: MagicMock,
-    mock_resolved: MagicMock,
-):
-    # GIVEN an installed machine still carrying the packaged default,
-    # whose TLS entries abort the entire webserver
-    mock_pihole.webserver_port.return_value = STOCK_WEBSERVER_PORT
-
-    # WHEN it reconciles
-    ctx.run(ctx.on.config_changed(), base_state)
-
-    # THEN the port is rewritten to plain HTTP only
-    mock_pihole.set_webserver_port.assert_called_once_with("80o,[::]:80o")
 
 
 def test_an_uninstalled_machine_is_maintenance_not_active(
@@ -337,55 +340,6 @@ def test_a_running_daemon_without_an_api_is_blocked(
     assert "HTTP API on port 80" in state_out.unit_status.message
 
 
-def test_a_missing_api_is_not_blamed_on_a_port_the_charm_has_not_fixed(
-    ctx: testing.Context[charm.PiholeCharm],
-    base_state: testing.State,
-    mock_pihole: MagicMock,
-    mock_resolved: MagicMock,
-):
-    """The API gate is only valid after the port has been corrected.
-
-    On a stock install FTL asks for TLS, cannot generate a
-    certificate inside the snap, and the SSL failure aborts the
-    *whole* webserver — so the API can never answer. Blocked here
-    would accuse a human of a fault the charm has simply not got to
-    yet, and one spurious Blocked masks every other status the
-    handler adds (ADR-0005 section 2.8).
-    """
-    # GIVEN a running daemon still carrying the packaged port, whose API
-    # therefore cannot be answering. The mocked workload keeps reporting
-    # that port afterwards, which is what a hook that never reached
-    # `_reconcile` — an action, or a follower — would see.
-    mock_pihole.webserver_port.return_value = STOCK_WEBSERVER_PORT
-    mock_pihole.api_facts.return_value = api_facts(api_ready=False)
-
-    # WHEN it reconciles
-    state_out = ctx.run(ctx.on.update_status(), base_state)
-
-    # THEN the unit says it is working on it, not that a human must
-    assert state_out.unit_status == testing.MaintenanceStatus("correcting the FTL webserver port")
-
-
-def test_a_drifted_port_is_not_active_even_when_the_api_answers(
-    ctx: testing.Context[charm.PiholeCharm],
-    base_state: testing.State,
-    mock_pihole: MagicMock,
-    mock_resolved: MagicMock,
-):
-    # GIVEN a machine whose API answers but whose webserver port is not
-    # the one the charm asked for — the intent was never applied
-    mock_pihole.webserver_port.return_value = STOCK_WEBSERVER_PORT
-
-    # WHEN it reconciles
-    state_out = ctx.run(ctx.on.update_status(), base_state)
-
-    # THEN it is not Active. This diff is pullable, so it is pulled:
-    # reporting Active over unapplied configuration is the highest
-    # severity silent failure this charm could have (ADR-0005 2.5).
-    assert state_out.unit_status != testing.ActiveStatus()
-    assert isinstance(state_out.unit_status, testing.MaintenanceStatus)
-
-
 def test_an_open_config_api_is_blocked_and_named(
     ctx: testing.Context[charm.PiholeCharm],
     base_state: testing.State,
@@ -431,12 +385,13 @@ def test_a_workload_error_is_pushed_to_the_status_handler(
     mock_resolved: MagicMock,
 ):
     # GIVEN a workload that reports success and changes nothing, which
-    # collect_unit_status cannot re-derive: the daemon is healthy
-    mock_pihole.webserver_port.return_value = STOCK_WEBSERVER_PORT
-    mock_pihole.set_webserver_port.side_effect = pihole.PiholeError(
-        operation="setting ftl.webserver.port",
-        expected="'80o,[::]:80o' in pihole.toml",
-        actual="it reads back as None",
+    # collect_unit_status cannot re-derive: the daemon is healthy, and
+    # the hold is missing so the failing effect actually runs
+    mock_pihole.refresh_held.return_value = False
+    mock_pihole.hold_refresh.side_effect = pihole.PiholeError(
+        operation="holding pihole-by-rajannpatel against auto-refresh",
+        expected="a hold visible in `snap info`",
+        actual="snapd reports no hold",
     )
 
     # WHEN it reconciles
@@ -445,7 +400,7 @@ def test_a_workload_error_is_pushed_to_the_status_handler(
     # THEN the failure the reconciler alone knew about wins over the
     # Active status the machine's own state would have produced
     assert isinstance(state_out.unit_status, testing.BlockedStatus)
-    assert "reads back as None" in state_out.unit_status.message
+    assert "snapd reports no hold" in state_out.unit_status.message
 
 
 def test_a_resolved_failure_is_pushed_to_the_status_handler(
@@ -455,7 +410,7 @@ def test_a_resolved_failure_is_pushed_to_the_status_handler(
     mock_resolved: MagicMock,
 ):
     # GIVEN a machine where port 53 cannot be freed
-    mock_pihole.stub_listener_disabled.return_value = False
+    mock_pihole.port53_released.return_value = False
     mock_resolved.disable_stub_listener.side_effect = resolved.ResolvedError(
         operation="restarting systemd-resolved",
         expected="a successful restart",
@@ -745,3 +700,104 @@ def test_a_secret_write_that_takes_no_effect_blocks_rather_than_errors(
     assert isinstance(state_out.unit_status, testing.BlockedStatus)
     assert "the secret still holds something else" in state_out.unit_status.message
     mock_pihole.install.assert_not_called()
+
+
+def test_config_changed_with_blocking_disabled_flows_to_intent(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a machine with blocking-enabled=false
+    state_in = dataclasses.replace(base_state, config={"blocking-enabled": False})
+
+    # WHEN the config-changed event fires
+    ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the intent flows to apply_ftl_config with the disabled value
+    mock_pihole.apply_ftl_config.assert_called_once_with(
+        password=ADMIN_PASSWORD, config={"dns.blocking.active": False}
+    )
+
+
+def test_config_changed_with_upstream_dns_flows_to_intent(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a machine with upstream-dns set
+    state_in = dataclasses.replace(base_state, config={"upstream-dns": "1.1.1.1, 9.9.9.9"})
+
+    # WHEN the config-changed event fires
+    ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the intent flows to apply_ftl_config
+    mock_pihole.apply_ftl_config.assert_called_once_with(
+        password=ADMIN_PASSWORD, config={"dns.upstreams": ("1.1.1.1", "9.9.9.9")}
+    )
+
+
+def test_config_changed_with_listening_mode_flows_to_intent(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a machine with dns-listening-mode set to ALL
+    state_in = dataclasses.replace(base_state, config={"dns-listening-mode": "ALL"})
+
+    # WHEN the config-changed event fires
+    ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the intent flows to apply_ftl_config
+    mock_pihole.apply_ftl_config.assert_called_once_with(
+        password=ADMIN_PASSWORD, config={"dns.listeningMode": "ALL"}
+    )
+
+
+def test_config_changed_with_ntp_enabled_applies_set_ntp_server(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a machine with ntp-server-enabled=true
+    state_in = dataclasses.replace(base_state, config={"ntp-server-enabled": True})
+
+    # WHEN the config-changed event fires
+    ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN set_ntp_server is called with active=True
+    mock_pihole.set_ntp_server.assert_called_once_with(active=True)
+
+
+def test_an_invalid_config_value_blocks_without_converging(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    absent_snap: MagicMock,
+    mock_resolved: MagicMock,
+):
+    """`load_config(errors="blocked")` must not be wrapped in a `try`.
+
+    It answers an invalid *value* by setting BlockedStatus and raising
+    ops' `_Abort(0)`, which exits the hook cleanly before
+    `_evaluate_status` — so nothing can override the status. That abort
+    is an `Exception` subclass: catching broadly around the call would
+    swallow it and the reconcile would carry on over unvalidated
+    config. This test is the only thing that notices if someone does.
+    """
+    # GIVEN a machine with nothing installed, so a reconcile that
+    # carried on would have to install the snap
+    state_in = dataclasses.replace(base_state, config={"dns-listening-mode": "NOT_A_MODE"})
+
+    # WHEN the config changes to a value the model rejects
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the unit is Blocked by ops itself, naming the config
+    assert isinstance(state_out.unit_status, testing.BlockedStatus)
+    assert "Invalid config" in state_out.unit_status.message
+
+    # AND the reconcile never ran: no effect reached the workload
+    absent_snap.install.assert_not_called()
+    absent_snap.hold_refresh.assert_not_called()

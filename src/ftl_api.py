@@ -10,6 +10,10 @@ The path constants come from `pihole_state`, the one module both
 workload files may import without a cycle: `pihole.py` composes
 `FtlApi`, so importing it back here would close a loop. See ADR-0009
 section 4.
+
+Provides three session-level operations: readiness probing, password
+classification, and config application via PATCH /api/config. See
+ADR-0004 section 5.
 """
 
 import http.client
@@ -41,7 +45,8 @@ from pihole_state import (
 logger = logging.getLogger(__name__)
 
 API_ORIGIN = "http://127.0.0.1"
-"""The charm knows the port because the charm sets it."""
+"""Port 80 of the snap's stock `webserver.port`, which the charm does
+not manage (ADR-0004, amended 2026-09-05)."""
 
 API_TIMEOUT = 10.0
 API_POLL_INTERVAL = 3.0
@@ -72,8 +77,36 @@ FTL's 16-session budget. See snap-constraints section 7.2.4.
 """
 
 
+# None of this module's exceptions may be a frozen dataclass: when one
+# crosses an event-handler boundary, ops' `_event_context` assigns
+# `exc.__traceback__`, and that assignment raises `FrozenInstanceError`
+# on a frozen instance — replacing the real error with a crash. Verified
+# against a deployed unit.
+def _nested(mapping: Mapping[str, object]) -> dict[str, object]:
+    """Convert flat dotted keys into the tree the PATCH body needs.
+
+    The API mirrors `pihole.toml`'s shape, not this charm's flat
+    vocabulary: `{"dns.upstreams": x}` must travel as
+    `{"dns": {"upstreams": x}}`. See ADR-0004 section 5.3.
+    """
+    tree: dict[str, object] = {}
+    for key, value in sorted(mapping.items()):
+        node: dict[str, object] = tree
+        segments = key.split(".")
+        for segment in segments[:-1]:
+            child: object | None = node.get(segment)
+            if not isinstance(child, dict):
+                child = {}
+                node[segment] = child
+            # A nested config table really is a str-keyed mapping;
+            # the cast tells pyright what isinstance cannot.
+            node = cast("dict[str, object]", child)
+        node[segments[-1]] = value
+    return tree
+
+
 @final
-@dataclass(frozen=True)
+@dataclass
 class ApiUnavailableError(Exception):
     """The FTL HTTP API could not be reached at all.
 
@@ -89,7 +122,7 @@ class ApiUnavailableError(Exception):
 
 
 @final
-@dataclass(frozen=True)
+@dataclass
 class ApiTimeoutError(Exception):
     """The HTTP API never answered within the wait window.
 
@@ -104,6 +137,22 @@ class ApiTimeoutError(Exception):
     def __str__(self) -> str:
         """Render the wait that ran out."""
         return f"the API never answered within {self.timeout:.0f}s"
+
+
+@final
+@dataclass
+class ApiConfigError(Exception):
+    """FTL reported a 400 on PATCH /api/config.
+
+    The `hint` field carries FTL's message verbatim — it is already
+    phrased for a human. See ADR-0004 section 5.4.
+    """
+
+    hint: str
+
+    def __str__(self) -> str:
+        """Render the hint FTL gave, verbatim."""
+        return self.hint
 
 
 @final
@@ -231,9 +280,8 @@ class FtlApi:
     def ready(self) -> bool:
         """Report whether `GET /api/dns/blocking` is answered.
 
-        Only meaningful once `webserver.port` is corrected (ADR-0005
-        section 2.6). Opens and closes its own session; `await_ready`
-        and `facts` share one instead, since FTL only has 16.
+        Opens and closes its own session; `await_ready` and `facts`
+        share one instead, since FTL only has 16.
         """
         match self._open_cli_session():
             case NoSession(reason=reason):
@@ -333,6 +381,63 @@ class FtlApi:
         finally:
             if session is not None:
                 self._logout(session.sid)
+
+    def apply_config(self, password: str, mapping: Mapping[str, object]) -> None:
+        """Apply FTL config keys in one PATCH, as an admin session.
+
+        Config modification needs the admin password: a `cli_pw`
+        session is read-only for config and is answered with 403
+        "The current CLI session is not allowed to modify Pi-hole
+        config settings" (verified on a deployed unit — snap-constraints
+        section 7.2.8). A 400 surfaces FTL's `hint` verbatim; any other
+        unexpected status raises `ApiUnavailableError`.
+
+        Raises:
+            ApiConfigError: FTL returned 400 with a hint.
+            ApiUnavailableError: The API could not be reached, or
+                returned an unexpected status.
+        """
+        try:
+            status, sid = self._authenticate(password)
+        except ApiUnavailableError as err:
+            raise ApiUnavailableError(
+                reason=f"could not authenticate for config PATCH: {err}"
+            ) from err
+        if status != HTTP_OK:
+            self._logout(sid)
+            raise ApiUnavailableError(
+                reason=f"authentication for config PATCH returned HTTP {status}"
+            )
+        try:
+            self._patch_config(sid, mapping)
+        finally:
+            self._logout(sid)
+
+    def _patch_config(self, sid: str | None, mapping: Mapping[str, object]) -> None:
+        """Issue PATCH /api/config and interpret the response.
+
+        Raises:
+            ApiConfigError: FTL returned 400 with a hint.
+            ApiUnavailableError: The API could not be reached, or
+                returned an unexpected status.
+        """
+        try:
+            status, payload = self._api_request(
+                "PATCH", "config", body={"config": _nested(mapping)}, sid=sid
+            )
+        except ApiUnavailableError as err:
+            raise ApiUnavailableError(
+                reason=f"PATCH /api/config could not be reached: {err}"
+            ) from err
+        if status == 400:
+            hint = payload.get("hint")
+            raise ApiConfigError(
+                hint=str(hint) if isinstance(hint, str) else "FTL rejected the config (HTTP 400)"
+            )
+        if status != HTTP_OK:
+            raise ApiUnavailableError(
+                reason=f"PATCH /api/config returned unexpected HTTP {status}"
+            )
 
     # -- Private. ---------------------------------------------------
 

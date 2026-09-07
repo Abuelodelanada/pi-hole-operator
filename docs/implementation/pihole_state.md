@@ -21,8 +21,11 @@ It imports neither `ops` nor any workload module, which has two consequences:
    other for anything but the `FtlApi` class itself. This is why the snap path
    constants live here rather than in `pihole.py` (ADR-0009 §4).
 
-Reading `compute`, `_bootstrap` and `_converge` — 66 lines — tells you everything
-the charm does.
+Reading `compute`, `_bootstrap`, `_converge` and their two helpers
+(`_ntp_step`, `_drifted_config`) tells you everything the charm does. They fit on
+two screens, and no number is quoted here on purpose: an exact count that no gate
+verifies goes stale on the next change, and this document has shipped stale counts
+three times.
 
 ---
 
@@ -54,38 +57,54 @@ show an operator, whether to retry, and whether to reapply the password.
 type PiholeState = SnapAbsent | SnapPresent
 ```
 
-`SnapAbsent` carries no fields. `SnapPresent` carries the nine facts that only
-exist once the snap is installed. Nothing can construct "not installed, but the
-webserver port is 80".
+`SnapAbsent` carries no fields. `SnapPresent` carries every fact that only
+exists once the snap is installed. Nothing can construct "not installed, but
+its refresh is held".
 
 ### The intent
 
-`PiholeIntent`, one field for Stage 1: `admin_password`, declared
-`field(repr=False)` so the password cannot reach a log line through a `repr()`.
+`PiholeIntent`, six fields: `admin_password` (declared `field(repr=False)` so
+the password cannot reach a log line through a `repr()`) plus the five Stage 2
+config values. `None` in an optional field means *not managed*: the charm never
+writes that key, and drift on it is not computed.
+
+What `charm.py` actually holds is `DeclaredIntent = NoIntentYet | PiholeIntent`.
+`NoIntentYet` is the follower case — no password minted yet, so there is nothing
+to converge toward — and being a named variant rather than `None` is what keeps
+`assert_never` on the two `match` sites that consume it.
 
 ### The outcomes
 
-`PiholeOutcome`, eight variants: `ReleasePort53`, `InstallSnap`,
-`SetWebserverPort`, `DisableNtpServer`, `SetAdminPassword`, `StartFtl`,
-`AwaitApi`, `Noop`. Each is a value, not an action; `charm.py`'s `_apply` is the
-only thing that turns one into an effect.
+`PiholeOutcome`, nine variants: `ReleasePort53`, `InstallSnap`,
+`HoldSnapRefresh`, `SetNtpServer`, `SetAdminPassword`, `StartFtl`, `AwaitApi`,
+`SetFtlConfig`, `Noop`. Each is a value, not an action; `charm.py`'s `_apply` is
+the only thing that turns one into an effect.
 
 ### The effect boundary and the two functions
 
-`PiholeFacts` is a `Protocol` of seven reads. Two implementations exist: `Pihole`
-in production, and `FactsStub` in the tests.
+`PiholeFacts` declares one read per fact `fetch` needs, and nothing else. Two
+implementations exist: `Pihole` in production, and `FactsStub` in the tests.
 
 `fetch` is the charm's **only** impure read path, and it short-circuits: if
 `installed_revision()` is `None` it returns `SnapAbsent()` without reading
 anything else, because none of the other facts are knowable.
 
+Its second parameter is `admin_password: str` — a **measurement input**, not the
+intent. A salted `pwhash` cannot be compared, so the only way to observe "does
+FTL accept this password" is to offer a candidate (ADR-0007 §4.3). Taking the
+candidate rather than the whole intent keeps anything *desired* out of the
+function that only observes, and makes reaching for another intent field inside
+`fetch` impossible rather than merely discouraged.
+
 `compute` dispatches on the state union:
 
-- `SnapAbsent` → `_bootstrap`, which returns a **fixed seven-outcome tuple**. The
+- `SnapAbsent` → `_bootstrap`, which returns a **fixed eight-outcome tuple**. The
   order is the correctness condition and is stated once, literally, in that
   function.
 - `SnapPresent` → `_converge`, which appends conditionally in the same order,
-  minus whatever is already true.
+  minus whatever is already true. Two helpers keep it flat: `_ntp_step` (the
+  tri-state NTP comparison — unknown drifts to a correction) and
+  `_drifted_config` (the FTL config diff).
 
 ---
 
@@ -93,9 +112,9 @@ anything else, because none of the other facts are knowable.
 
 | Case | Behaviour | Why |
 |---|---|---|
-| `webserver_port()` returns `None` (file missing, unparseable TOML) | Recorded as `""` | `""` never equals `WEBSERVER_PORT`, so an unreadable port is treated as wrong and corrected. Mistaking it for correct would skip the fix and leave the webserver dead. |
+| `ntp_server_active()` returns `None` (unreadable TOML) | Treated as *open* | Unknown drifts toward the correction: it is idempotent and its own read-back adjudicates. Treating it as closed would leave 123/udp bound on a machine the charm could have fixed. |
 | `version` is `None` on an installed snap | `SnapPresent.version: str \| None` | The snap may declare no version. `charm.py` matches `version=str() as version` so it only reports a real one. |
-| A port correction is needed | `AwaitApi()` is appended too, even if `api_ready` was `True` | Changing the port restarts FTL (snap-constraints §4), so the step carries its own readiness gate instead of leaving an unguarded bounce for the next status check. |
+| The installed revision is not the pin for this architecture | `InstallSnap()` again — a re-pin | The hold stops snapd's timer, but a manual `snap refresh` can still move the snap. The drift check is the second line of defence (ADR-0010). |
 | An NTP correction is needed | `AwaitApi()` appended too, for the same reason | The configure hook restarts FTL whenever a *changed* value lands, so a plan that closes 123/udp cannot trust a readiness fact read before it. |
 | `PasswordUnverified` | **Not** reapplied | A hash is already set; rewriting it while the daemon is down is churn, and the salt means the write cannot be verified anyway. |
 | `PasswordUnset` | Always reapplied | An empty `pwhash` means FTL accepts *any* password, so the config API is open to the network. |
@@ -106,8 +125,8 @@ anything else, because none of the other facts are knowable.
 
 ## Testing strategy
 
-[`tests/unit/test_pihole_state.py`](../../tests/unit/test_pihole_state.py) — 16
-test functions, 23 collected cases, **zero mocks**: no `monkeypatch`, no
+[`tests/unit/test_pihole_state.py`](../../tests/unit/test_pihole_state.py) —
+**zero mocks**: no `monkeypatch`, no
 `unittest.mock`, no snap. `FactsStub` implements `PiholeFacts` with plain
 attributes and counts its reads.
 

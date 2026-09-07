@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-08-07
 **Accepted:** 2026-08-08
+**Amended:** 2026-09-05 — §2.6's ordering correction removed: the snap self-signs TLS and serves the webserver from the first boot (upstream PR #15, in the pinned revision), so there is no port correction for the API gate to follow. The gate itself is unchanged.
 **Amended:** 2026-08-11 — added §2.9: raising is only safe before the resolved drop-in exists, which reorders install ahead of freeing port 53.
 **Amended:** 2026-08-08 — §2.7 retried `snap.SnapError`, which does not cover its sibling exceptions. Corrected to `snap.Error`.
 **Related:** [ADR-0001: Charm Scope and Specification](0001-charm-scope-and-specification.md), [ADR-0003: Reconciler and Functional Core](0003-reconciler-and-functional-core.md), [ADR-0004: FTL Configuration Mechanism](0004-ftl-configuration-mechanism.md)
@@ -120,7 +121,7 @@ ops.BlockedStatus(
 | `snap set` read-back mismatch | `Blocked` via §2.4 | a retry reproduces the same silent drop |
 | FTL crash-looping on `EADDRINUSE` | `Blocked` | the launcher no longer pre-checks the port, so this needs intervention |
 | DNS answering, last gravity sync failed | **`Active` with a message** | the workload *is* offering its service, merely degraded |
-| DNS answering but the HTTP API is down after we set `webserver.port` | `Blocked` | the admin UI and the config path are both gone; a human must look |
+| DNS answering but the HTTP API is down | `Blocked` | the admin UI and the config path are both gone; a human must look |
 | daemon serving with `pwhash = ""` | `Blocked` | the config API is open to the network ([ADR-0007 §1.3](0007-admin-password-handling.md)). Should be unreachable by construction, but assert it |
 | snap store transient failure | **retry ~3× in-hook, then raise** | genuinely transient — but see §2.9, which constrains *when* raising is safe |
 | a bug in our own code | **let it raise** | it *is* an error; the traceback is the point |
@@ -183,22 +184,14 @@ daemon reports `active` long before blocking works, because the launcher forks a
 background child that waits up to 90s for FTL to answer DNS before downloading the
 blocklist ([snap-constraints §10](../snap-constraints.md)).
 
-**Ordering correction.** An earlier draft of this ADR gated readiness on the API
-without noticing that **on a stock install the API never comes up at all**: the
-packaged `webserver.port` requests TLS, certificate generation fails inside the
-snap, and the SSL error aborts the whole webserver including plain HTTP
-([snap-constraints §5.1](../snap-constraints.md)). A charm implemented as first
-written would have sat in `MaintenanceStatus` forever, waiting for an endpoint that
-could never appear.
+The webserver binds 80 and 443 from the first boot — the snap's launcher
+self-signs its certificate ([snap-constraints §5.1](../snap-constraints.md)) — so
+the API is reachable as soon as the daemon is up, and the gate needs no
+precondition beyond the start itself.
 
-So the API gate is only valid *after* the charm has corrected `webserver.port`.
-That correction is an **install step, not a config step**, and it must precede the
-first daemon start — see [ADR-0004 §2.4](0004-ftl-configuration-mechanism.md) and
-the Stage 1 ordering in the [roadmap](../roadmap.md).
-
-If the API is unreachable *after* the charm has set the port and the daemon is
-active, that is not "still starting" — it is `BlockedStatus`, because something
-the charm cannot fix has gone wrong.
+If the API is unreachable while the daemon is active, that is not "still
+starting" — it is `BlockedStatus`, because something the charm cannot fix has
+gone wrong.
 
 `snap-check` provides the rest, with semantic exit codes: `0` OK, `1` config
 error, `2` runtime/port error. Both are cheap and side-effect-free, which is what

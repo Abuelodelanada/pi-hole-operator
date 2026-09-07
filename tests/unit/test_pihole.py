@@ -12,6 +12,7 @@ patched, which is what makes "a workload that lies" expressible at all.
 
 import inspect
 import pathlib
+import urllib.error
 from collections.abc import Callable, Sequence
 
 import pytest
@@ -21,6 +22,7 @@ from charmlibs import snap
 import pihole
 import resolved
 from pihole_state import (
+    SNAP_REVISIONS,
     ApiFacts,
     PasswordAccepted,
     PasswordUnset,
@@ -38,14 +40,14 @@ from tests.unit.conftest import (
     SID,
     VERSION,
     FakeCache,
+    FakeResponse,
     FakeRunner,
     FakeSnap,
     api,
+    http_error,
     write_cli_pw,
     write_pihole_toml,
 )
-
-STOCK_PORT = "80o,443os,[::]:80o,[::]:443os"
 
 MOUNT_FAILURE = 'Mount snap "snapd" (27591): wrong fs type, bad option, bad superblock'
 """What snapd really says in a 26.04 LXD container.
@@ -128,46 +130,19 @@ def test_a_missing_ftl_service_is_not_treated_as_running(
     assert workload.ftl_status() == ServiceStatus(enabled=False, active=False)
 
 
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        (None, None),
-        ("", None),
-        ("this is not toml {{{", None),
-        ("[webserver]\nport = 80\n", None),
-        ("[webserver]\nport = 'a-string'\n", "a-string"),
-    ],
-)
-def test_the_webserver_port_is_read_from_pihole_toml(
-    workload: pihole.Pihole,
-    snap_data: pathlib.Path,
-    raw: str | None,
-    expected: str | None,
-):
-    # GIVEN a pihole.toml in one of the states it can be in — missing
-    # before the daemon has ever run, and TOML afterwards
-    if raw is not None:
-        write_pihole_toml(snap_data, raw=raw)
-
-    # WHEN the value is read back
-    # THEN anything unreadable reads as absent rather than as correct,
-    # so the charm applies the value instead of assuming it landed
-    assert workload.webserver_port() == expected
-
-
 def test_the_stub_listener_fact_comes_from_the_drop_in(
     workload: pihole.Pihole,
     drop_in: pathlib.Path,
 ):
     # GIVEN a machine where port 53 has not been freed
-    assert workload.stub_listener_disabled() is False
+    assert workload.port53_released() is False
 
     # WHEN the drop-in is written
     drop_in.parent.mkdir(parents=True)
     drop_in.write_text(resolved.DROP_IN_CONTENT, encoding="utf-8")
 
     # THEN the workload module reports it
-    assert workload.stub_listener_disabled() is True
+    assert workload.port53_released() is True
 
 
 def test_snap_check_returns_its_exit_code_verbatim(
@@ -195,7 +170,7 @@ def test_snap_check_returns_its_exit_code_verbatim(
 # -- Install and start. -----------------------------------------------
 
 
-def test_install_ensures_the_snap_from_the_stable_channel(
+def test_install_ensures_the_snap_at_the_pinned_revision(
     workload: pihole.Pihole,
     fake_snap: FakeSnap,
 ):
@@ -205,8 +180,9 @@ def test_install_ensures_the_snap_from_the_stable_channel(
     # WHEN the snap is installed
     workload.install()
 
-    # THEN snapd was asked for it, from the only channel that exists
-    assert fake_snap.ensure_calls == [(snap.SnapState.Present, "stable")]
+    # THEN snapd was asked for the charm's pinned revision (ADR-0010),
+    # with no channel: the revision is the identity, not the channel
+    assert fake_snap.ensure_calls == [(snap.SnapState.Present, None, SNAP_REVISIONS["amd64"])]
 
 
 def test_install_does_not_believe_snapd_without_a_revision(
@@ -221,8 +197,8 @@ def test_install_does_not_believe_snapd_without_a_revision(
     )
 
     # WHEN the snap is installed
-    # THEN the read-back catches it
-    with pytest.raises(pihole.PiholeError, match="still reports the snap as absent"):
+    # THEN the read-back catches it: the pin is proven, not assumed
+    with pytest.raises(pihole.PiholeError, match="snapd reports revision"):
         workload.install()
 
 
@@ -319,7 +295,7 @@ def test_install_retries_every_snap_error_not_just_snap_error(
     # errors rather than a call count keeps this independent of
     # how often install() reaches for the cache.
     assert cache.remaining_errors == 0
-    assert fake_snap.ensure_calls == [(snap.SnapState.Present, pihole.SNAP_CHANNEL)]
+    assert fake_snap.ensure_calls == [(snap.SnapState.Present, None, SNAP_REVISIONS["amd64"])]
 
 
 # -- Which remedy an install failure names. ----------------------------
@@ -419,7 +395,7 @@ def test_an_install_that_lands_nothing_in_a_container_names_the_constraint(
         workload.install()
 
     # THEN both ways an install can fail name the same remedy
-    assert "still reports the snap as absent" in str(exc_info.value)
+    assert "snapd reports revision" in str(exc_info.value)
     assert pihole.CONTAINER_REMEDY in str(exc_info.value)
 
 
@@ -526,8 +502,8 @@ SNAPD_EFFECTS: list[tuple[Callable[[pihole.Pihole], None], str]] = [
     (lambda workload: workload.install(), "installing"),
     (lambda workload: workload.start(), "starting"),
     (
-        lambda workload: workload.set_webserver_port("80o,[::]:80o"),
-        "setting ftl.webserver.port",
+        lambda workload: workload.set_ntp_server(active=False),
+        "disabling the FTL NTP server",
     ),
 ]
 """Every effect that reaches snapd, and the operation it should name."""
@@ -536,7 +512,7 @@ SNAPD_EFFECTS: list[tuple[Callable[[pihole.Pihole], None], str]] = [
 @pytest.mark.parametrize(
     ("effect", "operation"),
     SNAPD_EFFECTS,
-    ids=["install", "start", "set_webserver_port"],
+    ids=["install", "start", "set_ntp_server"],
 )
 def test_no_effect_lets_a_snapd_lookup_failure_escape(
     fake_runner: FakeRunner,
@@ -586,29 +562,6 @@ def test_a_snapd_refusal_to_start_the_daemon_is_named_rather_than_re_raised(
     # traceback, and the unit stays removable
     assert "snap logs" in str(exc_info.value)
     assert "cannot start service" in str(exc_info.value)
-
-
-def test_a_snapd_refusal_of_the_webserver_port_is_named_rather_than_re_raised(
-    fake_snap: FakeSnap,
-    fake_runner: FakeRunner,
-    snap_data: pathlib.Path,
-):
-    # GIVEN a snapd that rejects the key itself, rather than accepting
-    # it and dropping it
-    fake_snap.refusal = snap.SnapError("invalid configuration key")
-    workload = pihole.Pihole(
-        cache_factory=FakeCache(fake_snap),
-        run=fake_runner,
-        snap_data=snap_data,
-    )
-
-    # WHEN the port is set
-    with pytest.raises(pihole.PiholeError) as exc_info:
-        workload.set_webserver_port("80o,[::]:80o")
-
-    # THEN the refusal is reported as ours
-    assert "invalid configuration key" in str(exc_info.value)
-    assert "journalctl -u snapd" in str(exc_info.value)
 
 
 def test_a_missing_pihole_wrapper_is_named_and_never_quotes_the_password(
@@ -663,44 +616,6 @@ def _missing_wrapper(_args: Sequence[str]) -> None:
 # -- The one snap set, and the password. ------------------------------
 
 
-def test_setting_the_webserver_port_verifies_pihole_toml(
-    workload: pihole.Pihole,
-    fake_snap: FakeSnap,
-    snap_data: pathlib.Path,
-):
-    # GIVEN a snap whose configure hook actually applies the value
-    write_pihole_toml(snap_data, webserver_port="80o,[::]:80o")
-
-    # WHEN the port is set
-    workload.set_webserver_port("80o,[::]:80o")
-
-    # THEN it went through the `ftl.` namespace. Without the prefix the
-    # configure hook ignores the key and snapd stores it anyway.
-    assert fake_snap.set_calls == [{"ftl.webserver.port": "80o,[::]:80o"}]
-
-
-def test_a_silently_dropped_snap_set_is_caught_by_the_read_back(
-    workload: pihole.Pihole,
-    fake_snap: FakeSnap,
-    snap_data: pathlib.Path,
-):
-    # GIVEN a snap that accepts the key and keeps the old value — the
-    # verified behaviour of `snap set` on keys it drops
-    write_pihole_toml(snap_data, webserver_port=STOCK_PORT)
-
-    # WHEN the port is set
-    # THEN the charm refuses to believe the exit code
-    with pytest.raises(pihole.PiholeError, match="reads back as"):
-        workload.set_webserver_port("80o,[::]:80o")
-
-    # AND it reports success from snapd's point of view, which is
-    # exactly why the read-back is the only defence
-    assert fake_snap.set_calls == [{"ftl.webserver.port": "80o,[::]:80o"}]
-
-
-# -- The NTP server the snap opens by default. ------------------------
-
-
 def test_closing_the_ntp_server_verifies_pihole_toml(
     workload: pihole.Pihole,
     fake_snap: FakeSnap,
@@ -710,7 +625,7 @@ def test_closing_the_ntp_server_verifies_pihole_toml(
     write_pihole_toml(snap_data, ntp_active=False)
 
     # WHEN the NTP server is closed
-    workload.disable_ntp_server()
+    workload.set_ntp_server(active=False)
 
     # THEN both keys went through the `ftl.` namespace, as real
     # booleans rather than strings — a string "False" would not parse
@@ -730,7 +645,7 @@ def test_an_ntp_server_still_enabled_after_the_set_is_caught(
     # WHEN the NTP server is closed
     # THEN the charm refuses to believe the exit code
     with pytest.raises(pihole.PiholeError, match="not proven off"):
-        workload.disable_ntp_server()
+        workload.set_ntp_server(active=False)
 
 
 def test_an_ntp_key_absent_from_the_toml_is_not_evidence_it_is_off(
@@ -745,7 +660,36 @@ def test_an_ntp_key_absent_from_the_toml_is_not_evidence_it_is_off(
     # WHEN the NTP server is closed
     # THEN the read-back refuses to declare victory on half the answer
     with pytest.raises(pihole.PiholeError, match="not proven off"):
-        workload.disable_ntp_server()
+        workload.set_ntp_server(active=False)
+
+
+def test_enabling_the_ntp_server_verifies_pihole_toml(
+    workload: pihole.Pihole,
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a snap whose configure hook actually applies the values
+    write_pihole_toml(snap_data, ntp_active=True)
+
+    # WHEN the NTP server is enabled
+    workload.set_ntp_server(active=True)
+
+    # THEN both keys are set to True
+    assert fake_snap.set_calls == [{"ftl.ntp.ipv4.active": True, "ftl.ntp.ipv6.active": True}]
+
+
+def test_an_ntp_server_still_disabled_after_set_is_caught(
+    workload: pihole.Pihole,
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a snap that accepts the keys and keeps the old value
+    write_pihole_toml(snap_data, ntp_active=False)
+
+    # WHEN the NTP server is enabled
+    # THEN the charm refuses to believe the exit code
+    with pytest.raises(pihole.PiholeError, match="not proven on"):
+        workload.set_ntp_server(active=True)
 
 
 def test_an_unreadable_toml_reports_an_unknown_ntp_state(
@@ -988,6 +932,167 @@ def test_awaiting_the_api_gives_up_and_points_at_the_log(
         workload.await_api(timeout=0.0)
 
 
+# -- apply_ftl_config. ------------------------------------------------
+
+
+def test_apply_ftl_config_applies_and_verifies(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a Pi-hole whose API accepts the config and whose TOML
+    # reflects it
+    write_cli_pw(snap_data, CLI_PW)
+    write_pihole_toml(snap_data, blocking_active=False, dnssec=False)
+    fake = api(
+        monkeypatch,
+        {
+            **AUTH_OK,
+            **LOGOUT_OK,
+            "PATCH config": FakeResponse(
+                200, {"config": {"dns": {"blocking": {"active": False}}}}
+            ),
+        },
+    )
+
+    # WHEN config is applied
+    workload.apply_ftl_config(PASSWORD, {"dns.blocking.active": False})
+
+    # THEN the API was called with the right body
+    assert [request.route for request in fake.requests] == [
+        "POST auth",
+        "PATCH config",
+        "DELETE auth",
+    ]
+    assert fake.requests[1].body == {"config": {"dns": {"blocking": {"active": False}}}}
+
+
+def test_apply_ftl_config_catches_a_lying_api(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The lying-API test: 200 returned, TOML keeps the old value.
+
+    FTL returns 200 for unknown keys and silently ignores them, so
+    the read-back is the only defence (rule 6, ADR-0004 section 5.4).
+    """
+    # GIVEN a Pi-hole whose API returns 200 but whose TOML keeps the
+    # old value — the verified unknown-key behaviour
+    write_cli_pw(snap_data, CLI_PW)
+    write_pihole_toml(snap_data, blocking_active=True)
+    api(
+        monkeypatch,
+        {
+            **AUTH_OK,
+            **LOGOUT_OK,
+            "PATCH config": FakeResponse(200, {}),
+        },
+    )
+
+    # WHEN config is applied
+    # THEN the read-back catches the lie
+    with pytest.raises(pihole.PiholeError, match=r"dns\.blocking\.active"):
+        workload.apply_ftl_config(PASSWORD, {"dns.blocking.active": False})
+
+
+def test_apply_ftl_config_surfaces_a_400_hint_verbatim(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a Pi-hole that rejects the config with a 400 hint
+    write_cli_pw(snap_data, CLI_PW)
+    api(
+        monkeypatch,
+        {
+            **AUTH_OK,
+            **LOGOUT_OK,
+            "PATCH config": http_error(400, {"hint": "dns.listeningMode: invalid option"}),
+        },
+    )
+
+    # WHEN config is applied
+    # THEN the hint reaches the error message verbatim
+    with pytest.raises(pihole.PiholeError, match=r"dns\.listeningMode: invalid option"):
+        workload.apply_ftl_config(PASSWORD, {"dns.listeningMode": "INVALID"})
+
+
+def test_apply_ftl_config_unknown_key_absent_from_toml(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """FTL ignores unknown keys with 200 — the key is absent from TOML.
+
+    This simulates what happens when a key name is misspelled: the API
+    returns 200, the key never appears in pihole.toml, and the
+    read-back catches it.
+    """
+    # GIVEN a Pi-hole whose API returns 200 for an unknown key
+    write_cli_pw(snap_data, CLI_PW)
+    write_pihole_toml(snap_data)
+    api(
+        monkeypatch,
+        {
+            **AUTH_OK,
+            **LOGOUT_OK,
+            "PATCH config": FakeResponse(200, {}),
+        },
+    )
+
+    # WHEN config is applied with a key FTL does not know
+    # THEN the read-back catches the absence
+    with pytest.raises(pihole.PiholeError, match=r"absent from pihole\.toml"):
+        workload.apply_ftl_config(PASSWORD, {"dns.typoKey": "value"})
+
+
+def test_apply_ftl_config_upstreams_round_trip(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a Pi-hole whose API accepts upstream config
+    write_cli_pw(snap_data, CLI_PW)
+    write_pihole_toml(snap_data, upstreams=["1.1.1.1", "9.9.9.9"])
+    api(
+        monkeypatch,
+        {
+            **AUTH_OK,
+            **LOGOUT_OK,
+            "PATCH config": FakeResponse(200, {}),
+        },
+    )
+
+    # WHEN upstreams are applied
+    workload.apply_ftl_config(PASSWORD, {"dns.upstreams": ("1.1.1.1", "9.9.9.9")})
+
+    # THEN the read-back passes — the TOML matches
+
+
+def test_apply_ftl_config_upstreams_mismatch(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a Pi-hole whose TOML has different upstreams than applied
+    write_cli_pw(snap_data, CLI_PW)
+    write_pihole_toml(snap_data, upstreams=["8.8.8.8"])
+    api(
+        monkeypatch,
+        {
+            **AUTH_OK,
+            **LOGOUT_OK,
+            "PATCH config": FakeResponse(200, {}),
+        },
+    )
+
+    # WHEN upstreams are applied
+    # THEN the mismatch is caught
+    with pytest.raises(pihole.PiholeError, match=r"dns\.upstreams"):
+        workload.apply_ftl_config(PASSWORD, {"dns.upstreams": ("1.1.1.1",)})
+
+
 # -- The default runner. ----------------------------------------------
 
 
@@ -1006,3 +1111,247 @@ def test_the_default_runner_actually_runs_a_command():
     # THEN output was captured as text, and the exit code is real
     assert completed.returncode == 0
     assert completed.stdout == "pihole\n"
+
+
+# -- Stage 2 facts, read from pihole.toml. -----------------------------
+
+
+def test_the_stage_two_facts_are_read_from_pihole_toml(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a pihole.toml holding all four Stage 2 keys
+    write_pihole_toml(
+        snap_data,
+        upstreams=["1.1.1.1", "9.9.9.9"],
+        listening_mode="ALL",
+        blocking_active=True,
+        dnssec=False,
+    )
+
+    # WHEN each fact is read
+    # THEN it answers exactly what the file says
+    assert workload.upstream_dns() == ("1.1.1.1", "9.9.9.9")
+    assert workload.listening_mode() == "ALL"
+    assert workload.blocking_enabled() is True
+    assert workload.dnssec_enabled() is False
+
+
+def test_absent_stage_two_facts_read_as_none(workload: pihole.Pihole):
+    # GIVEN a machine whose pihole.toml does not exist yet
+    # WHEN the four facts are read
+    # THEN every one is None — unreadable and unset are the same
+    # "cannot answer" for a fact, and the pure core decides what that
+    # means per key
+    assert workload.upstream_dns() is None
+    assert workload.listening_mode() is None
+    assert workload.blocking_enabled() is None
+    assert workload.dnssec_enabled() is None
+
+
+def test_a_bool_expected_over_a_string_landed_is_caught(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN an API that claims success while pihole.toml holds a string
+    # where a boolean belongs — the value did not land as configured
+    write_cli_pw(snap_data, CLI_PW)
+    write_pihole_toml(snap_data, raw='[dns.blocking]\nactive = "yes"\n')
+    api(monkeypatch, {**AUTH_OK, **LOGOUT_OK, "PATCH config": FakeResponse(200, {})})
+
+    # WHEN the config is applied
+    # THEN the type mismatch is refused rather than compared equal
+    with pytest.raises(pihole.PiholeError, match="did not land"):
+        workload.apply_ftl_config(PASSWORD, {"dns.blocking.active": True})
+
+
+def test_an_upstreams_value_that_is_not_a_list_is_caught(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN an API that claims success while pihole.toml holds a bare
+    # string where the list of upstreams belongs
+    write_cli_pw(snap_data, CLI_PW)
+    write_pihole_toml(snap_data, raw='[dns]\nupstreams = "1.1.1.1"\n')
+    api(monkeypatch, {**AUTH_OK, **LOGOUT_OK, "PATCH config": FakeResponse(200, {})})
+
+    # WHEN the config is applied
+    # THEN the shape mismatch is refused
+    with pytest.raises(pihole.PiholeError, match="did not land"):
+        workload.apply_ftl_config(PASSWORD, {"dns.upstreams": ("1.1.1.1",)})
+
+
+def test_a_listening_mode_that_did_not_land_is_caught(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN an API that claims success while the TOML keeps the old mode
+    write_cli_pw(snap_data, CLI_PW)
+    write_pihole_toml(snap_data, listening_mode="LOCAL")
+    api(monkeypatch, {**AUTH_OK, **LOGOUT_OK, "PATCH config": FakeResponse(200, {})})
+
+    # WHEN the config is applied
+    # THEN the drift between answer and file is the failure
+    with pytest.raises(pihole.PiholeError, match="did not land"):
+        workload.apply_ftl_config(PASSWORD, {"dns.listeningMode": "ALL"})
+
+
+def test_upstreams_that_landed_are_verified_quietly(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN an API whose answer and whose pihole.toml agree on the list
+    write_cli_pw(snap_data, CLI_PW)
+    write_pihole_toml(snap_data, upstreams=["1.1.1.1", "9.9.9.9"])
+    api(monkeypatch, {**AUTH_OK, **LOGOUT_OK, "PATCH config": FakeResponse(200, {})})
+
+    # WHEN the config is applied
+    # THEN the matching list passes the read-back without a sound
+    workload.apply_ftl_config(PASSWORD, {"dns.upstreams": ("1.1.1.1", "9.9.9.9")})
+
+
+def test_a_listening_mode_that_landed_is_verified_quietly(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN an API whose answer and whose pihole.toml agree on the mode
+    write_cli_pw(snap_data, CLI_PW)
+    write_pihole_toml(snap_data, listening_mode="ALL")
+    api(monkeypatch, {**AUTH_OK, **LOGOUT_OK, "PATCH config": FakeResponse(200, {})})
+
+    # WHEN the config is applied
+    # THEN the matching value passes the read-back without a sound
+    workload.apply_ftl_config(PASSWORD, {"dns.listeningMode": "ALL"})
+
+
+def test_workload_exceptions_survive_the_ops_event_boundary():
+    # GIVEN every exception this module can raise across a handler
+    errors = [
+        pihole.PiholeError(operation="op", expected="expected", actual="actual", remedy=""),
+        resolved.ResolvedError(operation="op", expected="expected", actual="actual"),
+    ]
+
+    # WHEN ops' `_event_context` assigns `__traceback__` on the way out
+    # — which is what it does to any exception leaving a handler
+    for err in errors:
+        err.__traceback__ = err.__traceback__
+
+    # THEN none of them is a frozen dataclass: the assignment would
+    # raise `FrozenInstanceError` and replace the real error with a
+    # crash. Verified against a deployed unit.
+
+
+def test_an_unreachable_api_becomes_a_pihole_error(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN an API that cannot be reached at all
+    write_pihole_toml(snap_data, blocking_active=False)
+    api(monkeypatch, {"POST auth": urllib.error.URLError("connection refused")})
+
+    # WHEN the config is applied
+    # THEN the failure is converted, not allowed to escape the
+    # workload module — an escaping exception is an error state, and
+    # this is a condition a human can act on, which is Blocked
+    with pytest.raises(pihole.PiholeError, match="could not be applied"):
+        workload.apply_ftl_config(PASSWORD, {"dns.blocking.active": False})
+
+
+# -- The hold against auto-refresh (ADR-0010). -------------------------
+
+
+def test_holding_the_snap_verifies_the_hold(workload: pihole.Pihole, fake_snap: FakeSnap):
+    # GIVEN an installed snap that is not held
+    assert fake_snap.held is False
+
+    # WHEN the hold is applied
+    workload.hold_refresh()
+
+    # THEN snapd was told once, and the read-back confirms it
+    assert fake_snap.hold_calls == 1
+    assert fake_snap.held is True
+
+
+def test_a_hold_snapd_claims_but_does_not_show_is_caught(
+    snap_data: pathlib.Path,
+):
+    # GIVEN a snapd that accepts the hold and reports none — the same
+    # lying shape as every other snapd claim this charm defends against
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(FakeSnap(honest=False)),
+        run=FakeRunner(),
+        snap_data=snap_data,
+    )
+
+    # WHEN the hold is applied
+    # THEN the charm refuses to believe the exit code
+    with pytest.raises(pihole.PiholeError, match="no hold"):
+        workload.hold_refresh()
+
+
+def test_an_absent_snap_reports_no_hold(workload: pihole.Pihole, fake_snap: FakeSnap):
+    # GIVEN a machine with nothing installed
+    fake_snap.present = False
+
+    # WHEN the fact is read
+    # THEN there is nothing to hold, which reads as not held
+    assert workload.refresh_held() is False
+
+
+# -- The per-architecture pin, at the workload boundary. ---------------
+
+
+def test_the_pinned_revision_fact_follows_the_machine(
+    fake_snap: FakeSnap,
+    fake_runner: FakeRunner,
+    snap_data: pathlib.Path,
+):
+    # GIVEN the same charm on an amd64 and on an arm64 host
+    amd = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=fake_runner,
+        snap_data=snap_data,
+        machine=lambda: "x86_64",
+    )
+    arm = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=fake_runner,
+        snap_data=snap_data,
+        machine=lambda: "aarch64",
+    )
+
+    # WHEN each reads the revision it pins
+    # THEN each gets its own architecture's build, because the store
+    # numbers them separately
+    assert amd.pinned_revision() == SNAP_REVISIONS["amd64"]
+    assert arm.pinned_revision() == SNAP_REVISIONS["arm64"]
+
+
+def test_an_unpinned_architecture_refuses_to_install(
+    fake_snap: FakeSnap,
+    fake_runner: FakeRunner,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a machine this charm's release pins no revision for
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=fake_runner,
+        snap_data=snap_data,
+        machine=lambda: "riscv64",
+    )
+
+    # WHEN the install is attempted
+    # THEN it refuses, naming the architecture — installing whatever
+    # the store offers would leave an unpinned snap that auto-refreshes
+    # out from under the charm, which ADR-0010 exists to prevent
+    with pytest.raises(pihole.PiholeError, match="riscv64"):
+        workload.install()
+
+    # AND snapd was never asked for anything
+    assert fake_snap.ensure_calls == []

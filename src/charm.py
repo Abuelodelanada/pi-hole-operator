@@ -11,6 +11,9 @@ This module owns `ops` and nothing else — no `charmlibs.*`, no
 `subprocess`, no file writes — which is what keeps it unit-testable.
 The reconciler is three stages: `fetch` reads the machine once,
 `compute` decides purely, `_apply` acts dumbly. See rule 2 and ADR-0003.
+
+Stage 2 adds config-driven intent, the FTL config API path, and
+conditional ports. See ADR-0004 section 5 and ADR-0006 section 2.1.
 """
 
 import logging
@@ -20,24 +23,11 @@ from typing import assert_never
 import ops
 
 import pihole
+import pihole_config
 import pihole_state
 import resolved
 
 logger = logging.getLogger(__name__)
-
-PORTS = (
-    ops.Port("tcp", 53),
-    # A bare int would mean TCP, and a DNS server without 53/udp is
-    # the single easiest way to ship a broken charm.
-    ops.Port("udp", 53),
-    ops.Port("tcp", 80),
-)
-"""What the charm serves.
-
-**Not 443**: the charm disables TLS. See ADR-0006 section 2.10.
-**Not 123/udp** either: the charm closes the NTP server the snap
-opens by default rather than advertising it.
-"""
 
 ADMIN_PASSWORD_LABEL = "pihole-admin-password"
 """Retrieved by label, so nothing has to be remembered across hooks."""
@@ -95,18 +85,23 @@ class PiholeCharm(ops.CharmBase):
         Every step must be safe to run twice or never. See ADR-0003
         section 2.5 on why ordering lives in `compute`'s sequence.
         """
-        self.unit.set_ports(*PORTS)
+        # No wrapper here: errors="blocked" answers invalid *values*
+        # with BlockedStatus and a clean exit-0 abort. That abort is an
+        # Exception subclass, so catching broadly here would swallow it
+        # and the hook would keep converging on unvalidated config.
+        config = self.load_config(pihole_config.PiholeConfig, errors="blocked")
 
         # Everything that can fail is inside the try: error state
         # needs `--force`, which skips the `remove` handler (ADR-0005
         # section 2.9).
         try:
-            match self._ensure_intent():
+            match _intent_from(self._ensure_password(), config):
                 case pihole_state.NoIntentYet():
                     logger.info("no admin password available yet; waiting for the leader")
                     return
                 case pihole_state.PiholeIntent() as intent:
-                    state = pihole_state.fetch(self._pihole, intent)
+                    self._advertise_ports(intent)
+                    state = pihole_state.fetch(self._pihole, intent.admin_password)
                     for outcome in pihole_state.compute(state, intent):
                         self._apply(outcome)
 
@@ -132,20 +127,39 @@ class PiholeCharm(ops.CharmBase):
                 resolved.disable_stub_listener()
             case pihole_state.InstallSnap():
                 self._pihole.install()
-            case pihole_state.SetWebserverPort(value=value):
-                self._pihole.set_webserver_port(value)
-            case pihole_state.DisableNtpServer():
-                self._pihole.disable_ntp_server()
+            case pihole_state.HoldSnapRefresh():
+                self._pihole.hold_refresh()
+            case pihole_state.SetNtpServer(active=active):
+                self._pihole.set_ntp_server(active=active)
             case pihole_state.SetAdminPassword(password=password):
                 self._pihole.set_password(password)
             case pihole_state.StartFtl():
                 self._pihole.start(enable=True)
             case pihole_state.AwaitApi(timeout=timeout):
                 self._pihole.await_api(timeout)
+            case pihole_state.SetFtlConfig(config=config, password=password):
+                self._pihole.apply_ftl_config(password=password, config=dict(config))
             case pihole_state.Noop():
                 logger.debug("converged: nothing to do.")
             case _ as unreachable:
                 assert_never(unreachable)
+
+    def _advertise_ports(self, intent: pihole_state.PiholeIntent) -> None:
+        """Tell Juju which ports this intent serves, NTP's when enabled.
+
+        Declares, it does not open: FTL binds these itself, and
+        `set_ports` only records them on the unit. Whether anything
+        acts on the record is the provider's business — the LXD
+        provider has no firewaller at all, and `open-port` does
+        nothing until the application is exposed (ADR-0006 §2.8).
+
+        The pure core answers protocol-and-number pairs because it
+        cannot import `ops`; the conversion to `ops.Port` lives here,
+        with the rest of the model-facing code.
+        """
+        self.unit.set_ports(
+            *(ops.Port(proto, num) for proto, num in pihole_state.open_ports(intent))
+        )
 
     def _report_version(self, state: pihole_state.PiholeState) -> None:
         """Show the Pi-hole version, not the charm's, in the status."""
@@ -170,7 +184,7 @@ class PiholeCharm(ops.CharmBase):
             event.add_status(self._reconcile_failure)
             return
 
-        match self._read_intent():
+        match _intent_from(self._read_password()):
             case pihole_state.NoIntentYet():
                 event.add_status(ops.MaintenanceStatus("generating the admin password"))
             case pihole_state.PiholeIntent() as intent:
@@ -234,25 +248,7 @@ class PiholeCharm(ops.CharmBase):
             return
         event.set_results({"result": "the admin UI password has been rotated"})
 
-    # -- Intent, which for Stage 1 is only the password. ---------------
-
-    def _read_intent(self) -> pihole_state.DeclaredIntent:
-        """The declared desired state as it stands now, reading only.
-
-        `NoIntentYet` before a password exists — a follower waiting on
-        the leader. Side-effect-free, so `_on_collect_status` can call
-        it safely.
-        """
-        return _intent_from(self._read_password())
-
-    def _ensure_intent(self) -> pihole_state.DeclaredIntent:
-        """The declared desired state to converge toward.
-
-        Same as `_read_intent`, but a leader with no password mints
-        one first. Still `NoIntentYet` on a follower waiting for the
-        leader.
-        """
-        return _intent_from(self._ensure_password())
+    # -- Intent, which for Stage 2 includes config. ---------------
 
     def _ensure_password(self) -> str | None:
         """Return the admin password, minting one if none exists yet.
@@ -311,11 +307,30 @@ class PiholeCharm(ops.CharmBase):
             )
 
 
-def _intent_from(password: str | None) -> pihole_state.DeclaredIntent:
-    """Name what the charm can declare, given the password it holds."""
+def _intent_from(
+    password: str | None,
+    config: pihole_config.PiholeConfig | None = None,
+) -> pihole_state.DeclaredIntent:
+    """Name what the charm can declare, given the password it holds.
+
+    `NoIntentYet` without a password — a follower waiting on the
+    leader to mint one. Which password reaches this function is the
+    caller's choice, and it is the whole difference between the two
+    call sites: `_reconcile` passes `_ensure_password()`, which mints
+    on a leader; `_on_collect_status` passes `_read_password()`,
+    because that handler must not mutate anything. See rule 7 and
+    ADR-0005 section 2.4.
+
+    The status handler passes no config: it needs the intent only to
+    offer the password to the API oracle, and building one from
+    unvalidated config there would invent values the reconciler never
+    applied.
+    """
     if password is None:
         return pihole_state.NoIntentYet()
-    return pihole_state.PiholeIntent(admin_password=password)
+    if config is None:
+        return pihole_state.PiholeIntent(admin_password=password)
+    return pihole_state.PiholeIntent(admin_password=password, **config.intent_fields())
 
 
 def _machine_status(
@@ -323,7 +338,7 @@ def _machine_status(
     intent: pihole_state.PiholeIntent,
 ) -> ops.StatusBase:
     """Read the machine once and map what it finds onto one status."""
-    match pihole_state.fetch(facts, intent):
+    match pihole_state.fetch(facts, intent.admin_password):
         case pihole_state.SnapAbsent():
             return ops.MaintenanceStatus(f"installing the {pihole.SNAP_NAME} snap")
         case pihole_state.SnapPresent() as state:
@@ -344,12 +359,6 @@ def _installed_status(state: pihole_state.SnapPresent) -> ops.StatusBase:
         return ops.BlockedStatus(problem)
     if not (state.ftl_enabled and state.ftl_active):
         return ops.MaintenanceStatus("starting the Pi-hole FTL daemon")
-    if state.webserver_port != pihole_state.WEBSERVER_PORT:
-        # Valid only once the port is corrected — on a stock install
-        # the API never answers, so Blocked here would accuse the
-        # charm of a step it has not taken yet. See ADR-0005 sections
-        # 2.5-2.6.
-        return ops.MaintenanceStatus("correcting the FTL webserver port")
     if not state.api_ready:
         return ops.BlockedStatus(
             "FTL is running but its HTTP API on port 80 is not answering; "

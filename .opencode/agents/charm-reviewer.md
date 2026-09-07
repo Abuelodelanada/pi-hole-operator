@@ -212,8 +212,8 @@ the `ops` definition is just an opinion. The triggers:
   function called both ways — `f(generate=True)` from `_reconcile` and
   `f(generate=False)` from `_on_collect_status` — where the name can no longer
   answer "does this mutate?" and the guarantee lives in an argument. The fix is
-  two methods whose names carry the answer; `_read_intent` (reads only) and
-  `_ensure_intent` (may mint a secret) in `src/charm.py` are the worked
+  two methods whose names carry the answer; `_read_password` (reads only) and
+  `_ensure_password` (may mint a secret) in `src/charm.py` are the worked
   example, so do not flag those. Report it as Should fix normally, and
   **Blocking when one of the callers is `_on_collect_status`** — that handler must
   not mutate, and a correctly-passed bool is the only thing enforcing it.

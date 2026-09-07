@@ -7,17 +7,25 @@ This is not a Kubernetes charm. There is no Pebble, no `lightkube`, no OCI image
 
 ## Where we are
 
-**Stage 1 is complete and reviewed; Stage 2 has not started.** The charm
-installs the snap, frees port 53, starts FTL, closes the snap's default NTP
-server on 123/udp, restores the host resolver on removal, and owns the admin
-password. Integration tests on LXD passed against this tree. `docs/roadmap.md` defines the stages and is the source of truth —
-check it before treating a missing feature as a defect rather than as unstarted
-work.
+**Stages 1 and 2 are closed** — Stage 2's acceptance is green on LXD and its
+`charm-reviewer` audit is clean (2026-09-07). The charm installs the snap **pinned to `SNAP_REVISIONS` and held against
+auto-refresh** (ADR-0010 — the snap never updates itself), frees port 53, starts
+FTL, closes the snap's default NTP server on 123/udp, owns the admin password,
+applies declarative config through `PATCH /api/config` with a read-back against
+`pihole.toml`, and restores the host resolver on removal. `docs/roadmap.md`
+defines the stages and is the source of truth — check it before treating a
+missing feature as a defect rather than as unstarted work.
 
-The public interface today is two actions, `get-admin-password` and
-`rotate-admin-password`, and **nothing else**: zero config options, zero
-relations. That is the state rules 4 and 5 exist to defend, so adding the first
-config option or the first `requires` is a decision, not a detail.
+The public interface today: two actions (`get-admin-password`,
+`rotate-admin-password`), **five config options** (`upstream-dns`,
+`dns-listening-mode`, `blocking-enabled`, `dnssec-enabled`,
+`ntp-server-enabled`). **Zero relations, and no bindings** — `extra-bindings:
+dns` was withdrawn until something consumes it (BACKLOG). Each option
+is justified in [ADR-0006](docs/adr/0006-configuration-surface.md) §2.1 against
+rule 4's three alternatives; the sixth and seventh (`snap-channel`,
+`snap-revision`) were **removed** because the revision is charm policy, not
+deployment shape (ADR-0010). Adding the first `requires` is still a decision,
+not a detail.
 
 ## Non-negotiables
 
@@ -83,8 +91,9 @@ are audited by `charm-reviewer`. Do not treat a passing gate as a review.
    from one caller, `f(generate=False)` from another — leaves the name unable to
    answer "does this mutate?", and puts the guarantee in an argument instead of in
    the type system. Split it into two named methods and let each name carry the
-   answer; `_read_intent` and `_ensure_intent` in `src/charm.py` are the
-   worked example. See `charm-functional-style`.
+   answer; `_read_password` and `_ensure_password` in `src/charm.py` are the
+   worked example — the intent is then built from whichever one the caller
+   chose. See `charm-functional-style`.
 8. **Inheritance only where a framework demands it.** `ops.CharmBase` is the one
    mandatory subclass; charm libraries are instantiated, never extended.
    Everything else is composition — but note the verified constraint:
@@ -128,6 +137,7 @@ pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, tenacity
 uv.lock
 tox.ini
 docs/
+  overview.md             # two-minute map: the pattern, and what each src/ file is for
   pattern.md              # how the charm decides what to do, taught with a small example
   adr/                    # numbered decision records. Load `new-adr` before adding one.
   implementation/         # how an existing module works. One file per module, as it lands.
@@ -139,6 +149,7 @@ src/
   pihole.py               # workload: snap install/start, config apply, readiness
   ftl_api.py              # workload: FTL HTTP API client (ADR-0009)
   pihole_state.py         # functional core: intent, state, outcome ADT, fetch/compute
+  pihole_config.py        # pydantic model of the charm's config options
   resolved.py             # workload: systemd-resolved port 53 orchestration
 tests/
   unit/                   # ops.testing, Model(type='lxd'), mocks src.pihole

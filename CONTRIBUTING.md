@@ -44,8 +44,10 @@ src/
   pihole.py          # snap/systemd/filesystem. Never imports ops.
   ftl_api.py         # FTL HTTP API client: sessions, auth, readiness.
   pihole_state.py    # frozen snapshot + outcome ADT + pure compute(). No IO.
+  pihole_config.py   # pydantic model of the charm's config options. No ops.
   resolved.py        # systemd-resolved drop-in. Never imports ops.
 docs/
+  overview.md        # two-minute map of the pattern and the src/ layout
   adr/               # decisions — why the charm is shaped this way
   roadmap.md         # stages, acceptance criteria, open spikes
   snap-constraints.md# verified facts about the workload
@@ -53,8 +55,7 @@ docs/
 ```
 
 `lib/charms/grafana_agent/` arrives with Stage 5 (COS) and is vendored then —
-never edited, never linted. There is deliberately **no** `pihole_config.py` yet;
-it is a Stage 2 deliverable.
+never edited, never linted.
 
 ### The module boundary is not stylistic
 
@@ -78,7 +79,7 @@ Either one is a design defect, not a test problem. See
 
 **Work is driven by stages in [`docs/roadmap.md`](docs/roadmap.md), not by ADRs.**
 
-ADRs are decisions; stages are work. Five of the nine ADRs are *cross-cutting* —
+ADRs are decisions; stages are work. Two of the ten ADRs are *cross-cutting* —
 they are complied with in every stage rather than completed in one:
 
 | ADR | Lands in | Nature |
@@ -92,6 +93,7 @@ they are complied with in every stage rather than completed in one:
 | [0007](docs/adr/0007-admin-password-handling.md) password | Stage 1 (Stage 4 was folded into it) | Completed there |
 | [0008](docs/adr/0008-cos-integration.md) COS | Stage 5 | Completed there |
 | [0009](docs/adr/0009-ftl-api-client-module.md) FTL API client | Stage 1 | Completed there |
+| [0010](docs/adr/0010-snap-revision-is-charm-policy.md) snap revision pin | Stage 2 | Completed there |
 
 ### The per-stage loop
 
@@ -177,8 +179,12 @@ deciding whether something belongs in an ADR, in `roadmap.md`, in
 It will happen. The rule:
 
 - ADR is **`Proposed`** → amend it in the same PR. It was not yet a commitment.
-- ADR is **`Accepted`** → **do not edit it.** Write a new ADR that supersedes it,
-  and mark the old one `Superseded by ADR-NNNN`. The history is the point.
+- ADR is **`Accepted`** → **do not edit its decision.** Write a new ADR that
+  supersedes it, and mark the old one `Superseded by ADR-NNNN`. The history is
+  the point. The one exception, and it is narrow: a **dated `Amended:` line**
+  may correct a *fact* the ADR recorded wrongly, or remove a section whose
+  premise no longer exists — the charm has never shipped, so nothing downstream
+  depends on the old text. ADR-0004 and ADR-0006 both carry such lines.
 - In neither case do you deviate silently.
 
 ---
