@@ -6,10 +6,14 @@ v6 on Ubuntu machines — LXD, MAAS, or a public cloud — using the
 
 Not a Kubernetes charm: no Pebble, no OCI image.
 
-> **Status: Stage 1.** The charm installs the snap, frees port 53, starts FTL,
-> owns the admin password, closes the NTP server the snap opens by default, and
-> restores the host resolver on removal. It has no config options and no
-> relations yet. See [`docs/roadmap.md`](docs/roadmap.md).
+> **Status: Stage 2.** The charm installs the snap **pinned to a revision the
+> charm's release defines and held against auto-refresh** — the snap never
+> updates itself; updating it is a charm release (see
+> [ADR-0010](docs/adr/0010-snap-revision-is-charm-policy.md)). It frees port 53,
+> starts FTL, owns the admin password, closes the NTP server the snap opens by
+> default, applies declarative config verified against `pihole.toml`, and
+> restores the host resolver on removal. It has no relations yet. See
+> [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Deploy
 
@@ -24,7 +28,10 @@ separately. It works out what is true on the machine, compares that to what
 should be true, and closes the gap. The code that decides is kept separate from
 the code that touches the machine.
 
-If you want to learn that shape first, start at
+For a two-minute map of the pattern and what each file in `src/` is for, read
+**[`docs/overview.md`](docs/overview.md)**.
+
+If you want to learn the shape itself first, start at
 **[`docs/pattern.md`](docs/pattern.md)**. It explains it with a forty-line
 example that has nothing to do with Pi-hole, and lists the three ways to get it
 wrong.

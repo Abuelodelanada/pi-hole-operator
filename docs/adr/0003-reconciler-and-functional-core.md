@@ -217,7 +217,7 @@ class Pihole:
 
     def __init__(
         self,
-        cache_factory: Callable[[], Mapping[str, SnapLike]] = snap.SnapCache,
+        cache_factory: Callable[[], Mapping[str, snap.Snap]] = snap.SnapCache,
         run: Runner = subprocess.run,
         snap_data: Path = SNAP_DATA,
     ) -> None: ...

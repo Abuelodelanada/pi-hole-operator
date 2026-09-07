@@ -98,7 +98,7 @@ def test_the_stub_listener_state_is_read_from_disk(
 
     # WHEN the fact is read
     # THEN only the exact content counts as "port 53 is ours"
-    assert resolved.is_stub_disabled(drop_in) is expected
+    assert resolved.is_port53_released(drop_in) is expected
 
 
 def test_removal_deletes_the_drop_in_and_restarts(drop_in: pathlib.Path):

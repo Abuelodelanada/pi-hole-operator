@@ -14,13 +14,12 @@ description: |
 
   What the charm does for you:
 
-  - Installs the snap and starts the FTL daemon, which the snap does
-    not start by itself.
+  - Installs the snap at a revision the charm's release defines, held
+    against auto-refresh — the snap never updates itself — and starts the
+    FTL daemon, which the snap does not start by itself. The admin UI
+    serves on 80 and 443, the latter with a self-signed certificate.
   - Takes port 53 away from `systemd-resolved` on deployment, and gives
     it back on removal, so the machine is never left without a resolver.
-  - Corrects the webserver port the snap ships with, which requests TLS
-    the snap cannot serve — without that fix there is no admin UI and
-    no HTTP API at all.
   - Closes the NTP server the snap opens on 123/udp by default.
   - Generates the admin UI password itself, stores it in a Juju secret,
     and applies it before the daemon ever serves; actions retrieve and
@@ -80,3 +79,35 @@ parts:
     source: .
     build-snaps:
       - astral-uv
+
+config:
+  options:
+    upstream-dns:
+      type: string
+      default: ""
+      description: |
+        Comma-separated upstream DNS resolvers (e.g. 1.1.1.1,9.9.9.9).
+        Empty means the charm does not manage upstreams.
+    dns-listening-mode:
+      type: string
+      default: ""
+      description: |
+        FTL listening mode: LOCAL, SINGLE, BIND, ALL, or NONE.
+        Empty means the charm does not manage this setting.
+    blocking-enabled:
+      type: boolean
+      default: true
+      description: Whether DNS-based ad blocking is active.
+    dnssec-enabled:
+      type: boolean
+      default: false
+      description: Whether DNSSEC validation is enabled.
+    ntp-server-enabled:
+      type: boolean
+      default: false
+      description: |
+        Whether the FTL NTP server on 123/udp is enabled.
+        The charm default is false, diverging from the snap's default
+        of true. See the README.
+extra-bindings:
+  dns:

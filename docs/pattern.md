@@ -367,24 +367,30 @@ workload, the split is broken, and the tests will need mocks again.
 Notice that `fetch` takes only `Facts`, not the intent. That is the shape to aim
 for: reading what is true should not need to know what should be true.
 
-**There is one case where it does, and this charm has it.** Sometimes a workload
-gives you no way to observe a fact on its own, and the only way to learn it is to
-offer a candidate answer and see what the workload says. Pi-hole's admin password
-is like that: the stored hash is salted, so it changes on every write even for the
+**Some facts cannot be read without an input, and this charm has one.** Sometimes
+a workload gives you no way to observe a fact on its own: the only way to learn it
+is to offer a candidate and see what the workload says. Pi-hole's admin password
+is like that. The stored hash is salted, so it changes on every write even for the
 same password, and there is nothing to compare it against. The only way to ask "is
 this the right password" is to try it against the API.
 
-So the real `fetch` in this charm takes the intent as well:
+That makes the password a **measurement input**, the way a key is an input to
+"does this lock accept this key". So the real `fetch` in this charm takes one:
 
 ```python
-def fetch(pihole: PiholeFacts, intent: PiholeIntent) -> PiholeState: ...
+def fetch(pihole: PiholeFacts, admin_password: str) -> PiholeState: ...
 ```
 
-Be honest about what that costs. The password field on the resulting state is no
-longer a plain observation. It is the answer to a comparison, and it is only
-meaningful for *that* intent. If you do this, say so where the reader will see it,
-and keep it to the facts that genuinely cannot be read any other way. Everything
-else in `fetch` should still be a plain read.
+Note what it does *not* take: the intent. Passing the whole intent would say
+"reading depends on what you want", and would let a later edit reach for
+`intent.blocking_enabled` inside `fetch` — which is deciding, in the function
+whose only job is observing. Passing the candidate alone makes that impossible,
+and keeps the rule intact: **nothing desired enters `fetch`.**
+
+Be honest about what the input costs anyway: the password field on the resulting
+state is not a plain observation, it is the answer for *that* candidate. Say so
+where the reader will see it, and keep it to the facts that genuinely cannot be
+read any other way. Everything else in `fetch` should still be a plain read.
 
 ### The decision
 

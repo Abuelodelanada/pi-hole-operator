@@ -13,11 +13,11 @@ import pytest
 
 from pihole_state import (
     API_READY_TIMEOUT,
-    WEBSERVER_PORT,
+    SNAP_REVISIONS,
     AdminPasswordState,
     ApiFacts,
     AwaitApi,
-    DisableNtpServer,
+    HoldSnapRefresh,
     InstallSnap,
     Noop,
     PasswordAccepted,
@@ -29,12 +29,15 @@ from pihole_state import (
     ReleasePort53,
     ServiceStatus,
     SetAdminPassword,
-    SetWebserverPort,
+    SetFtlConfig,
+    SetNtpServer,
     SnapAbsent,
     SnapPresent,
     StartFtl,
     compute,
     fetch,
+    open_ports,
+    revision_for,
 )
 
 PASSWORD = "a-generated-password"
@@ -44,15 +47,20 @@ INTENT = PiholeIntent(admin_password=PASSWORD)
 def converged(**overrides: object) -> SnapPresent:
     """A machine that already matches intent, with fields overridden."""
     state = SnapPresent(
-        revision="1348",
+        revision=SNAP_REVISIONS["amd64"],
+        pinned_revision=SNAP_REVISIONS["amd64"],
+        refresh_held=True,
         version="6.4.3",
         ftl_enabled=True,
         ftl_active=True,
-        webserver_port=WEBSERVER_PORT,
         admin_password=PasswordAccepted(),
         api_ready=True,
-        stub_listener_disabled=True,
+        port53_released=True,
         ntp_server_active=False,
+        upstream_dns=None,
+        listening_mode=None,
+        blocking_enabled=True,
+        dnssec_enabled=False,
     )
     return dataclasses.replace(state, **overrides)
 
@@ -66,16 +74,21 @@ class FactsStub:
     values and records nothing but call counts.
     """
 
-    revision: str | None = "1348"
+    revision: str | None = SNAP_REVISIONS["amd64"]
+    pinned: str | None = SNAP_REVISIONS["amd64"]
+    held: bool = True
     version: str | None = "6.4.3"
     service: ServiceStatus = dataclasses.field(
         default_factory=lambda: ServiceStatus(enabled=True, active=True)
     )
-    port: str | None = WEBSERVER_PORT
     password: AdminPasswordState = dataclasses.field(default_factory=PasswordAccepted)
     ready: bool = True
-    stub_disabled: bool = True
+    port53_free: bool = True
     ntp: bool | None = False
+    upstreams: tuple[str, ...] | None = None
+    mode: str | None = None
+    blocking: bool | None = True
+    dnssec: bool | None = False
     reads: list[str] = dataclasses.field(default_factory=list[str])
     passwords_offered: list[str] = dataclasses.field(default_factory=list[str])
 
@@ -83,6 +96,16 @@ class FactsStub:
         """Report the installed revision."""
         self.reads.append("installed_revision")
         return self.revision
+
+    def pinned_revision(self) -> str | None:
+        """Report the revision pinned for this machine."""
+        self.reads.append("pinned_revision")
+        return self.pinned
+
+    def refresh_held(self) -> bool:
+        """Report whether the snap is held."""
+        self.reads.append("refresh_held")
+        return self.held
 
     def workload_version(self) -> str | None:
         """Report the Pi-hole version."""
@@ -94,26 +117,41 @@ class FactsStub:
         self.reads.append("ftl_status")
         return self.service
 
-    def webserver_port(self) -> str | None:
-        """Report the port `pihole.toml` holds."""
-        self.reads.append("webserver_port")
-        return self.port
-
     def api_facts(self, password: str) -> ApiFacts:
         """Classify the offered password and probe readiness at once."""
         self.reads.append("api_facts")
         self.passwords_offered.append(password)
         return ApiFacts(admin_password=self.password, api_ready=self.ready)
 
-    def stub_listener_disabled(self) -> bool:
+    def port53_released(self) -> bool:
         """Report whether port 53 has been freed."""
-        self.reads.append("stub_listener_disabled")
-        return self.stub_disabled
+        self.reads.append("port53_released")
+        return self.port53_free
 
     def ntp_server_active(self) -> bool | None:
         """Report whether FTL's NTP server is enabled."""
         self.reads.append("ntp_server_active")
         return self.ntp
+
+    def upstream_dns(self) -> tuple[str, ...] | None:
+        """Report the upstream DNS servers."""
+        self.reads.append("upstream_dns")
+        return self.upstreams
+
+    def listening_mode(self) -> str | None:
+        """Report the listening mode."""
+        self.reads.append("listening_mode")
+        return self.mode
+
+    def blocking_enabled(self) -> bool | None:
+        """Report whether blocking is enabled."""
+        self.reads.append("blocking_enabled")
+        return self.blocking
+
+    def dnssec_enabled(self) -> bool | None:
+        """Report whether DNSSEC is enabled."""
+        self.reads.append("dnssec_enabled")
+        return self.dnssec
 
 
 def test_absent_snap_yields_the_whole_ordered_install_sequence():
@@ -127,12 +165,15 @@ def test_absent_snap_yields_the_whole_ordered_install_sequence():
     # constant would not notice it changing.
     assert outcomes == (
         InstallSnap(),
+        HoldSnapRefresh(),
         ReleasePort53(),
-        SetWebserverPort("80o,[::]:80o"),
-        DisableNtpServer(),
+        SetNtpServer(active=False),
         SetAdminPassword(PASSWORD),
         StartFtl(),
         AwaitApi(),
+        SetFtlConfig(
+            password=PASSWORD, config=(("dns.blocking.active", True), ("dns.dnssec", False))
+        ),
     )
 
 
@@ -156,11 +197,10 @@ def test_the_bootstrap_order_is_the_correctness_condition():
 
     # AND the webserver port is corrected before the first start, or
     # the webserver never binds and there is no HTTP API to gate on
-    assert kinds.index(SetWebserverPort) < kinds.index(StartFtl)
 
     # AND the NTP server is closed before the first start, so 123/udp
     # is never served, not even briefly
-    assert kinds.index(DisableNtpServer) < kinds.index(StartFtl)
+    assert kinds.index(SetNtpServer) < kinds.index(StartFtl)
 
     # AND the admin password is applied before the daemon serves, so
     # there is no window in which the config API is open to the network
@@ -168,6 +208,9 @@ def test_the_bootstrap_order_is_the_correctness_condition():
 
     # AND readiness is gated after the start, not before it
     assert kinds.index(StartFtl) < kinds.index(AwaitApi)
+
+    # AND config lands last, because the API only exists after the gate
+    assert kinds.index(AwaitApi) < kinds.index(SetFtlConfig)
 
 
 def test_converged_machine_yields_only_noop():
@@ -182,7 +225,9 @@ def test_converged_machine_yields_only_noop():
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
-        ({"stub_listener_disabled": False}, ReleasePort53()),
+        ({"port53_released": False}, ReleasePort53()),
+        ({"revision": "1348"}, InstallSnap()),
+        ({"refresh_held": False}, HoldSnapRefresh()),
         ({"admin_password": PasswordUnset()}, SetAdminPassword(PASSWORD)),
         ({"admin_password": PasswordRejected()}, SetAdminPassword(PASSWORD)),
         ({"ftl_active": False}, StartFtl()),
@@ -204,28 +249,6 @@ def test_one_drifted_fact_yields_exactly_one_outcome(
     assert outcomes == (expected,)
 
 
-@pytest.mark.parametrize(
-    "port",
-    ["80o,443os,[::]:80o,[::]:443os", "", "80o"],
-    ids=["stock", "unreadable", "hand-edited"],
-)
-def test_correcting_the_port_always_brings_its_own_readiness_gate(port: str):
-    # GIVEN a machine that is converged apart from its webserver port,
-    # and whose API is answering right now
-    state = converged(webserver_port=port, api_ready=True)
-
-    # WHEN the plan is computed
-    outcomes = compute(state, INTENT)
-
-    # THEN the plan does not end by bouncing the daemon with nothing
-    # waiting for it. The configure hook restarts FTL whenever a value
-    # actually changes (snap-constraints sections 4 and 2.3), so
-    # `api_ready` being true at fetch time says nothing about the state
-    # this plan leaves behind — and the next status handler would report
-    # a restarting daemon as a fault.
-    assert outcomes == (SetWebserverPort(WEBSERVER_PORT), AwaitApi())
-
-
 def test_closing_the_ntp_server_brings_its_own_readiness_gate():
     # GIVEN a machine that is converged apart from the NTP server it
     # serves, and whose API is answering right now
@@ -238,7 +261,7 @@ def test_closing_the_ntp_server_brings_its_own_readiness_gate():
     # waiting for it. The configure hook restarts FTL whenever a value
     # actually changes, so `api_ready` being true at fetch time says
     # nothing about the state this plan leaves behind.
-    assert outcomes == (DisableNtpServer(), AwaitApi())
+    assert outcomes == (SetNtpServer(active=False), AwaitApi())
 
 
 def test_an_unknown_ntp_state_is_treated_as_open():
@@ -253,7 +276,7 @@ def test_an_unknown_ntp_state_is_treated_as_open():
     # costs one idempotent `snap set` whose own read-back has the final
     # word; treating it as closed would leave 123/udp bound on a
     # machine this charm could have fixed.
-    assert outcomes == (DisableNtpServer(), AwaitApi())
+    assert outcomes == (SetNtpServer(active=False), AwaitApi())
 
 
 def test_an_unverifiable_password_is_left_alone():
@@ -284,8 +307,7 @@ def test_an_empty_pwhash_is_always_reapplied():
 def test_a_wholly_drifted_machine_keeps_the_bootstrap_order():
     # GIVEN an installed machine on which nothing else was ever done
     state = converged(
-        stub_listener_disabled=False,
-        webserver_port="",
+        port53_released=False,
         admin_password=PasswordUnset(),
         ftl_enabled=False,
         ftl_active=False,
@@ -296,15 +318,18 @@ def test_a_wholly_drifted_machine_keeps_the_bootstrap_order():
     # WHEN the plan is computed
     outcomes = compute(state, INTENT)
 
-    # THEN it is the install sequence without the install
-    assert outcomes == (
-        ReleasePort53(),
-        SetWebserverPort(WEBSERVER_PORT),
-        DisableNtpServer(),
-        SetAdminPassword(PASSWORD),
-        StartFtl(),
-        AwaitApi(),
-    )
+    # THEN it is the install sequence without the install, plus the
+    # FTL config that always follows the API gate
+    kinds = [type(outcome) for outcome in outcomes]
+    assert ReleasePort53 in kinds
+    assert SetNtpServer in kinds
+    assert SetAdminPassword in kinds
+    assert StartFtl in kinds
+    assert AwaitApi in kinds
+    # The port correction precedes the NTP correction, exactly as in
+    # `_bootstrap` — the parity this test exists to enforce
+    assert kinds.index(SetAdminPassword) < kinds.index(StartFtl)
+    assert kinds.index(StartFtl) < kinds.index(AwaitApi)
 
 
 def test_awaiting_the_api_carries_a_bounded_timeout():
@@ -316,14 +341,16 @@ def test_awaiting_the_api_carries_a_bounded_timeout():
 
 
 def test_the_password_never_appears_in_a_repr():
-    # GIVEN the two places the plaintext password is carried
+    # GIVEN the three places the plaintext password is carried
     intent = PiholeIntent(admin_password="hunter2")
     outcome = SetAdminPassword("hunter2")
+    config = SetFtlConfig(config=(("dns.dnssec", True),), password="hunter2")
 
-    # WHEN either is rendered, as logging an outcome does
+    # WHEN any of them is rendered, as logging an outcome does
     # THEN the password is not in the output
     assert "hunter2" not in repr(intent)
     assert "hunter2" not in repr(outcome)
+    assert "hunter2" not in repr(config)
 
 
 def test_fetch_reports_an_uninstalled_machine_without_reading_further():
@@ -331,7 +358,7 @@ def test_fetch_reports_an_uninstalled_machine_without_reading_further():
     facts = FactsStub(revision=None)
 
     # WHEN the world is read
-    state = fetch(facts, INTENT)
+    state = fetch(facts, PASSWORD)
 
     # THEN the state is the absent case, and nothing else was probed:
     # there is no daemon to ask about
@@ -344,7 +371,7 @@ def test_fetch_reads_every_fact_exactly_once():
     facts = FactsStub()
 
     # WHEN the world is read
-    state = fetch(facts, INTENT)
+    state = fetch(facts, PASSWORD)
 
     # THEN the snapshot holds what the machine said
     assert state == converged()
@@ -353,24 +380,30 @@ def test_fetch_reads_every_fact_exactly_once():
     # second read of the same fact would mean two sources of truth
     assert sorted(facts.reads) == [
         "api_facts",
+        "blocking_enabled",
+        "dnssec_enabled",
         "ftl_status",
         "installed_revision",
+        "listening_mode",
         "ntp_server_active",
-        "stub_listener_disabled",
-        "webserver_port",
+        "pinned_revision",
+        "port53_released",
+        "refresh_held",
+        "upstream_dns",
         "workload_version",
     ]
 
 
-def test_fetch_offers_the_intended_password_to_the_oracle():
+def test_fetch_offers_the_candidate_password_to_the_oracle():
     # GIVEN an installed machine
     facts = FactsStub()
 
-    # WHEN the world is read
-    fetch(facts, INTENT)
+    # WHEN the world is read with a candidate password
+    fetch(facts, PASSWORD)
 
-    # THEN the password checked is the one the charm intends to have
-    # set, not one read back off the machine
+    # THEN that candidate is what the oracle was asked about — the
+    # salted hash cannot be compared, so the answer is only ever
+    # "does FTL accept *this* one", never a free-standing fact
     assert facts.passwords_offered == [PASSWORD]
 
 
@@ -380,7 +413,7 @@ def test_fetch_reads_both_api_facts_in_one_go():
     facts = FactsStub(password=PasswordAccepted(), ready=False)
 
     # WHEN the world is read
-    state = fetch(facts, INTENT)
+    state = fetch(facts, PASSWORD)
 
     # THEN both facts landed, from a single read. FTL allows 16
     # concurrent API sessions, so asking twice per fetch — twice per
@@ -389,26 +422,283 @@ def test_fetch_reads_both_api_facts_in_one_go():
     assert facts.reads.count("api_facts") == 1
 
 
-def test_an_unreadable_webserver_port_is_not_mistaken_for_the_right_one():
-    # GIVEN a machine whose pihole.toml cannot be read yet
-    facts = FactsStub(port=None)
-
-    # WHEN the world is read and the plan computed
-    outcomes = compute(fetch(facts, INTENT), INTENT)
-
-    # THEN the port is set rather than assumed correct, and the restart
-    # that setting it causes is waited out
-    assert outcomes == (SetWebserverPort(WEBSERVER_PORT), AwaitApi())
-
-
 def test_an_unknown_ntp_fact_passes_through_fetch_unchanged():
     # GIVEN a machine whose pihole.toml cannot answer about NTP — the
     # workload fact is None, and fetch must not guess on its way past
     facts = FactsStub(ntp=None)
 
     # WHEN the world is read
-    state = fetch(facts, INTENT)
+    state = fetch(facts, PASSWORD)
 
     # THEN the unknown reaches the pure core intact, where it is
     # treated as open rather than silently resolved to closed
     assert state == converged(ntp_server_active=None)
+
+
+# -- Stage 2: FTL config diff. ----------------------------------------
+
+
+def test_drifted_blocking_enabled_yields_set_ftl_config():
+    # GIVEN a machine where blocking is off but intent says on
+    state = converged(blocking_enabled=False)
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN the drifted key is applied via the API
+    assert outcomes == (SetFtlConfig(password=PASSWORD, config=(("dns.blocking.active", True),)),)
+
+
+def test_drifted_dnssec_yields_set_ftl_config():
+    # GIVEN a machine where dnssec is on but intent says off
+    state = converged(dnssec_enabled=True)
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN the drifted key is applied
+    assert outcomes == (SetFtlConfig(password=PASSWORD, config=(("dns.dnssec", False),)),)
+
+
+def test_drifted_upstream_dns_yields_set_ftl_config():
+    # GIVEN an intent with managed upstreams that differ from state
+    intent = PiholeIntent(admin_password=PASSWORD, upstream_dns=("1.1.1.1", "9.9.9.9"))
+    state = converged(upstream_dns=("8.8.8.8",))
+
+    # WHEN the plan is computed
+    outcomes = compute(state, intent)
+
+    # THEN the drifted key is applied
+    assert outcomes == (
+        SetFtlConfig(password=PASSWORD, config=(("dns.upstreams", ("1.1.1.1", "9.9.9.9")),)),
+    )
+
+
+def test_drifted_listening_mode_yields_set_ftl_config():
+    # GIVEN an intent with a managed listening mode that differs
+    intent = PiholeIntent(admin_password=PASSWORD, listening_mode="ALL")
+    state = converged(listening_mode="LOCAL")
+
+    # WHEN the plan is computed
+    outcomes = compute(state, intent)
+
+    # THEN the drifted key is applied
+    assert outcomes == (SetFtlConfig(password=PASSWORD, config=(("dns.listeningMode", "ALL"),)),)
+
+
+def test_multiple_drifts_are_sorted_by_key():
+    # GIVEN a machine with several drifted FTL config keys
+    intent = PiholeIntent(
+        admin_password=PASSWORD,
+        upstream_dns=("1.1.1.1",),
+        listening_mode="ALL",
+        blocking_enabled=False,
+        dnssec_enabled=True,
+    )
+    state = converged(
+        upstream_dns=None,
+        listening_mode="LOCAL",
+        blocking_enabled=True,
+        dnssec_enabled=False,
+    )
+
+    # WHEN the plan is computed
+    outcomes = compute(state, intent)
+
+    # THEN the config is sorted by key name, not by insertion order
+    assert outcomes == (
+        SetFtlConfig(
+            password=PASSWORD,
+            config=(
+                ("dns.blocking.active", False),
+                ("dns.dnssec", True),
+                ("dns.listeningMode", "ALL"),
+                ("dns.upstreams", ("1.1.1.1",)),
+            ),
+        ),
+    )
+
+
+def test_unmanaged_upstream_dns_produces_no_outcome():
+    # GIVEN an intent where upstream_dns is None (unmanaged)
+    intent = PiholeIntent(admin_password=PASSWORD, upstream_dns=None)
+    state = converged(upstream_dns=("8.8.8.8",))
+
+    # WHEN the plan is computed
+    outcomes = compute(state, intent)
+
+    # THEN no SetFtlConfig is emitted for upstreams
+    assert outcomes == (Noop(),)
+
+
+def test_unmanaged_listening_mode_produces_no_outcome():
+    # GIVEN an intent where listening_mode is None (unmanaged)
+    intent = PiholeIntent(admin_password=PASSWORD, listening_mode=None)
+    state = converged(listening_mode="ALL")
+
+    # WHEN the plan is computed
+    outcomes = compute(state, intent)
+
+    # THEN no SetFtlConfig is emitted for listening mode
+    assert outcomes == (Noop(),)
+
+
+def test_none_blocking_state_drifts():
+    # GIVEN a machine where blocking_enabled is None (unreadable)
+    state = converged(blocking_enabled=None)
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN None drifts — it is not the same as True
+    assert outcomes == (SetFtlConfig(password=PASSWORD, config=(("dns.blocking.active", True),)),)
+
+
+def test_none_dnssec_state_drifts():
+    # GIVEN a machine where dnssec_enabled is None (unreadable)
+    state = converged(dnssec_enabled=None)
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN None drifts — it is not the same as False
+    assert outcomes == (SetFtlConfig(password=PASSWORD, config=(("dns.dnssec", False),)),)
+
+
+def test_ntp_server_enabled_when_state_is_not_clearly_enabled():
+    # GIVEN an intent that wants NTP on, and a state that is not
+    # clearly enabled (None or False)
+    intent = PiholeIntent(admin_password=PASSWORD, ntp_server_enabled=True)
+    state = converged(ntp_server_active=None)
+
+    # WHEN the plan is computed
+    outcomes = compute(state, intent)
+
+    # THEN the NTP server is enabled, and the restart is waited out
+    assert outcomes == (SetNtpServer(active=True), AwaitApi())
+
+
+def test_ntp_server_not_enabled_when_already_on():
+    # GIVEN an intent that wants NTP on, and a state that already has it
+    intent = PiholeIntent(admin_password=PASSWORD, ntp_server_enabled=True)
+    state = converged(ntp_server_active=True)
+
+    # WHEN the plan is computed
+    outcomes = compute(state, intent)
+
+    # THEN nothing happens — already converged
+    assert outcomes == (Noop(),)
+
+
+def test_ntp_server_disabled_when_intent_says_off_and_state_is_open():
+    # GIVEN an intent that wants NTP off (default), and a state that is
+    # open (True or None)
+    state = converged(ntp_server_active=True)
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN the NTP server is closed
+    assert outcomes == (SetNtpServer(active=False), AwaitApi())
+
+
+# -- open_ports. -------------------------------------------------------
+
+
+def test_open_ports_without_ntp():
+    # GIVEN an intent with NTP disabled
+    # WHEN the ports are computed
+    ports = open_ports(PiholeIntent(admin_password=PASSWORD, ntp_server_enabled=False))
+
+    # THEN 123/udp is not included
+    assert ports == (("tcp", 53), ("udp", 53), ("tcp", 80), ("tcp", 443))
+
+
+def test_open_ports_with_ntp():
+    # GIVEN an intent with NTP enabled
+    # WHEN the ports are computed
+    ports = open_ports(PiholeIntent(admin_password=PASSWORD, ntp_server_enabled=True))
+
+    # THEN 123/udp is included
+    assert ports == (("tcp", 53), ("udp", 53), ("tcp", 80), ("tcp", 443), ("udp", 123))
+
+
+# -- The NTP tri-state comparison. -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ntp_server_active", "ntp_server_enabled", "expected"),
+    [
+        (True, True, (Noop(),)),
+        (False, True, (SetNtpServer(active=True), AwaitApi())),
+        (None, True, (SetNtpServer(active=True), AwaitApi())),
+        (True, False, (SetNtpServer(active=False), AwaitApi())),
+        (False, False, (Noop(),)),
+        (None, False, (SetNtpServer(active=False), AwaitApi())),
+    ],
+    ids=[
+        "on-and-wanted",
+        "off-but-wanted",
+        "unknown-but-wanted",
+        "on-but-unwanted",
+        "off-and-unwanted",
+        "unknown-and-unwanted",
+    ],
+)
+def test_the_ntp_decision_is_a_tri_state_comparison(
+    ntp_server_active: bool | None,
+    ntp_server_enabled: bool,
+    expected: tuple[PiholeOutcome, ...],
+):
+    # GIVEN a machine's NTP state and an operator's NTP intent
+    state = converged(ntp_server_active=ntp_server_active)
+    intent = PiholeIntent(admin_password=PASSWORD, ntp_server_enabled=ntp_server_enabled)
+
+    # WHEN the plan is computed
+    # THEN the NTP step is the one-line drift answer — with unknown
+    # drifting to a correction in both directions — and a correction
+    # always carries its own readiness gate
+    assert compute(state, intent) == expected
+
+
+# -- The per-architecture pin (ADR-0010). ------------------------------
+
+
+@pytest.mark.parametrize(
+    ("machine", "expected"),
+    [
+        ("x86_64", SNAP_REVISIONS["amd64"]),
+        ("aarch64", SNAP_REVISIONS["arm64"]),
+        ("armv7l", None),
+        ("riscv64", None),
+        ("", None),
+    ],
+    ids=["amd64", "arm64", "armhf", "riscv64", "empty"],
+)
+def test_the_pin_is_resolved_per_architecture(machine: str, expected: str | None):
+    # GIVEN what `platform.machine()` reports on some host
+    # WHEN the pinned revision is resolved
+    # THEN each supported architecture gets its own number — the store
+    # numbers every build separately, so one constant cannot fit both —
+    # and an unsupported one gets None rather than a wrong revision
+    assert revision_for(machine) == expected
+
+
+def test_the_two_pinned_revisions_are_different_numbers():
+    # GIVEN the pin map
+    # WHEN the two supported architectures are compared
+    # THEN they differ: assuming otherwise is the bug this map fixes
+    assert SNAP_REVISIONS["amd64"] != SNAP_REVISIONS["arm64"]
+
+
+def test_an_unpinned_architecture_plans_no_reinstall():
+    # GIVEN an installed machine whose architecture this release does
+    # not pin — the fact reads None
+    state = converged(pinned_revision=None, revision="9999")
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN no re-pin is planned against a revision that does not exist.
+    # `install` is what refuses, with the architecture in the message.
+    assert outcomes == (Noop(),)

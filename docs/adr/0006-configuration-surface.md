@@ -4,6 +4,8 @@
 **Date:** 2026-08-07
 **Accepted:** 2026-08-08
 **Amended:** 2026-08-08 — `web-password` moved from accepted to rejected, per [ADR-0007 §3](0007-admin-password-handling.md).
+**Amended:** 2026-09-05 — `snap-channel` and `snap-revision` moved from accepted to rejected: the revision is charm policy, pinned per release and held against auto-refresh, per [ADR-0010](0010-snap-revision-is-charm-policy.md).
+**Amended:** 2026-09-05 — §2.10 removed and §2.8 rewritten: the snap self-signs TLS and self-protects its API since upstream PRs #15/#16 (byte-identical in the pinned revision 1400), so the charm no longer manages `webserver.port`.
 **Related:** [ADR-0001: Charm Scope and Specification](0001-charm-scope-and-specification.md), [ADR-0004: FTL Configuration Mechanism](0004-ftl-configuration-mechanism.md), [ADR-0007: Admin Password Handling](0007-admin-password-handling.md)
 
 ---
@@ -32,8 +34,6 @@ re-added.
 
 | Option | Type | Justification against §1 |
 |---|---|---|
-| `snap-channel` | string (`stable`\|`edge`) | Only two values exist ([snap-constraints §1](../snap-constraints.md)). Not deployment shape — it selects workload behaviour, and only the charm can act on it. |
-| `snap-revision` | string | The **only** reproducibility lever, because the snap publishes no tracks. Empty means track the channel. Document the cost: a pinned revision stops receiving security updates. |
 | `upstream-dns` | string (CSV in, JSON array out) | Core workload intent, and operator intent rather than data another charm owns. See §2.4. |
 | `dns-listening-mode` | string enum | An enum, not a raw FTL string, so the charm owns the vocabulary. FTL's values are `LOCAL \| SINGLE \| BIND \| ALL \| NONE` (default `LOCAL`) — **not** `LISTEN_LOCAL`/`LISTEN_ALL` as an earlier draft stated; corrected from the annotated `pihole.toml`. |
 | `blocking-enabled` | boolean | Reachable, cheap, genuinely operational. |
@@ -52,11 +52,12 @@ retry a hook that can only fail again — consistent with
 | Rejected | Instead | Rule applied |
 |---|---|---|
 | `listen-interface` / `bind-address` | **`extra-bindings: dns`** + `self.model.get_binding("dns")`, using `network.bind_address` to bind and `network.ingress_address` to advertise. | #2 — network placement. Juju spaces own this. This is non-negotiable #4 in its purest form. |
-| `web-port` as an *operator* option | Nothing — but the charm **must manage `webserver.port` itself**. See §2.10. | The reasoning in the original draft ("FTL's default already fails soft") was factually wrong. |
+| `web-port` as an *operator* option | Nothing. The snap's stock `webserver.port` binds 80 and 443 and the charm leaves it alone. | A port the charm does not need to manage is not a deployment choice either. |
 | `install-timeout`, `readiness-timeout` | Constants in `pihole.py`. | A permanent public API for a transient problem is a bad trade. |
 | `blocklists` / `adlists` | **Deferred** — see [BACKLOG.md](../BACKLOG.md). | Adlists live in the `adlist` table of `gravity.db`, not in config. Not declarative, not transactional, not idempotent. **Do not add a config option whose implementation has not been proven.** |
 | `upstream-dns` as a *relation* | Kept as a config option. See §2.4 — no resolver charm and no interface exist, and upstreams are operator intent. | #1 checked, does not apply. |
 | `web-password` | **Nothing.** The charm generates the admin password, owns it in a Juju secret, and exposes `get-admin-password` / `rotate-admin-password`. See [ADR-0007 §3](0007-admin-password-handling.md). | One source of truth beats two mechanisms plus a precedence rule. |
+| `snap-channel`, `snap-revision` | **Nothing.** `SNAP_REVISIONS` is a charm constant — one revision per architecture — bumped per release; the snap is held against auto-refresh. See [ADR-0010](0010-snap-revision-is-charm-policy.md). | Rule 4's third alternative: the revision is the charm's release engineering, not deployment shape. The default (empty = auto-refresh) was the exposure being removed. |
 
 ### 2.3 NTP off by default — a deliberate divergence from the snap
 
@@ -165,13 +166,14 @@ under you.
 ### 2.8 Ports are computed from config
 
 ```python
-ops.Port("tcp", 53), ops.Port("udp", 53), ops.Port("tcp", 80)
+ops.Port("tcp", 53), ops.Port("udp", 53), ops.Port("tcp", 80), ops.Port("tcp", 443)
 ```
 
 plus 123/udp only when NTP is enabled, and 67/udp + 546/udp only when DHCP is.
 
-**Not 443.** The charm disables TLS (§2.10), so advertising 443 would document a
-listener that does not exist.
+**443 is advertised** because the snap's launcher self-signs a TLS certificate on
+first boot and serves it — a real listener, with a self-signed certificate the
+operator's browser will warn about.
 
 Three traps:
 
@@ -209,33 +211,6 @@ Ordering is mandatory and lives in `compute`'s output sequence: pool → router 
 not valid"*, and `restart-condition: on-failure` turns that into a crash loop
 rather than a degraded service.
 
-### 2.10 `webserver.port` is charm-managed, and not an operator option
-
-The packaged default requests TLS, FTL cannot generate its certificate inside this
-snap, and the SSL failure aborts the **entire** webserver — including the
-plain-HTTP listeners. A stock install has no admin UI and no HTTP API
-([snap-constraints §5.1](../snap-constraints.md)).
-
-The charm therefore sets
-
-```
-ftl.webserver.port = "80o,[::]:80o"
-```
-
-**before the daemon first starts**, unconditionally. Properties:
-
-- It is a **reachable** `snap set` key, so it works before the API exists — which
-  is precisely why it is the one key in the bootstrap phase of
-  [ADR-0004 §4](0004-ftl-configuration-mechanism.md).
-- Applying it before first start avoids the failure entirely: verified, port 80
-  binds and the API answers on the first boot.
-- It is **not** exposed as a config option. This is a workaround for a workload
-  defect, not a deployment choice, and an operator setting it to something that
-  re-enables TLS would silently lose the admin UI and the charm's own config path.
-
-When TLS support becomes real — either the snap fixes certificate generation or we
-supply a certificate through `tls-certificates` — this value has to be revisited
-together with that work. Tracked in [BACKLOG.md](../BACKLOG.md).
 
 ---
 

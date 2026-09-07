@@ -267,7 +267,7 @@ class Pihole:
 
     def __init__(
         self,
-        cache_factory: Callable[[], Mapping[str, SnapLike]] = snap.SnapCache,
+        cache_factory: Callable[[], Mapping[str, snap.Snap]] = snap.SnapCache,
         run: Runner = subprocess.run,
         snap_data: Path = SNAP_DATA,
     ) -> None:
@@ -325,19 +325,28 @@ gate catches it.
 Split it so each name is the answer:
 
 ```python
-def _read_intent(self) -> PiholeIntent | None:
-    """The declared desired state as it stands now, reading only."""
-    return _intent_from(self._read_password())
+def _read_password(self) -> str | None:
+    """Read the charm-owned secret by label. Reads only."""
+    ...
 
 
-def _ensure_intent(self) -> PiholeIntent | None:
-    """The declared desired state to converge toward, minting if needed."""
-    return _intent_from(self._ensure_password())
+def _ensure_password(self) -> str | None:
+    """Return the admin password, minting one if none exists yet."""
+    existing = self._read_password()
+    if existing is not None:
+        return existing
+    if not self.unit.is_leader():
+        return None
+    ...  # mint, store, verify
 ```
 
-Now `_on_collect_status` calls `_read_intent()` and there is no argument that
-could make it write. The reachability of the effect moved from a runtime value
-into the call graph, where reading the code answers the question.
+Now the call sites choose the effect by choosing the function:
+`_reconcile` builds its intent from `_ensure_password()`, and
+`_on_collect_status` from `_read_password()`. There is no argument that could
+make the status handler write. The reachability of the effect moved from a
+runtime value into the call graph, where reading the code answers the question —
+and note that no third method was added to "build the intent from the right
+password": the two call sites say which one they want, in one line each.
 
 Not every boolean parameter is this defect. `check: bool` passed straight through
 to `subprocess.run` is fine — it configures an effect that happens either way. The

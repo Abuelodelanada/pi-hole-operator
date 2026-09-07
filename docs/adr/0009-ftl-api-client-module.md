@@ -108,7 +108,6 @@ class FtlApi:
 
     def __init__(
         self,
-        run: Runner = _subprocess_run,
         snap_data: Path = SNAP_DATA,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
@@ -120,10 +119,11 @@ class FtlApi:
     def await_ready(self, timeout: float) -> None: ...
 ```
 
-`Pihole` composes it and forwards:
+`Pihole` composes it, and injects nothing of its own into it — a caller that
+needs a fake clock passes a whole `FtlApi`:
 
 ```python
-self._api = api or FtlApi(run=run, snap_data=snap_data, sleep=sleep, monotonic=monotonic)
+self._api = api or FtlApi(snap_data=snap_data)
 
 def api_facts(self, password: str) -> ApiFacts:
     """Establish both API facts from a single session."""
@@ -138,7 +138,7 @@ The `api` parameter is injected with a default so `FtlApi` can be faked in
 `is_transient`, `classify_blocking`, and the `PASSWORD_SETTLE_*` constants.
 
 **Stays in `pihole.py`:** everything snapd, `_read_toml`, `_ftl_config_value`,
-`_in_container`, `install_remedy`, `Runner`, `SnapLike`, `_subprocess_run`.
+`_in_container`, `install_remedy`, `Runner`, `_subprocess_run`.
 
 **Unchanged:** `PiholeFacts`, `fetch`, `compute` and `charm.py` are not edited.
 

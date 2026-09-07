@@ -2,6 +2,14 @@
 
 **Status:** Accepted
 **Date:** 2026-08-07
+**Amended:** 2026-09-04 — §5.2 recorded `cli_pw` as the PATCH credential; that is
+wrong. A `cli_pw` session is read-only for config and is answered with 403. The
+PATCH authenticates with the admin password. Re-verified on a deployed unit; see
+[snap-constraints §7.2.8](../snap-constraints.md).
+**Amended:** 2026-09-05 — §2.4 removed and §4 collapsed to a single mechanism: the
+snap's launcher self-signs TLS and serves the webserver from the first boot
+(upstream PR #15, byte-identical in the pinned revision 1400), so there is no
+bootstrap-phase key and the charm no longer touches `webserver.port`.
 **Related:** [ADR-0003: Reconciler and Functional Core](0003-reconciler-and-functional-core.md), [ADR-0005: Status Semantics and Failure Handling](0005-status-semantics-and-failure-handling.md), [ADR-0006: Configuration Surface](0006-configuration-surface.md), [ADR-0007: Admin Password Handling](0007-admin-password-handling.md), [ADR-0009: Split the FTL API client out of `Pihole`](0009-ftl-api-client-module.md), [snap constraints §4](../snap-constraints.md)
 
 ---
@@ -58,23 +66,6 @@ The configure hook already diffs the requested value against the current TOML
 changed (`hooks/configure:263-267`). Verified by PID: setting the same value
 twice does not restart. **Do not reimplement that diff.**
 
-### 2.4 The bootstrap ordering constraint — discovered during the spike
-
-This is what ultimately shapes the decision, and it was not visible when this
-ADR was first written.
-
-The packaged default `webserver.port = "80o,443os,[::]:80o,[::]:443os"` requests
-TLS. FTL cannot generate its self-signed certificate inside this snap, and the
-SSL failure **aborts the entire webserver** — including the plain-HTTP entries.
-Result on a stock install: no port 80, no admin UI, **and no HTTP API**. See
-[snap-constraints §5.1](../snap-constraints.md).
-
-So `webserver.port` must be corrected **before the daemon first serves**, and the
-HTTP API is unavailable until it is. Any mechanism that depends on the API cannot
-be the *only* mechanism.
-
----
-
 ## 3. Approaches, evaluated against spike evidence
 
 ### A. `snap run --shell` then `pihole-FTL --config`
@@ -116,8 +107,8 @@ Additional verified properties:
 use it, and there is no PATCH anywhere. The charm must issue its own HTTP
 request.
 
-**Cons** — requires the webserver up, so it cannot apply the bootstrap key
-(§2.4); needs session handling; `cli_pw` rotates on every FTL restart.
+**Cons** — requires the webserver up, so it cannot write before the daemon's
+first boot; needs session handling; `cli_pw` rotates on every FTL restart.
 
 ### C. Run `pihole-FTL --config` directly from the host
 
@@ -128,17 +119,14 @@ Runs unconfined, outside the snap's mount namespace, with the wrong `$SNAP_DATA`
 
 ## 4. Decision
 
-**Split by bootstrap versus steady-state, not by snapd's regex.**
+**One mechanism: `PATCH /api/config`, for all 166 keys.**
 
-| Phase | Mechanism | Keys |
-|---|---|---|
-| **Bootstrap** — before the daemon first serves | `snap set ftl.*` | `webserver.port` (§2.4). Nothing else. |
-| **Steady state** — daemon serving | `PATCH /api/config` | Everything else, all 166 keys. |
-
-This is the key simplification the spike bought. The earlier draft of this ADR
-routed each key by whether snapd's validation regex accepted it, which required a
-`_is_snapd_safe_key()` predicate, a hard-coded exception for `dns.dnssec`, and
-two mechanisms whose failure modes differed per key.
+The webserver binds port 80 from the first boot, so the HTTP API is available
+for every configuration write — there is no bootstrap-versus-steady-state split.
+The earlier draft of this ADR routed each key by whether snapd's validation
+regex accepted it, which required a `_is_snapd_safe_key()` predicate, a
+hard-coded exception for `dns.dnssec`, and two mechanisms whose failure modes
+differed per key.
 
 **`_is_snapd_safe_key` is deleted.** The reachable/unreachable distinction is an
 accident of snapd's option-name validation and carries no meaning for the
@@ -156,14 +144,13 @@ such key exists today.
 ### 5.1 The client
 
 `ftl_api.py` owns a small HTTP client using stdlib `urllib.request` — no new
-dependency. It talks to `http://127.0.0.1:<webserver-port>/api/`, and the charm
-knows the port because it sets it (§4). (This client lived in `pihole.py` when
-this ADR was written; ADR-0009 moved it.)
+dependency. It talks to `http://127.0.0.1/api/`, port 80 of the snap's stock
+`webserver.port`, which the charm does not manage. (This client lived in
+`pihole.py` when this ADR was written; ADR-0009 moved it.)
 
 *(The `pihole api` wrapper discovers the URL by querying a CHAOS TXT record,
 `dig +short -p <dns.port> chaos txt local.api.ftl @127.0.0.1`. That is a more
-robust discovery mechanism and is worth adopting if we ever stop owning
-`webserver.port`.)*
+robust discovery mechanism if the stock port ever stops being dependable.)*
 
 ### 5.2 Authentication
 
@@ -252,8 +239,8 @@ Run 2026-08-07 on an Ubuntu 26.04 LXD VM, snap rev 1348.
   writes `pihole.toml` directly; the charm overwrites it on the next reconcile.
   Correct convergence, but surfacing the drift as an `ActiveStatus` message would
   be kinder. Now cheap, since `GET /api/config` returns the whole tree.
-- **CHAOS TXT URL discovery** (§5.1), if the charm ever stops owning
-  `webserver.port`.
+- **CHAOS TXT URL discovery** (§5.1), if depending on the snap's stock port 80
+  ever stops being dependable.
 - **Fixing the 66-key gap upstream.** The snap's configure hook could expose
   kebab-case aliases mapping to camelCase FTL keys. That would make `snap set`
   complete — but with the API path working, this is no longer on our critical
@@ -282,9 +269,8 @@ Run 2026-08-07 on an Ubuntu 26.04 LXD VM, snap rev 1348.
 ### Negative
 
 - **snapd state is now permanently unreliable** as a view of FTL configuration.
-  `snap get` shows only `webserver.port`; everything else lives in `pihole.toml`
-  and nowhere else. This must be stated plainly in the README, because an
-  operator's first instinct will be `snap get`.
+  Everything lives in `pihole.toml` and nowhere else. This must be stated plainly
+  in the README, because an operator's first instinct will be `snap get`.
 - **Config application depends on the daemon serving HTTP.** The charm cannot
   apply steady-state config until port 80 is up, which couples configuration to
   webserver health and makes the install ordering load-bearing.

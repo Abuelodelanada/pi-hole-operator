@@ -25,7 +25,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Protocol
+from typing import Protocol, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -42,7 +42,11 @@ import resolved
 ADMIN_PASSWORD = "an-admin-password-24-bytes"
 """What the mocked secret holds. Never a real generated value."""
 
+PINNED_REVISION = pihole_state.SNAP_REVISIONS["amd64"]
+"""What the charm pins for the architecture the fakes pretend to be."""
+
 REVISION = "1348"
+"""A revision that is NOT the charm's pin — drift tests rely on it."""
 VERSION = "6.4.3"
 
 
@@ -86,14 +90,19 @@ def mock_pihole(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     decisions instead of a stubbed answer.
     """
     mock = MagicMock()
-    mock.installed_revision.return_value = REVISION
+    mock.installed_revision.return_value = PINNED_REVISION
+    mock.pinned_revision.return_value = PINNED_REVISION
+    mock.refresh_held.return_value = True
     mock.workload_version.return_value = VERSION
     mock.ftl_status.return_value = pihole_state.ServiceStatus(enabled=True, active=True)
-    mock.webserver_port.return_value = pihole_state.WEBSERVER_PORT
     mock.api_facts.return_value = api_facts()
     mock.admin_password_state.return_value = pihole_state.PasswordAccepted()
-    mock.stub_listener_disabled.return_value = True
+    mock.port53_released.return_value = True
     mock.ntp_server_active.return_value = False
+    mock.upstream_dns.return_value = None
+    mock.listening_mode.return_value = None
+    mock.blocking_enabled.return_value = True
+    mock.dnssec_enabled.return_value = False
     monkeypatch.setattr(charm.pihole, "Pihole", lambda: mock)
     return mock
 
@@ -174,7 +183,7 @@ class FakeSnap:
         # `_snap_daemons`, and `ensure` talks to the store. Scripting it
         # is what lets a test prove the workload module converts it.
         self.refusal = refusal
-        self.ensure_calls: list[tuple[snap.SnapState, str | None]] = []
+        self.ensure_calls: list[tuple[snap.SnapState, str | None, str | None]] = []
         self.set_calls: list[dict[str, object]] = []
         self.start_calls: list[tuple[list[str] | None, bool]] = []
         self.has_ftl_service = True
@@ -194,13 +203,28 @@ class FakeSnap:
             )
         }
 
-    def ensure(self, state: snap.SnapState, *, channel: str | None = None) -> None:
+    def ensure(
+        self, state: snap.SnapState, *, channel: str | None = None, revision: str | None = None
+    ) -> None:
         """Install the snap, or pretend to when dishonest."""
-        self.ensure_calls.append((state, channel))
+        self.ensure_calls.append((state, channel, revision))
         if self.refusal is not None:
             raise self.refusal
         if self.honest:
             self.present = True
+            if revision is not None:
+                self.revision = str(revision)
+
+    def hold(self) -> None:
+        """Hold the snap, or pretend to when dishonest."""
+        self.hold_calls += 1
+        if self.refusal is not None:
+            raise self.refusal
+        if self.honest:
+            self.held = True
+
+    held: bool = False
+    hold_calls: int = 0
 
     def set(self, config: Mapping[str, snap.JSONAble], *, typed: bool = False) -> None:
         """Accept configuration, as `snap set` accepts anything."""
@@ -233,15 +257,21 @@ class FakeCache:
         self.error = error or snap.SnapError("the snap store is having a moment")
         self.calls = 0
 
-    def __call__(self) -> Mapping[str, pihole.SnapLike]:
-        """Return the cache, raising while errors remain."""
+    def __call__(self) -> Mapping[str, snap.Snap]:
+        """Return the cache, raising while errors remain.
+
+        The cast is the whole price of `FakeSnap` not inheriting from
+        `snap.Snap`: it tells pyright to accept a duck. A fake that
+        drifts from the real API is still caught — as a `TypeError` in
+        whichever test calls it.
+        """
         self.calls += 1
         if self.remaining_errors > 0:
             self.remaining_errors -= 1
             raise self.error
         if self.fake_snap is None:
             raise snap.SnapNotFoundError(f"Snap {pihole.SNAP_NAME!r} not found!")
-        return {pihole.SNAP_NAME: self.fake_snap}
+        return cast("Mapping[str, snap.Snap]", {pihole.SNAP_NAME: self.fake_snap})
 
 
 class FakeRunner:
@@ -361,7 +391,7 @@ class HttpReply(Protocol):
         ...
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class FakeResponse:
     """Enough of an HTTP response for the client under test."""
 
@@ -489,9 +519,12 @@ def write_cli_pw(snap_data: pathlib.Path, value: str) -> None:
 def write_pihole_toml(
     snap_data: pathlib.Path,
     *,
-    webserver_port: str | None = None,
     pwhash: str | None = None,
     ntp_active: bool | None = None,
+    upstreams: list[str] | None = None,
+    listening_mode: str | None = None,
+    blocking_active: bool | None = None,
+    dnssec: bool | None = None,
     raw: str | None = None,
 ) -> None:
     """Write the subset of `pihole.toml` this charm reads back."""
@@ -500,10 +533,7 @@ def write_pihole_toml(
     if raw is not None:
         path.write_text(raw, encoding="utf-8")
         return
-    lines = ["[webserver]"]
-    if webserver_port is not None:
-        lines.append(f'port = "{webserver_port}"')
-    lines.append("[webserver.api]")
+    lines = ["[webserver.api]"]
     if pwhash is not None:
         lines.append(f'pwhash = "{pwhash}"')
     if ntp_active is not None:
@@ -513,6 +543,20 @@ def write_pihole_toml(
             "[ntp.ipv6]",
             f"active = {str(ntp_active).lower()}",
         ]
+    # All three [dns] keys are collected first so the table header is
+    # emitted once, whatever the combination.
+    dns_lines: list[str] = []
+    if upstreams is not None:
+        dns_lines.append(f"upstreams = {upstreams!r}")
+    if listening_mode is not None:
+        dns_lines.append(f'listeningMode = "{listening_mode}"')
+    if dnssec is not None:
+        dns_lines.append(f"dnssec = {str(dnssec).lower()}")
+    if dns_lines:
+        lines.append("[dns]")
+        lines += dns_lines
+    if blocking_active is not None:
+        lines += ["[dns.blocking]", f"active = {str(blocking_active).lower()}"]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -563,6 +607,7 @@ def workload(
         snap_data=snap_data,
         resolved_drop_in=drop_in,
         retry_wait=tenacity.wait_none(),
-        sleep=clock.sleep,
-        monotonic=clock.monotonic,
+        # The clock belongs to the API client, not to the snap wrapper:
+        # `Pihole` never reads the time itself.
+        api=ftl_api.FtlApi(snap_data=snap_data, sleep=clock.sleep, monotonic=clock.monotonic),
     )

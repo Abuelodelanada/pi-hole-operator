@@ -15,9 +15,7 @@ dependencies = [
     "charmlibs-snap>=1,<2",
     "charmlibs-systemd>=1,<2",
     "tenacity",
-    # pydantic returns with Stage 2, for self.load_config and the FTL
-    # config mapping. Declaring it before anything imports it only
-    # ships an unused dependency in every unit's venv.
+    "pydantic",
 ]
 
 [dependency-groups]

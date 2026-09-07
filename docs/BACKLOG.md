@@ -32,8 +32,11 @@ listed in [roadmap.md](roadmap.md#open-spikes).
   request. (ADR-0004 §7)
 - **CHAOS TXT API discovery.** The `pihole api` wrapper locates the API with
   `dig +short -p <dns.port> chaos txt local.api.ftl @127.0.0.1` rather than assuming
-  a port. More robust than ours; adopt if the charm ever stops owning
-  `webserver.port`. (ADR-0004 §5.1)
+  a port. **The recorded trigger has fired** (2026-09-05): the charm stopped
+  managing `webserver.port`, so `API_ORIGIN` now assumes the snap's stock port 80
+  without observing it. Either adopt discovery, or keep `webserver.port` as an
+  observed fact so a moved port produces a status that names the real remedy.
+  (ADR-0004 §5.1)
 - **`webserver.acl` as defence in depth.** Restricting the API to known addresses
   would harden a deployment beyond merely requiring a password — but a restrictive
   ACL also blocks the admin UI the operator wants to reach. Needs a design that
@@ -66,13 +69,12 @@ Ordered by estimated value — user impact against implementation risk.
    snap ships nothing. Three options with named costs in ADR-0008 §2.2. Default is
    to ship none until a requirement exists. (ADR-0008)
 3. **`tls-certificates` for the admin UI** — `tls_certificates_interface.v4` is the
-   recommended library and FTL reads `webserver.tls.cert`. **Currently blocked by a
-   snap defect:** FTL cannot emit a certificate in this snap at all
-   (snap-constraints §5.1), which is why the charm disables TLS outright
-   (ADR-0006 §2.10). An externally issued certificate may sidestep it — unproven.
-   Whoever picks this up must revisit `webserver.port` at the same time. The snap's
-   own docs recommend a reverse proxy instead, which may be the better answer.
-   (ADR-0001, ADR-0006 §2.10)
+   recommended library and FTL reads `webserver.tls.cert`. **No longer blocked:**
+   the snap's launcher self-signs `tls.pem` on first boot and serves 443
+   (snap-constraints §5.1), so the charm advertises it. What remains is replacing
+   that self-signed certificate with an issued one, which an operator's browser
+   would accept without a warning. The snap's own docs recommend a reverse proxy
+   instead, which may still be the better answer. (ADR-0001, ADR-0006 §2.8)
 4. **Upstream resolver relation** — would let Pi-hole learn a recursive resolver's
    address instead of the operator copying it by hand. **Blocked on two things that
    do not exist** (checked 2026-08-08): there is no `unbound` charm on Charmhub, and
@@ -129,16 +131,18 @@ Items explicitly scoped out. Add when there is demand.
 - **Timeout tuning options** (`install-timeout`, `readiness-timeout`). A permanent
   public API for a transient problem. Constants in `pihole.py` instead. (ADR-0006)
 
-## Upstream issues to file
+## Upstream issues — both filed and fixed
 
-Drafted in the repository root; delete once filed.
+- **Webserver dead on a stock install** — filed as issue #13, fixed by PR #15
+  (merged 2026-08-25): the launcher self-signs `tls.pem`, with an OpenSSL
+  fallback. (snap-constraints §5.1)
+- **Unauthenticated, network-reachable config API** — filed as issue #14, fixed by
+  PR #16 (merged 2026-09-04): the launcher generates an admin password on first
+  boot when the webserver binds non-loopback. (snap-constraints §5.2)
 
-- **`snap-issue-webserver-tls.md`** — a stock install has no web UI and no HTTP API,
-  because TLS certificate generation fails and takes the whole webserver down with
-  it. `snap-check` reports exit 0 regardless. (snap-constraints §5.1)
-- **`snap-issue-unauthenticated-api.md`** — following the documented Quickstart
-  leaves an unauthenticated, network-reachable config API that permits a full DNS
-  hijack. (snap-constraints §5.2, ADR-0007 §1.3)
+Both are byte-identical in the pinned revision 1400, which is what allowed the
+charm's corresponding defences to be deleted (ADR-0010 guarantees the revision).
+The two draft files in the repository root can go.
 
 ## Housekeeping
 
@@ -152,9 +156,6 @@ Drafted in the repository root; delete once filed.
   first — it removes `venv/bin/python*`, so the template's symlink and
   `LD_LIBRARY_PATH` setup are load-bearing. Details in the `machine-charm-scaffold`
   skill. (Stage 0)
-- **`assumes: juju >= 3.6` should probably be `>= 3.6.17`**, which is the true floor
-  for the 26.04 base (ADR-0002 §2.2.1). **NOT VERIFIED** whether `assumes` accepts a
-  patch-level version. (Stage 0)
 - **No `LICENSE` file.** The README deliberately claims no license because the tree
   carries none. Decide and add one. (Stage 0)
 

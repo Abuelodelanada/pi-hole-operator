@@ -61,6 +61,36 @@ snapd older than 2.76.
 
 ---
 
+### 1.4 Revisions move silently; holds are per-snap and verifiable
+
+Verified 2026-09-05. A deployed unit held revision `1389` while `latest/stable`
+carried `1400` — both reporting the identical version string
+`v6.4.3+git.f47b8ed`. A store-side rebuild is invisible to every signal except
+the revision number.
+
+`snap refresh --hold=forever <snap>` holds one snap indefinitely (idempotent,
+exit 0 on repeat), and `snap info <snap>` answers with a `hold:` line — absent
+when not held. A machine-level global hold (concierge bootstrap leaves one) also
+shows as `hold:` per-snap, so "held" is true by whatever mechanism; a charm
+must still establish its own per-snap hold to hold on clean machines.
+
+**Revisions are per architecture.** Verified 2026-09-05 through the store API:
+`latest/stable` was revision **1400** on amd64 and **1398** on arm64 — both
+`v6.4.3+git.f47b8ed`, both byte-identical in `bin/launcher-ftl` and
+`bin/snap-check` to the post-PR-#15/#16 source. `latest/edge` the same day was
+1413 and 1403. So a pin is one number *per platform*, and the numbers cannot be
+derived from one another:
+
+```bash
+curl -s -H 'Snap-Device-Series: 16' -H 'Snap-Device-Architecture: arm64' \
+  'https://api.snapcraft.io/v2/snaps/info/pihole-by-rajannpatel?fields=revision'
+```
+
+`charmlibs-snap` 1.0.1 exposes all three: `Snap.ensure(revision=...)`,
+`Snap.hold()`, and the `Snap.held` property (which runs `snap info` and greps
+`hold:`). Its `install` docstring prescribes the pairing: installing a revision
+does not pin it — the next refresh moves the snap unless held.
+
 ## 2. Services
 
 ```
@@ -281,83 +311,36 @@ Verified with `ss -tulpn`:
 |---|---|---|
 | 53 tcp+udp | DNS | `ftl.dns.port` |
 | 80 tcp | admin UI + API | default `webserver.port = "80o,443os,[::]:80o,[::]:443os"`; the `o` suffix means *optional* — it does not fail if taken |
-| 443 tcp | HTTPS | the `s` suffix; needs `webserver.tls.cert` |
+| 443 tcp | HTTPS | the `s` suffix; the launcher self-signs `tls.pem` on first boot |
 | **123 udp** | **NTP server — active by default** | `ntp.ipv4.active`/`ntp.ipv6.active` default `true`. Unexpected attack surface for a DNS appliance. Both keys are reachable, so the charm can decide. |
 | 67 / 546 udp | DHCP / DHCPv6 | only when `dhcp.active=true` |
 | 4711 | **not used** | that was FTL v5's telnet API. v6 serves the API over HTTP on `webserver.port`. |
 
-### 5.1 The webserver does not start at all on a stock install
+### 5.1 The stock install serves the webserver, self-signed
 
-**Verified 2026-08-07** (Ubuntu 24.04 container and 26.04 VM, snap rev 1348). This
-is the single most consequential defect for the charm, and it is documented
-nowhere upstream.
+**Fixed upstream 2026-08-25** (PR #15, `launcher-ftl` bootstraps `tls.pem` with
+`--gen-x509`, falling back to staged OpenSSL; only when both fail does
+`webserver.port` drop to HTTP-only). Byte-identical in the pinned revision 1400,
+verified by diffing the snap's `bin/launcher-ftl` against the post-merge source.
+A stock install binds 80 and 443, with a self-signed certificate on 443.
 
-The packaged default `webserver.port = "80o,443os,[::]:80o,[::]:443os"` requests
-TLS via the `s` suffix. FTL tries to auto-generate `/etc/pihole/tls.pem`, fails,
-and the SSL context error **aborts the entire webserver — including the plain-HTTP
-`80o` entries, despite `o` meaning optional**:
+Historical note: before that PR (revisions ≤ 1389 verified), the packaged TLS
+request aborted the **entire** webserver — no port 80, no admin UI, no HTTP API,
+while DNS kept working — and `snap-check` returned exit 0 through all of it.
 
-```
-ERROR: Generation of SSL/TLS certificate /etc/pihole/tls.pem failed!
-ERROR: Start of webserver failed! Web interface will not be available!
-ERROR:        Error: Error initializing SSL context (error code 3.0)
-```
+### 5.2 The snap generates an admin password before serving an open API
 
-Net effect: **no port 80, no port 443, no admin UI, and no HTTP API.** DNS works
-normally, which masks the failure completely.
+**Fixed upstream 2026-09-04** (PR #16). On first boot, when no `pwhash` exists
+and the webserver binds non-loopback, the launcher generates a random 20-char
+password, applies it, and stores it root-only in `etc/pihole/web_pw`; `snap-check`
+gains a WEB API section that fails non-zero on an unauthenticated, reachable
+API. Byte-identical in the pinned revision 1400. The same unauthenticated
+`PATCH /api/config` that returned 200 before now returns 401.
 
-Certificate generation fails for **both** key types, in the same call, after key
-generation succeeds:
+The charm still sets its own password before the first start (ADR-0007), so the
+launcher's generation never fires on a charm-managed unit — and a two-password
+collision cannot happen.
 
-```
-$ pihole-FTL --gen-x509 /etc/pihole/tls.pem pi.hole
-ERROR: mbedtls_x509write_crt_pem (CA) returned -20352   # -0x4F80 ECP_BAD_INPUT_DATA
-$ pihole-FTL --gen-x509 /etc/pihole/tls.pem pi.hole rsa
-ERROR: mbedtls_x509write_crt_pem (CA) returned -16512   # -0x4080 RSA_BAD_INPUT_DATA
-```
-
-Ruled out: **not** confinement (zero AppArmor denials), **not** file permissions
-(`/etc/pihole` is writable inside the sandbox), **not** missing libraries (all
-three `libmbed*` resolve from `$SNAP/usr/lib/`), **not** missing entropy
-(`/dev/urandom` present), **not** a port conflict. mbedTLS works for TLS
-*connections* (`--tls-ciphers` enumerates suites) but cannot *emit* a certificate.
-**Inferred, not proven:** the bundled mbedTLS lacks a working x509/PEM write path.
-
-**Fix the charm applies**, verified to bind port 80 immediately and to avoid the
-failure entirely when applied *before* first start:
-
-```
-snap set pihole-by-rajannpatel ftl.webserver.port="80o,[::]:80o"
-```
-
-`webserver.port` is a snapd-reachable key, which is why it is the sole bootstrap
-key in [ADR-0004 §4](adr/0004-ftl-configuration-mechanism.md).
-
-**`snap-check` does not detect this.** With the webserver dead it returns exit `0`
-and its output never mentions the webserver or port 80.
-
-Reported upstream — see `snap-issue-webserver-tls.md` in the repository root.
-
-### 5.2 With no admin password, the config API is open to the network
-
-**Verified 2026-08-07** from a *different host*, with *no credentials*:
-
-```
-$ curl -X PATCH http://<pihole-ip>/api/config -H 'Content-Type: application/json' \
-       --data '{"config":{"dns":{"upstreams":["198.51.100.66"]}}}'
-HTTP 200
-```
-
-The value landed in `pihole.toml` and DNS resolution for the whole network broke.
-Any configuration key can be rewritten this way.
-
-Cause: the defaults `pwhash = ""` and `acl = ""`. Pi-hole v6 permits
-unauthenticated API access when no password is set (upstream behaviour), but
-upstream's installer forces a password during setup. The snap's documented
-Quickstart never does, and FTL binds `0.0.0.0:80`.
-
-**The charm must close this before the daemon serves** — see
-[ADR-0007 §1.3](adr/0007-admin-password-handling.md).
 
 ---
 
@@ -516,6 +499,28 @@ that sets a password (as it must) cannot use an unauthenticated readiness probe.
 Verified on `ftl.webserver.port`: after `snap unset`, `pihole.toml` retains the
 last applied value rather than returning to the FTL default. Relevant to any design
 that assumes `unset` undoes a `set`.
+
+### 7.2.8 A `cli_pw` session cannot modify config
+
+Verified 2026-09-04 on a deployed unit (Core v6.4.3, FTL v6.7). `POST /api/auth`
+with the `cli_pw` value opens a session that **reads but cannot write config**:
+
+```
+PATCH /api/config  (cli_pw session)   -> 403
+{"error":{"key":"forbidden","message":"Unable to change configuration (read-only)",
+ "hint":"The current CLI session is not allowed to modify Pi-hole config settings"}}
+```
+
+The same PATCH with a session authenticated by the **admin password** returns
+`200` and the value lands in `pihole.toml`. The body shape is nested, mirroring
+`pihole.toml` (ADR-0004 §5.3); the 403 is about the *session type*, not the body.
+
+**Consequences:**
+- Config application must authenticate with the admin password, which the charm
+  already owns in its Juju secret. `cli_pw` remains valid for read-only probes.
+- The 403 body is JSON with a `hint`, so it must not be parsed as "not JSON".
+- ADR-0004 §5.2 recorded `cli_pw` for the PATCH from the spike; this section is
+  the corrected, re-verified fact.
 
 ### 7.3 `snap-check` exit codes
 

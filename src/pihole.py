@@ -7,12 +7,16 @@ mutation below reads back its own result, and no foreign exception
 leaves this module unconverted — see ADR-0005 section 2.9. The FTL
 HTTP client lives in `ftl_api.py`, composed below — see ADR-0009
 section 4.
+
+Stage 2 adds four new facts from pihole.toml, generalises the NTP
+server toggle, and adds config application via the HTTP API. See
+ADR-0004 section 5 and ADR-0006 section 2.1.
 """
 
 import contextlib
 import logging
+import platform
 import subprocess
-import time
 import tomllib
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
@@ -23,7 +27,7 @@ import tenacity
 from charmlibs import snap
 
 import resolved
-from ftl_api import ApiTimeoutError, FtlApi
+from ftl_api import ApiConfigError, ApiTimeoutError, ApiUnavailableError, FtlApi
 from pihole_state import (
     PIHOLE_TOML,
     PWHASH_KEY,
@@ -33,12 +37,11 @@ from pihole_state import (
     ApiFacts,
     ServiceStatus,
     config_value,
+    revision_for,
 )
 
 logger = logging.getLogger(__name__)
 
-SNAP_CHANNEL = "stable"
-"""The only channels this snap publishes are stable and edge."""
 
 FTL_SERVICE = "pihole-ftl"
 """The daemon the snap ships with `install-mode: disable`."""
@@ -46,10 +49,14 @@ FTL_SERVICE = "pihole-ftl"
 PIHOLE_CMD = f"/snap/bin/{SNAP_NAME}.pihole"
 """The fully qualified command: the `pihole` alias does not register."""
 
-WEBSERVER_PORT_KEY = "webserver.port"
-
 NTP_ACTIVE_KEYS = ("ntp.ipv4.active", "ntp.ipv6.active")
 """The two keys behind FTL's NTP server on 123/udp, on by default."""
+
+UPSTREAM_DNS_KEY = "dns.upstreams"
+LISTENING_MODE_KEY = "dns.listeningMode"
+BLOCKING_ACTIVE_KEY = "dns.blocking.active"
+DNSSEC_KEY = "dns.dnssec"
+"""FTL config keys read from pihole.toml for the Stage 2 diff."""
 
 INSTALL_ATTEMPTS = 3
 INSTALL_WAIT = tenacity.wait_fixed(2) + tenacity.wait_random(0, 5)
@@ -81,8 +88,12 @@ snap-constraints section 1.
 """
 
 
+# Not frozen: an exception that crosses an event-handler boundary gets
+# `exc.__traceback__` assigned by ops' `_event_context`, which raises
+# `FrozenInstanceError` on a frozen dataclass and replaces the real
+# error with a crash. Verified on a deployed unit.
 @final
-@dataclass(frozen=True)
+@dataclass
 class PiholeError(Exception):
     """A workload operation did not produce the state it claimed to.
 
@@ -156,42 +167,6 @@ class Runner(Protocol):
         ...
 
 
-class SnapLike(Protocol):
-    """The subset of `charmlibs.snap.Snap` this module uses."""
-
-    @property
-    def present(self) -> bool:
-        """Whether the snap is installed."""
-        ...
-
-    @property
-    def revision(self) -> str:
-        """The installed revision, as a string."""
-        ...
-
-    @property
-    def version(self) -> str | None:
-        """The workload version the snap declares."""
-        ...
-
-    @property
-    def services(self) -> Mapping[str, snap.SnapServiceDict]:
-        """What snapd knows about each of the snap's services."""
-        ...
-
-    def ensure(self, state: snap.SnapState, *, channel: str | None = None) -> None:
-        """Install or refresh the snap toward the given state."""
-        ...
-
-    def set(self, config: Mapping[str, snap.JSONAble], *, typed: bool = False) -> None:
-        """Write snapd configuration keys."""
-        ...
-
-    def start(self, services: list[str] | None = None, enable: bool = False) -> None:
-        """Start services, optionally enabling them at boot."""
-        ...
-
-
 def _subprocess_run(
     args: Sequence[str],
     *,
@@ -209,13 +184,12 @@ class Pihole:
 
     def __init__(
         self,
-        cache_factory: Callable[[], Mapping[str, SnapLike]] = snap.SnapCache,
+        cache_factory: Callable[[], Mapping[str, snap.Snap]] = snap.SnapCache,
         run: Runner = _subprocess_run,
         snap_data: Path = SNAP_DATA,
         resolved_drop_in: Path = resolved.DROP_IN,
         retry_wait: tenacity.wait.WaitBaseT = INSTALL_WAIT,
-        sleep: Callable[[float], None] = time.sleep,
-        monotonic: Callable[[], float] = time.monotonic,
+        machine: Callable[[], str] = platform.machine,
         api: FtlApi | None = None,
     ) -> None:
         self._cache_factory = cache_factory
@@ -223,7 +197,8 @@ class Pihole:
         self._snap_data = snap_data
         self._resolved_drop_in = resolved_drop_in
         self._retry_wait = retry_wait
-        self._api = api or FtlApi(snap_data=snap_data, sleep=sleep, monotonic=monotonic)
+        self._machine = machine
+        self._api = api or FtlApi(snap_data=snap_data)
 
     # -- Facts. Every one of these is safe to call at any time. --------
 
@@ -233,6 +208,26 @@ class Pihole:
         if pihole is None or not pihole.present:
             return None
         return pihole.revision
+
+    def pinned_revision(self) -> str | None:
+        """Report the revision this charm pins for this machine.
+
+        None on an architecture `SNAP_REVISIONS` does not cover —
+        revisions are per-architecture, so there is no single number
+        that fits every machine (ADR-0010).
+        """
+        return revision_for(self._machine())
+
+    def refresh_held(self) -> bool:
+        """Report whether snapd will not auto-refresh this snap.
+
+        False when it cannot be read: an unreadable hold is not a
+        held snap, and the correction is one idempotent command.
+        """
+        pihole = self._snap()
+        if pihole is None or not pihole.present:
+            return False
+        return pihole.held
 
     def workload_version(self) -> str | None:
         """Return the Pi-hole version the snap reports, if any."""
@@ -253,10 +248,6 @@ class Pihole:
             return ServiceStatus(enabled=False, active=False)
         return ServiceStatus(enabled=service["enabled"], active=service["active"])
 
-    def webserver_port(self) -> str | None:
-        """Return `webserver.port` as `pihole.toml` holds it."""
-        return self._ftl_config_value(WEBSERVER_PORT_KEY)
-
     def ntp_server_active(self) -> bool | None:
         """Report whether FTL's NTP server is enabled on 123/udp.
 
@@ -269,9 +260,29 @@ class Pihole:
             return None
         return any(state for state in states)
 
-    def stub_listener_disabled(self) -> bool:
-        """Report whether port 53 was taken from systemd-resolved."""
-        return resolved.is_stub_disabled(self._resolved_drop_in)
+    def upstream_dns(self) -> tuple[str, ...] | None:
+        """Return `dns.upstreams` as a tuple, or None if unreadable."""
+        value = config_value(self._read_toml(), UPSTREAM_DNS_KEY)
+        if isinstance(value, list):
+            return tuple(str(item) for item in value)  # type: ignore[arg-type]
+        return None
+
+    def listening_mode(self) -> str | None:
+        """Return `dns.listeningMode`, or None if unreadable."""
+        value = self._ftl_config_value(LISTENING_MODE_KEY)
+        return value
+
+    def blocking_enabled(self) -> bool | None:
+        """Return `dns.blocking.active`, or None if unreadable."""
+        return self._ftl_config_bool(BLOCKING_ACTIVE_KEY)
+
+    def dnssec_enabled(self) -> bool | None:
+        """Return `dns.dnssec`, or None if unreadable."""
+        return self._ftl_config_bool(DNSSEC_KEY)
+
+    def port53_released(self) -> bool:
+        """Report whether port 53 is free for Pi-hole."""
+        return resolved.is_port53_released(self._resolved_drop_in)
 
     def api_ready(self) -> bool:
         """Report whether `GET /api/dns/blocking` is answered."""
@@ -306,8 +317,8 @@ class Pihole:
 
     # -- Effects. Each one verifies the state it was meant to produce. -
 
-    def _ensure_installed(self) -> None:
-        """Ask snapd for the snap at the configured channel.
+    def _ensure_installed(self, revision: str) -> None:
+        """Ask snapd for the snap at the pinned revision.
 
         Separate from `install` so the retry wraps this one call, and
         not the read-back that proves it worked.
@@ -316,10 +327,10 @@ class Pihole:
             snap.Error: snapd refused. `install` retries this and
                 converts what survives.
         """
-        self._require_snap().ensure(snap.SnapState.Present, channel=SNAP_CHANNEL)
+        self._require_snap().ensure(snap.SnapState.Present, channel=None, revision=revision)
 
     def install(self) -> None:
-        """Install the snap, retrying a flaky store a few times.
+        """Install the snap at the pinned revision, with retries.
 
         Retries on ``snap.Error``, **not** ``snap.SnapError``. Verified
         against charmlibs-snap 1.0.1: ``SnapError``, ``SnapAPIError``
@@ -331,14 +342,34 @@ class Pihole:
         What survives the retries is converted, not re-raised — see
         ADR-0005 section 2.9. The remedy is chosen after the failure
         rather than before, so a healthy install never execs the
-        diagnostic.
+        diagnostic. The revision is charm policy per ADR-0010, resolved
+        for this machine's architecture — and the read-back proves the
+        pin, because installing a revision does not by itself stop a
+        later refresh from moving it.
 
         Raises:
-            PiholeError: The store kept failing after the retries, or
-                snapd reported success and the snap is still not
-                installed.
+            PiholeError: This charm's release pins no revision for this
+                architecture, the store kept failing after the retries,
+                or snapd reported success and the snap is still not
+                installed at the pinned revision.
         """
-        operation = f"installing the {SNAP_NAME} snap"
+        machine = self._machine()
+        pinned = revision_for(machine)
+        if pinned is None:
+            # Refusing beats installing whatever the store offers: an
+            # unpinned snap would auto-refresh out from under the charm,
+            # which is the whole thing ADR-0010 prevents.
+            raise PiholeError(
+                operation=f"installing the {SNAP_NAME} snap",
+                expected=f"a revision pinned for {machine}",
+                actual="this charm's release pins none",
+                remedy=(
+                    f"{machine} is not a supported architecture; deploy on "
+                    "amd64 or arm64, or add its revision to SNAP_REVISIONS"
+                ),
+            )
+
+        operation = f"installing the {SNAP_NAME} snap at revision {pinned}"
         retrying = tenacity.Retrying(
             retry=tenacity.retry_if_exception_type(snap.Error),
             wait=self._retry_wait,
@@ -346,7 +377,7 @@ class Pihole:
             reraise=True,
         )
         try:
-            retrying(self._ensure_installed)
+            retrying(self._ensure_installed, pinned)
         except snap.Error as err:
             raise _snapd_failure(
                 operation=operation,
@@ -355,14 +386,38 @@ class Pihole:
             ) from err
 
         revision = self.installed_revision()
-        if revision is None:
+        if revision != pinned:
             raise PiholeError(
                 operation=operation,
-                expected="an installed revision",
-                actual="snapd still reports the snap as absent",
+                expected=f"revision {pinned} installed",
+                actual=f"snapd reports revision {revision}",
                 remedy=self._install_remedy(),
             )
-        logger.info("Installed %s revision %s.", SNAP_NAME, revision)
+        logger.info("Installed %s revision %s on %s.", SNAP_NAME, revision, machine)
+
+    def hold_refresh(self) -> None:
+        """Hold the snap against auto-refresh, and verify it took.
+
+        Per-snap and indefinite: snapd's timer can no longer move the
+        pinned revision. A manual refresh is still possible — the
+        revision drift check is the second line of defence. See
+        ADR-0010.
+
+        Raises:
+            PiholeError: snapd refused the hold, or accepted it and
+                `snap info` still shows none.
+        """
+        operation = f"holding {SNAP_NAME} against auto-refresh"
+        with _converting_snapd_failure(operation=operation, remedy=SNAPD_REMEDY):
+            self._require_snap().hold()
+        if not self.refresh_held():
+            raise PiholeError(
+                operation=operation,
+                expected="a hold visible in `snap info`",
+                actual="snapd reports no hold",
+                remedy=f"run `snap refresh --hold=forever {SNAP_NAME}` on the machine",
+            )
+        logger.info("Held %s against auto-refresh.", SNAP_NAME)
 
     def start(self, *, enable: bool = True) -> None:
         """Start the FTL daemon, and enable it so it survives a reboot.
@@ -392,64 +447,43 @@ class Pihole:
             )
         logger.info("Started %s.%s (enable=%s).", SNAP_NAME, FTL_SERVICE, enable)
 
-    def set_webserver_port(self, value: str) -> None:
-        """Set `ftl.webserver.port`, and verify `pihole.toml` agrees.
-
-        The only `snap set` this charm performs. Everything else goes
-        through the HTTP API, which does not exist until this has been
-        applied.
-
-        Raises:
-            PiholeError: snapd refused the key, or the value did not
-                appear in `pihole.toml`.
-        """
-        with _converting_snapd_failure(
-            operation=f"setting ftl.{WEBSERVER_PORT_KEY} to {value!r}",
-            remedy=SNAPD_REMEDY,
-        ):
-            self._require_snap().set({f"ftl.{WEBSERVER_PORT_KEY}": value})
-        actual = self._ftl_config_value(WEBSERVER_PORT_KEY)
-        if actual != value:
-            raise PiholeError(
-                operation=f"setting ftl.{WEBSERVER_PORT_KEY} to {value!r}",
-                expected=f"{value!r} in pihole.toml",
-                actual=f"it reads back as {actual!r}",
-                remedy="`snap set` returns 0 on keys it drops; inspect pihole.toml on the unit",
-            )
-        logger.info("Set ftl.%s to %r.", WEBSERVER_PORT_KEY, value)
-
-    def disable_ntp_server(self) -> None:
-        """Set both `ftl.ntp.*.active` keys false, and verify the TOML.
+    def set_ntp_server(self, *, active: bool) -> None:
+        """Set both `ftl.ntp.*.active` keys, and verify the TOML.
 
         The snap starts an NTP server on 123/udp by default — attack
         surface nothing asked for. Both keys are `snap set`-reachable,
         and the configure hook restarts FTL only when a value actually
         changed, so a converged machine is not bounced.
 
+        When `active` is True, both keys must be present and True.
+        When False, both must be present and False — absence or None
+        is not evidence the server is off (rule 6).
+
         Raises:
-            PiholeError: snapd refused the keys, or either server is
-                still enabled in `pihole.toml`.
+            PiholeError: snapd refused the keys, or the TOML does not
+                confirm the intended state.
         """
-        operation = "disabling the FTL NTP server on 123/udp"
+        direction = "enabling" if active else "disabling"
+        operation = f"{direction} the FTL NTP server on 123/udp"
         with _converting_snapd_failure(operation=operation, remedy=SNAPD_REMEDY):
             self._require_snap().set(
-                {f"ftl.{key}": False for key in NTP_ACTIVE_KEYS},
+                {f"ftl.{key}": active for key in NTP_ACTIVE_KEYS},
                 typed=True,
             )
-        # Strict read-back: both keys must be present and false. An
-        # absent or unreadable key is not evidence the server is off —
-        # FTL's default is true, so absence can mean the write never
-        # landed (rule 6).
+        # Strict read-back: both keys must be present and match the
+        # intended value. An absent or unreadable key is not evidence
+        # the write landed — FTL's default is true, so absence can
+        # mean the write never landed (rule 6).
         after = {key: self._ftl_config_bool(key) for key in NTP_ACTIVE_KEYS}
-        not_off = [key for key, state in after.items() if state is not False]
-        if not_off:
+        not_proven = [key for key, state in after.items() if state is not active]
+        if not_proven:
             raise PiholeError(
                 operation=operation,
-                expected="both NTP servers disabled in pihole.toml",
-                actual=f"not proven off: {', '.join(not_off)}",
+                expected=f"both NTP servers {'enabled' if active else 'disabled'} in pihole.toml",
+                actual=f"not proven {'on' if active else 'off'}: {', '.join(not_proven)}",
                 remedy="`snap set` returns 0 on keys it drops; inspect pihole.toml on the unit",
             )
-        logger.info("Disabled the FTL NTP server.")
+        logger.info("%s the FTL NTP server.", direction.capitalize())
 
     def set_password(self, password: str) -> None:
         """Apply the admin password with `pihole setpassword`.
@@ -497,10 +531,9 @@ class Pihole:
         """Block until the HTTP API answers, or give up and say so.
 
         Raises:
-            PiholeError: The API never answered. With `webserver.port`
-                corrected and the daemon active, that is not "still
-                starting" — something a human must look at has gone
-                wrong.
+            PiholeError: The API never answered. With the daemon
+                active, that is not "still starting" — something a
+                human must look at has gone wrong.
         """
         try:
             self._api.await_ready(timeout)
@@ -515,9 +548,102 @@ class Pihole:
                 ),
             ) from err
 
+    def apply_ftl_config(self, password: str, config: Mapping[str, object]) -> None:
+        """Apply FTL config keys via the HTTP API, and read back.
+
+        Delegates to `FtlApi.apply_config` — which authenticates with
+        the admin password, because a `cli_pw` session cannot modify
+        config — then reads every key back from `pihole.toml` to verify
+        it landed. FTL returns 200 for unknown keys and silently ignores
+        them, so the read-back is the only defence (rule 6, ADR-0004
+        section 5.4). No `ftl_api` exception leaves this module
+        unconverted.
+
+        Raises:
+            PiholeError: A key was not applied, the API could not be
+                reached, or it reported a 400 with a hint.
+        """
+        try:
+            self._api.apply_config(password, config)
+        except ApiUnavailableError as err:
+            raise PiholeError(
+                operation="applying FTL config via PATCH /api/config",
+                expected="the API to accept the config",
+                actual=f"it could not be applied: {err}",
+                remedy=(
+                    "check that the FTL daemon is running and see "
+                    f"/var/snap/{SNAP_NAME}/common/var/log/pihole/FTL.log"
+                ),
+            ) from err
+        except ApiConfigError as err:
+            raise PiholeError(
+                operation="applying FTL config via PATCH /api/config",
+                expected="the config to be accepted",
+                actual=f"FTL rejected it: {err.hint}",
+                remedy="check the key name and value type against the FTL documentation",
+            ) from err
+
+        for key in config:
+            expected = config[key]
+            actual = config_value(self._read_toml(), key)
+            if actual is None:
+                # Key not found in pihole.toml at all — FTL silently
+                # ignored an unknown key.
+                raise PiholeError(
+                    operation=f"applying {key}",
+                    expected=f"{key} = {expected!r} in pihole.toml",
+                    actual=f"{key} is absent from pihole.toml",
+                    remedy="FTL ignores unknown keys with HTTP 200; check the key name",
+                )
+            # Type-appropriate comparison
+            if isinstance(expected, bool):
+                if not isinstance(actual, bool):  # type: ignore[reportUnnecessaryIsInstance]
+                    raise PiholeError(
+                        operation=f"applying {key}",
+                        expected=f"{key} = {expected}",
+                        actual=f"{key} = {actual}",
+                        remedy=("the API returned 200 but the value did not land in pihole.toml"),
+                    )
+                if actual != expected:
+                    raise PiholeError(
+                        operation=f"applying {key}",
+                        expected=f"{key} = {expected}",
+                        actual=f"{key} = {actual}",
+                        remedy=("the API returned 200 but the value did not land in pihole.toml"),
+                    )
+            elif isinstance(expected, tuple):
+                if isinstance(actual, list):
+                    if expected != tuple(actual):  # type: ignore[reportUnknownArgumentType]
+                        raise PiholeError(
+                            operation=f"applying {key}",
+                            expected=f"{key} = {expected!r}",
+                            actual=f"{key} = {actual!r}",
+                            remedy=(
+                                "the API returned 200 but the value did not land in pihole.toml"
+                            ),
+                        )
+                else:
+                    raise PiholeError(
+                        operation=f"applying {key}",
+                        expected=f"{key} = {expected!r}",
+                        actual=f"{key} = {actual!r}",
+                        remedy=("the API returned 200 but the value did not land in pihole.toml"),
+                    )
+            else:
+                if str(actual) != str(expected):
+                    raise PiholeError(
+                        operation=f"applying {key}",
+                        expected=f"{key} = {expected!r}",
+                        actual=f"{key} = {actual!r}",
+                        remedy=("the API returned 200 but the value did not land in pihole.toml"),
+                    )
+        logger.info(
+            "Applied FTL config for %d keys and verified them in pihole.toml.", len(config)
+        )
+
     # -- Snap plumbing. -----------------------------------------------
 
-    def _snap(self) -> SnapLike | None:
+    def _snap(self) -> snap.Snap | None:
         """Look the snap up, tolerating snapd not knowing about it."""
         try:
             return self._cache_factory()[SNAP_NAME]
@@ -525,7 +651,7 @@ class Pihole:
             logger.debug("snapd could not describe %s: %s", SNAP_NAME, err)
             return None
 
-    def _require_snap(self) -> SnapLike:
+    def _require_snap(self) -> snap.Snap:
         """Look the snap up, letting a snapd failure propagate.
 
         Raises the raw `snap.Error`: `install`'s retry is keyed on

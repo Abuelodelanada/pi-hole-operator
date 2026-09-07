@@ -40,8 +40,9 @@ tests need mocks.
 from one caller and `f(generate=False)` from another means the name cannot answer
 "does this mutate?", and a read-only caller stays read-only only because someone
 passed the right argument. Write two methods and let each name carry the answer —
-`_read_intent` and `_ensure_intent` in `src/charm.py`. This matters most
-around `_on_collect_status`, which must not mutate anything.
+`_read_password` and `_ensure_password` in `src/charm.py`, with each call site
+choosing which one it needs. This matters most around `_on_collect_status`,
+which must not mutate anything.
 
 **Reach for a type before reaching for a boolean.** Three booleans threaded
 through control flow is a decision you cannot name. A frozen dataclass union with
