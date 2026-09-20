@@ -320,8 +320,10 @@ Verified with `ss -tulpn`:
 
 **Fixed upstream 2026-08-25** (PR #15, `launcher-ftl` bootstraps `tls.pem` with
 `--gen-x509`, falling back to staged OpenSSL; only when both fail does
-`webserver.port` drop to HTTP-only). Byte-identical in the pinned revision 1400,
-verified by diffing the snap's `bin/launcher-ftl` against the post-merge source.
+`webserver.port` drop to HTTP-only). Byte-identical in the pinned revisions
+(verified 2026-09-07 against 1400/1398, re-verified 2026-09-18 against
+1417/1415 — unchanged), by diffing the snap's `bin/launcher-ftl` against the
+post-merge source.
 A stock install binds 80 and 443, with a self-signed certificate on 443.
 
 Historical note: before that PR (revisions ≤ 1389 verified), the packaged TLS
@@ -334,7 +336,8 @@ while DNS kept working — and `snap-check` returned exit 0 through all of it.
 and the webserver binds non-loopback, the launcher generates a random 20-char
 password, applies it, and stores it root-only in `etc/pihole/web_pw`; `snap-check`
 gains a WEB API section that fails non-zero on an unauthenticated, reachable
-API. Byte-identical in the pinned revision 1400. The same unauthenticated
+API. Byte-identical in the pinned revisions (re-verified 2026-09-18 against
+1417/1415 — unchanged). The same unauthenticated
 `PATCH /api/config` that returned 200 before now returns 401.
 
 The charm still sets its own password before the first start (ADR-0007), so the
@@ -598,7 +601,7 @@ choices are traceable.
 | Admin password | Operator runbook: *"Do not use `snap set` to change web passwords."* `Reference: native-configuration` documents `ftl.webserver.api.password` as an ordinary settable key **with no warning**. | Follow the runbook. See [ADR-0007](adr/0007-admin-password-handling.md). |
 | `snap-check` exit codes | **Not documented anywhere in the wiki.** | Use the source-verified codes in §7.3 and pin them with a test. |
 | Metrics / Prometheus | **No mention anywhere** in 25 wiki pages — no exporter, no `/metrics`, no observability integration. | Nothing exists to wire up. See [ADR-0008](adr/0008-cos-integration.md). |
-| Content slots for logs | — | **Verified by grep: `snapcraft.yaml` contains no `slots:` key at all.** `COSAgentProvider(log_slots=...)` is therefore impossible; forward logs by path. |
+| Content slots for logs | — | **Corrected 2026-09-18:** verified by grep on the pre-PR-18 snapcraft that there was no `slots:` key, which made `COSAgentProvider(log_slots=...)` impossible — and note that "forward by path" was never a real mechanism: cos_agent v0 has no path-based forwarding at all (ADR-0008 §1.2). Upstream PR #18 added a read-only `logs` content slot; it is present in the pinned revisions (1417/1415) and connected live. |
 
 Also documented by the snap project as a self-declared weakness: the v5→v6 config
 migration *"has not been fully tested for this snap workflow."* Do not automate

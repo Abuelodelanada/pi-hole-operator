@@ -24,11 +24,13 @@ API_READY_TIMEOUT = 120.0
 # reach without a cycle. See ADR-0009 section 4.
 SNAP_NAME = "pihole-by-rajannpatel"
 
-SNAP_REVISIONS: Mapping[str, str] = {"amd64": "1400", "arm64": "1398"}
+SNAP_REVISIONS: Mapping[str, str] = {"amd64": "1417", "arm64": "1415"}
 """The revisions this charm's release is built against — ADR-0010.
 
 Per architecture, because the store numbers every build of the same
-source separately: 1400 and 1398 are the same `v6.4.3+git.f47b8ed`.
+source separately. The bump ritual and its evidence live in the ADR;
+this docstring deliberately records nothing bump-specific, because it
+would be wrong at the next bump with nothing prompting its update.
 Bump **every** entry in the change that cuts a charm release — the snap
 is held against auto-refresh, so this map is the only path a security
 update can take, and a stale pin is invisible in-machine.

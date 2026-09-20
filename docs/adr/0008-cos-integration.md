@@ -1,8 +1,20 @@
 # ADR-0008: COS Integration
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-08-07
-**Related:** [ADR-0002: Tech Stack and Repository Architecture](0002-tech-stack-and-repo-architecture.md), [ADR-0006: Configuration Surface](0006-configuration-surface.md)
+**Accepted:** 2026-09-18 — implemented and verified live: the relation, the
+databag, the slot connection, the filelog receiver with our topology, and the
+files readable inside the subordinate's namespace. Every Stage 5 acceptance
+box is ticked; the one hop this harness cannot prove — logs observed in a
+deployed Loki — is reworded out of the box and into BACKLOG with its trigger.
+**Amended:** 2026-09-18 — §1.2's remedy rewritten again: the upstream slot
+landed (PR #18) and is in the pinned revisions (ADR-0010's 2026-09-18 bump), so
+`log_slots` is now passed and connected live. §2.5's wiring gained `log_slots`
+and `upgrade_charm` as a refresh event. §2.1's deferral reason updated: the
+label shapes are now observed, and the selector decision is topology, not
+`filename` — the filename label is the subordinate's mount path and embeds its
+snap revision, so a filename selector breaks on every subordinate refresh.
+**Related:** [ADR-0002: Tech Stack and Repository Architecture](0002-tech-stack-and-repo-architecture.md), [ADR-0006: Configuration Surface](0006-configuration-surface.md), [ADR-0009: Split the FTL API client out of `Pihole`](0009-ftl-api-client-module.md), [ADR-0010: The Snap Revision Is Charm Policy](0010-snap-revision-is-charm-policy.md)
 
 ---
 
@@ -33,19 +45,28 @@ The snap's entire day-2 story is `snap logs`, `dmesg | grep DENIED`,
 
 So metrics are work we own, not something to wire up.
 
-### 1.2 There is no content slot for logs — verified
+### 1.2 The logs content slot — upstream, since PR #18
 
 `COSAgentProvider` accepts `log_slots=[...]`, which requires the snap to expose a
-`content` slot for its log directory.
+`content` slot for its log directory. cos_agent v0 (LIBPATCH 27) has **no
+path-based mechanism at all** — verified in the library and the subordinate's
+source: the provider publishes `log_slots`; the consumer `snap connect`s its
+`logs` plug to each named slot, reads the mount from snapd's fstab, and tails
+the mounted path. No slot → no connect → no fstab entry → no log receiver, and
+there is no journald receiver either.
 
-**Verified by grep: `snapcraft.yaml` contains no `slots:` key whatsoever.**
-
-So `log_slots` is not merely unset — it is **impossible** for this snap. Logs must
-be forwarded by path:
-
-```
-/var/snap/pihole-by-rajannpatel/common/var/log/pihole/{FTL,pihole,webserver,gravity-init}.log
-```
+**History:** verified by grep on 2026-08-07 that the snapcraft had no `slots:`
+key at all, which made `log_slots` impossible; this section then wrongly
+concluded "forward by path" (corrected 2026-09-07 — no such mechanism exists);
+the operator filed
+[PR #18](https://github.com/rajannpatel/snap-pi-hole/pull/18) on 2026-09-07
+asking for a read-only `logs` slot, and it merged and published in the pinned
+revisions (1417/1415, [ADR-0010](0010-snap-revision-is-charm-policy.md)'s
+2026-09-18 bump). The slot exposes `$SNAP_COMMON/var/log/pihole/`; the files
+observed in it on a live unit are `FTL.log`, `pihole.log`, `webserver.log`,
+`gravity-init.log`, and `gravity-first-run.log`. Connected live on the
+operator's model: `snap connections` shows
+`opentelemetry-collector:logs ↔ pihole-by-rajannpatel:logs`.
 
 ### 1.3 The naming trap
 
@@ -69,19 +90,32 @@ assuming a replacement exists.
 
 Split the work, because logs need no exporter and metrics do:
 
-- **Now:** the `cos-agent` relation, log forwarding by path, and **Loki** alert
-  rules.
+- **Now:** the `cos-agent` relation. Host metrics arrive with it via the
+  subordinate's own `node-exporter` (§2.2).
+- **When the rules are authored** (the slot has landed; forwarding works): the
+  selector is **topology labels, never `filename`** — observed live, the
+  `filename` label is the subordinate's mount path
+  (`/snap/opentelemetry-collector/<rev>/shared-logs/pihole/FTL.log`), which
+  embeds the subordinate's snap revision and breaks on every one of its
+  refreshes. Also observed: the subordinate sets `juju_charm` to *its own* charm
+  name in our receiver's topology, so rules key on `juju_application`/
+  `juju_unit` only. Until the rules are written and validated against a real
+  Loki, this stays deferred — authoring against a guessed label shape is the
+  failure this charm refuses to ship.
 - **Deferred:** Prometheus metrics, and therefore Prometheus alert rules.
 
-This ordering is not arbitrary. Prometheus alert rules without a metrics source
-are inert files. Loki rules over forwarded logs work immediately, and the failure
-modes we most need to detect are **visible in logs**:
+The failure modes we most need to detect are visible in logs, so when forwarding
+lands these are the signals worth rules:
 
 | Alert | Signal in the logs |
 |---|---|
 | FTL crash-looping | repeated `EADDRINUSE` in `FTL.log` — the launcher no longer pre-checks port 53, and `restart-condition: on-failure` makes this an indefinite loop |
 | Gravity sync failing | `gravity-init.log`; the weekly timer is the only thing refreshing blocklists |
-| Confinement denials | AppArmor `DENIED` bursts, which indicate a plug that should be connected |
+
+**Not alertable from snap logs:** AppArmor `DENIED` bursts. Denials land in the
+host's `kern.log`/journal, not in `$SNAP_COMMON`, so a rule over the forwarded
+snap logs can never see them. Dropped from the first cut; revisit if the host's
+logs ever get forwarded.
 
 Write every `description` for a human at 3am: state the user-visible impact and the
 first diagnostic step. For a DNS sinkhole the impact line is usually *"every device
@@ -99,6 +133,23 @@ Three options, none free:
 
 **Default to the third** until someone states a metrics requirement. Choose between
 the first two only then, in a PR that names the trade-off.
+
+**The requirement was stated 2026-09-07, and the choice was researched** — five
+community exporters, none shippable: `eko/pihole-exporter` (the recognised name)
+merged v6 support but is broken against v6's session model — it re-authenticates
+up to 7× per scrape and wedges after one timeout, with the fixes unmerged since
+July 2025; the fork that fixes it is days old with no adoption; the only exporter
+that handles the 16-session cap correctly is Docker-only; none ship a snap; and no
+Pi-hole charm exists on Charmhub. **Decision: defer Pi-hole-specific metrics.**
+Host metrics arrive anyway — the subordinate installs and scrapes the
+`node-exporter` snap itself (verified in its source: receiver
+`prometheus/node-exporter`, job `juju_<topology>_node-exporter`), so relating
+cos-agent yields host-level metrics with no exporter on our side. When
+Pi-hole-specific metrics are wanted, a **charm-owned exporter** is the leading
+candidate — the session-lifecycle machinery is already verified in
+[ADR-0009](0009-ftl-api-client-module.md) — but it carries a real cost the
+community options share: FTL requires a session for reads once a password is set
+(snap-constraints §7.2.6), so any exporter holds the admin password at rest.
 
 **Never point `metrics_endpoints` at the FTL API directly.** Prometheus cannot
 parse JSON; it would silently produce no metrics, which is worse than shipping
@@ -152,9 +203,16 @@ replacement exists; we **create none**.
 self._cos_agent = COSAgentProvider(
     self,
     relation_name="cos-agent",
-    refresh_events=[self.on.config_changed],
+    log_slots=[f"{pihole_state.SNAP_NAME}:logs"],
+    refresh_events=[self.on.config_changed, self.on.upgrade_charm],
 )
 ```
+
+`log_slots` names the snap's read-only `logs` content slot (§1.2). `upgrade_charm`
+is a refresh event because an upgrade can change what we publish — this one did:
+`log_slots` went from impossible to advertised, and without the event the
+subordinate keeps reading the pre-upgrade databag. No `metrics_endpoints`
+(deferred, §2.2).
 
 Instantiated in `__init__` alongside the other integration objects, **composed
 never subclassed**. It manages its own relation events.
@@ -209,14 +267,13 @@ and an unqualified `integrate` may resolve to that instead of `cos-agent`.
 - **Prometheus alert rules**, which follow metrics.
 - **A Grafana dashboard driven by logs** rather than metrics — feasible but of
   limited value; most Pi-hole dashboards people expect are metric-based.
-- **Integration-testing this relation**, which is blocked until
-  `opentelemetry-collector` publishes a 26.04 revision. The charm targets
-  `ubuntu@26.04` ([ADR-0002](0002-tech-stack-and-repo-architecture.md) §2.2), and
-  Juju enforces base compatibility between a principal and its subordinates.
-  [PR #369](https://github.com/canonical/opentelemetry-collector-operator/pull/369)
-  adds the bases but is open and unmerged. **This is a Stage 5 precondition
-  only** — the provider side can be implemented and unit-tested now. Re-check with
-  the scripted query in ADR-0002 §2.2.3.
+- **Observing logs in a deployed Loki** — the only hop this harness cannot
+  prove, because no machine Loki charm exists (COS's Loki runs on Kubernetes).
+  The machine-side chain is verified (databag, connection, files — asserted by
+  the suite; receiver and in-namespace readability — verified live). The
+  base-compatibility caveat that used to live here is recorded in
+  [ADR-0002](0002-tech-stack-and-repo-architecture.md)'s header `Amended:` lines:
+  deploy the subordinate with `--channel=0.130/stable --revision=<per-arch>`.
 
 ---
 
@@ -224,12 +281,16 @@ and an unqualified `integrate` may resolve to that instead of `cos-agent`.
 
 ### Positive
 
-- Shipping logs and Loki rules first means observability that **works on day one**
-  rather than a set of inert Prometheus rule files.
-- The alerts we can write cover the failure modes that actually bite: the port-53
-  crash loop, gravity failure, and confinement denials.
-- Verifying the absence of `slots:` avoids shipping a `log_slots` configuration
-  that would have silently forwarded nothing.
+- Log forwarding works on day one via the upstream slot; the Loki rules follow
+  once their label shapes are validated against a real Loki, so the first
+  release ships plumbing that is verified rather than rules that might not fire.
+- The alerts worth writing cover the failure modes that actually bite: the
+  port-53 crash loop and gravity failure. Confinement denials are out — they
+  land in the host's `kern.log`, not the snap's logs (§2.1).
+- Verifying the absence of `slots:` before PR #18 avoided shipping a `log_slots`
+  configuration that would have silently forwarded nothing; verifying the slot's
+  presence is now part of ADR-0010's bump ritual, because its failure mode is
+  silent.
 - Deciding `limit: 1` now avoids an unfixable `juju refresh` break later.
 - Recording the `grafana_agent` naming trap saves the next contributor from
   hunting a library that does not exist.
@@ -244,11 +305,14 @@ and an unqualified `integrate` may resolve to that instead of `cos-agent`.
 - The library name (`grafana_agent`) does not match the subordinate
   (`opentelemetry-collector`), which is permanently confusing and cannot be fixed
   from our side.
-- Forwarding logs by path rather than by content slot means the paths are
-  hardcoded against `$SNAP_COMMON`; a snap layout change breaks log collection
-  silently. Worth an integration assertion that the files exist.
-- **This relation cannot be integration-tested yet.** `opentelemetry-collector`
-  publishes no 26.04 revision, so Stage 5's integration test waits on a third
-  party. We deliberately did *not* hold the whole charm back on 24.04 for it
-  (ADR-0002 §2.2), which means this one stage carries the delay instead of the
-  entire project — but the delay is real and outside our control.
+- Forwarding rides on the subordinate's correctness: its `juju_charm` topology
+  label is wrong (its own name instead of ours — an upstream bug), and the
+  `filename` label embeds its snap revision. Our rules must therefore key on
+  `juju_application`/`juju_unit` only, and the integration suite asserts what
+  it can (databag, connection, files) rather than trusting it — the receiver
+  config was verified by hand on the operator's model.
+- **Observing logs in a deployed Loki** — the only hop this harness cannot
+  prove, because no machine Loki charm exists (COS's Loki runs on Kubernetes).
+  Everything on our side of that hop is integration-tested: the databag, the
+  slot connection, and the files; the receiver config and in-namespace
+  readability were verified live on the operator's model (2026-09-18).
