@@ -83,11 +83,17 @@ from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 self._cos_agent = COSAgentProvider(
     self,
     relation_name="cos-agent",
-    metrics_endpoints=[{"path": "/metrics", "port": 9617}],
     log_slots=["pihole-by-rajannpatel:logs"],
-    refresh_events=[self.on.config_changed],
+    refresh_events=[self.on.config_changed, self.on.upgrade_charm],
 )
 ```
+
+`upgrade_charm` belongs in `refresh_events`: an upgrade can change what the
+charm publishes (this one did — `log_slots` went from impossible to advertised),
+and without it the subordinate keeps reading the pre-upgrade databag. Verified
+live: after `juju refresh` the databag republishes and the subordinate connects.
+
+No `metrics_endpoints` in this charm — see Metrics below.
 
 Instantiate it in `__init__` alongside the other integration objects, before the
 reconcile observers. It manages its own relation events.
@@ -116,25 +122,31 @@ subdirectories under the rules directories expecting them to be picked up.
 
 ### Pi-hole specifics
 
-**Metrics.** Pi-hole v6 has no Prometheus endpoint. The FTL HTTP API returns JSON
-(`/api/stats/summary`, `/api/dns/blocking`), not the text exposition format.
-Options, in order of preference:
+**Metrics.** Pi-hole v6 has no Prometheus endpoint. The FTL HTTP API returns
+JSON (`/api/stats/summary`, `/api/dns/blocking`), not the text exposition
+format. **Decided (ADR-0008 §2.2): Pi-hole-specific metrics are deferred** —
+the community exporters were researched and none is shippable (the recognised
+one is broken against v6's session model, with fixes unmerged; the correct
+fork is days old; the session-model-correct one is Docker-only; none ship
+snaps). Host metrics arrive anyway: the subordinate installs and scrapes
+`node-exporter` itself, so relating cos-agent already yields them. If someone
+restates the need, a charm-owned exporter is the leading candidate — the
+session machinery is verified in `ftl_api.py` — but note any exporter must
+hold the admin password (reads require a session once one is set).
 
-1. Deploy a sidecar exporter (a community `pihole-exporter` translates the API to
-   Prometheus) and point `metrics_endpoints` at it.
-2. Have the charm write its own tiny exporter — more code to own, but no external
-   dependency.
-3. Ship no metrics initially and only forward logs and dashboards.
-
-Do not point `metrics_endpoints` at the FTL API directly; Prometheus cannot parse
-it. Pick one of the above and say which in the PR.
+Never point `metrics_endpoints` at the FTL API directly; Prometheus cannot
+parse JSON and would silently collect nothing.
 
 **Logs.** `log_slots` requires the snap to expose a `content` slot for its log
-directory. **NOT VERIFIED** whether `pihole-by-rajannpatel` declares one — check
-`snap/snapcraft.yaml` in the `snap-pi-hole` reference before relying on it. If it
-does not, the logs live at
-`/var/snap/pihole-by-rajannpatel/common/var/log/pihole/{FTL,pihole,webserver}.log`
-and must be forwarded by path instead.
+directory. **Verified 2026-09-18**: upstream
+[PR #18](https://github.com/rajannpatel/snap-pi-hole/pull/18) added a
+read-only `logs` slot (`$SNAP_COMMON/var/log/pihole`), published in the pinned
+revisions (1417/1415) and connected live. There is **no path-based forwarding
+in cos_agent v0** — the subordinate connects its `logs` plug to the slot,
+reads the mount from snapd's fstab, and tails the mounted path; no slot means
+no forwarding, and no journald receiver exists either. The files observed in
+the directory: `FTL.log`, `pihole.log`, `webserver.log`, `gravity-init.log`,
+`gravity-first-run.log`.
 
 ## Alert rules
 

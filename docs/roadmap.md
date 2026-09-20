@@ -335,12 +335,12 @@ trigger to revisit are in ADR-0007 §5 and [BACKLOG.md](BACKLOG.md).
 
 **Reference:** [ADR-0008](adr/0008-cos-integration.md)
 
-> **Precondition — check before starting.** `opentelemetry-collector` must publish
-> an `ubuntu@26.04` revision, because Juju enforces base compatibility between a
-> principal and its subordinates. Verify with the scripted query in
-> [ADR-0002 §2.2.3](adr/0002-tech-stack-and-repo-architecture.md). If it has not
-> landed, the provider side can still be **implemented and unit-tested** — only the
-> integration test blocks. Do not use `--force-base` to work around it.
+> **Precondition — cleared, with a caveat.** `opentelemetry-collector` publishes
+> `ubuntu@26.04` in track `0.130`, but the channel's recommended pointer for amd64
+> serves the 22.04 build, so a bare `juju deploy` fails base compatibility. Deploy
+> with `--channel=0.130/stable --revision=<per-arch>` — the full record is in the
+> [ADR-0002](adr/0002-tech-stack-and-repo-architecture.md)'s header `Amended:` lines.
+> Never `--force-base`.
 
 **Deliverables**
 
@@ -348,29 +348,66 @@ trigger to revisit are in ADR-0007 §5 and [BACKLOG.md](BACKLOG.md).
 - `charm-libs: [{lib: grafana_agent.cos_agent, version: "0"}]` +
   `charmcraft fetch-libs`. Vendored, never edited, never linted. Transitive
   `PYDEPS` added to `pyproject.toml` by hand.
-- `COSAgentProvider(self, ...)` in `__init__`. **No `log_slots`** — the snap has no
-  content slot. Forward by path from `$SNAP_COMMON/var/log/pihole/`.
+- `COSAgentProvider(self, ...)` in `__init__`, with
+  `log_slots=["pihole-by-rajannpatel:logs"]` — the snap's read-only `logs`
+  content slot (upstream PR #18, in the pinned revisions). `upgrade_charm` is a
+  refresh event: an upgrade that changes what we publish must republish.
 - Default rule directories, **no path arguments**:
   `src/loki_alert_rules/`, `src/grafana_dashboards/`,
   `src/prometheus_alert_rules/` (empty for now).
-- Loki alerts: FTL `EADDRINUSE` crash loop, gravity sync failure, AppArmor
-  `DENIED` bursts. Descriptions written for a human at 3am.
+- Loki alerts: **deferred** — the selector rules and the observed label shapes
+  that decide them live in [ADR-0008 §2.1](adr/0008-cos-integration.md); this
+  line deliberately does not restate them. When they land: FTL crash-loop and
+  gravity-failure signals authored against real lines, descriptions written for
+  a human at 3am.
 
 **Acceptance**
 
-- [ ] `juju integrate pihole:cos-agent otelcol:cos-agent` — **both endpoints
-      named**.
-- [ ] Log lines from Pi-hole appear in Loki with Juju topology labels.
-- [ ] The charm still reaches `ActiveStatus` with the relation **removed**.
-- [ ] An assertion that the log paths exist, since they are hardcoded.
+- [x] `juju integrate pihole:cos-agent otelcol:cos-agent` — **both endpoints
+      named**. — `test_cos_agent_integrates_and_publishes`. The subordinate needs a
+      revision pin (`--channel=0.130/stable --revision=491` amd64, 486 arm64): the
+      channel's amd64 pointer serves the 22.04 build, so a bare deploy fails base
+      compatibility (ADR-0008 §3). The assertion is the `config` databag read from
+      **otelcol/0's** view — `juju show-unit pihole/0` does not display the unit's
+      own databag, a fact that cost a live model to learn.
+- [x] The machine-side log chain, verified end to end. — Reworded from "log
+      lines appear in Loki": no machine Loki charm exists (COS's Loki runs on
+      Kubernetes), so that hop is unprovable in this harness and lives in BACKLOG
+      with its trigger. What this suite proves: the databag publishes
+      `log_slots` (`test_cos_agent_databag_publication`, unit), and on LXD
+      `test_log_paths_exist` asserts the files on disk **and** the slot
+      connected (`snap connections`:
+      `opentelemetry-collector:logs ↔ pihole-by-rajannpatel:logs`). Verified
+      live on the operator's model, beyond the suite (2026-09-18): the
+      subordinate's filelog receiver carries our topology labels, and the
+      files are readable inside its snap namespace.
+- [x] `charm-reviewer` clean (2026-09-19, fourth pass over the slice that
+      closes this stage). Four passes, each finding what the previous one's
+      fixes left: a vacuous `snap services` assertion and doc inversions; a
+      stale ADR-0008 §1.2 and a teardown race in the slot assertion; a false
+      "open box" claim; a duplicated clause — all fixed in this commit, and
+      the fourth pass cleared the closure. Deferred with triggers: the Loki
+      rules and end-to-end observation (BACKLOG), Pi-hole-specific metrics
+      (ADR-0008 §2.2).
+- [x] The charm still reaches `ActiveStatus` with the relation **removed**. —
+      `test_charm_stays_active_with_relation_removed`; the subordinate's own
+      `blocked` without COS backends is expected and is not the charm's status.
+- [x] An assertion that the log paths exist. — `test_log_paths_exist`: the log
+      files under `$SNAP_COMMON/var/log/pihole/` on a live unit (the observed
+      set is recorded in ADR-0008 §1.2). The "hardcoded" premise is gone — the
+      rules were deferred (ADR-0008 §2.1), so the paths live in the ADR and in
+      the upstream slot request, not in the charm.
 
 ---
 
 ## Stage 6 — Metrics
 
-**Deliberately unscheduled.** See [ADR-0008 §2.2](adr/0008-cos-integration.md).
-Default is to ship no metrics until a requirement exists; then choose between a
-community exporter and a charm-owned one in a PR that names the trade-off.
+**Pi-hole-specific metrics: deferred by decision (2026-09-07).** The research
+and the decision live in [ADR-0008 §2.2](adr/0008-cos-integration.md); this
+section deliberately does not restate them. Host-level metrics arrive anyway:
+the subordinate installs and scrapes `node-exporter` itself, so relating
+`cos-agent` already yields them. When Pi-hole-specific metrics
+are wanted, a charm-owned exporter is the leading candidate.
 
 **Never** point `metrics_endpoints` at the FTL API — Prometheus cannot parse JSON
 and would silently collect nothing.

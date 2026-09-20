@@ -65,9 +65,11 @@ Ordered by estimated value — user impact against implementation risk.
    or transactional**, which is why it is deferred rather than scheduled: we will
    not add a permanent config option whose reconcile step is unproven. Needs a
    proven idempotent design first. (ADR-0006)
-2. **Metrics via an exporter** — Pi-hole v6 exposes no Prometheus endpoint and the
-   snap ships nothing. Three options with named costs in ADR-0008 §2.2. Default is
-   to ship none until a requirement exists. (ADR-0008)
+2. **Pi-hole-specific metrics via an exporter** — the requirement was stated
+   (2026-09-07) and the options researched; none of the community exporters is
+   shippable and the decision is to defer, taking host metrics via the
+   subordinate's `node-exporter` meanwhile. The record and the re-open trigger
+   (someone restating the need) live in ADR-0008 §2.2. (ADR-0008)
 3. **`tls-certificates` for the admin UI** — `tls_certificates_interface.v4` is the
    recommended library and FTL reads `webserver.tls.cert`. **No longer blocked:**
    the snap's launcher self-signs `tls.pem` on first boot and serves 443
@@ -167,7 +169,7 @@ Items explicitly scoped out. Add when there is demand.
 - **Timeout tuning options** (`install-timeout`, `readiness-timeout`). A permanent
   public API for a transient problem. Constants in `pihole.py` instead. (ADR-0006)
 
-## Upstream issues — both filed and fixed
+## Upstream issues — filed and fixed
 
 - **Webserver dead on a stock install** — filed as issue #13, fixed by PR #15
   (merged 2026-08-25): the launcher self-signs `tls.pem`, with an OpenSSL
@@ -175,10 +177,15 @@ Items explicitly scoped out. Add when there is demand.
 - **Unauthenticated, network-reachable config API** — filed as issue #14, fixed by
   PR #16 (merged 2026-09-04): the launcher generates an admin password on first
   boot when the webserver binds non-loopback. (snap-constraints §5.2)
+- **No content slot for logs** — filed 2026-09-07, merged as
+  [PR #18](https://github.com/rajannpatel/snap-pi-hole/pull/18), published in
+  the pinned revisions (1417/1415): a read-only `logs` content slot exposing
+  `$SNAP_COMMON/var/log/pihole`. The PR is the record of the request.
 
-Both are byte-identical in the pinned revision 1400, which is what allowed the
-charm's corresponding defences to be deleted (ADR-0010 guarantees the revision).
-The two draft files in the repository root can go.
+Each is byte-identical across the pinned revisions where that applies
+(re-verified 2026-09-18 against 1417/1415 — unchanged), which is what allowed
+the charm's corresponding defences to be deleted (ADR-0010 guarantees the
+revision).
 
 ## Housekeeping
 
@@ -201,10 +208,11 @@ The two draft files in the repository root can go.
 - **CI on 3.14 only** from Stage 0 — the sole interpreter in the 26.04 archive.
   Testing 3.12 would exercise a configuration that never exists in production and
   would silently forbid 3.13+ syntax. (ADR-0002 §2.2.4)
-- **Watch `opentelemetry-collector` for a 26.04 revision.** It is a Stage 5
-  precondition, not a base blocker.
-  [PR #369](https://github.com/canonical/opentelemetry-collector-operator/pull/369)
-  is open and unmerged. Scripted check in ADR-0002 §2.2.3. (ADR-0008)
+- **Watch the `opentelemetry-collector` channel pointer.** The 26.04 builds
+  exist in track `0.130` but the channel's amd64 recommendation serves the 22.04
+  build, so deploys pin the revision by hand. When the pointer serves 26.04, the
+  pin in `test_stage5.py` can go. (ADR-0002's header `Amended:` lines,
+  ADR-0008 §3)
 - **`docs/implementation/`** — one document per module as it lands, following the
   house format: header metadata (module, ADR link), Purpose, Design, Edge Cases
   table, Testing Strategy. Documents code that exists, not code we intend to write.
@@ -214,9 +222,16 @@ The two draft files in the repository root can go.
   which **diverges from the workload's own default**, and (if ADR-0004 approach A
   is chosen) `snap get` is not a reliable source of truth for a third of the FTL
   keys.
-- **Integration assertion that the log paths exist.** They are hardcoded against
-  `$SNAP_COMMON`; a snap layout change would break log collection silently.
-  (ADR-0008)
+- **Loki alert rules, and logs observed in a deployed Loki.** The machine-side
+  chain is verified (databag, slot connection, receiver with our topology, files
+  readable in the subordinate's namespace); what remains needs a real Loki
+  backend, and no machine Loki charm exists — COS's Loki runs on Kubernetes,
+  reached via cross-model offers. The rules must key on
+  `juju_application`/`juju_unit` (never `filename` — it is the subordinate's
+  mount path and embeds its snap revision; never `juju_charm` — the subordinate
+  mislabels it, an upstream bug). **Trigger:** someone deploys COS with Loki
+  against this charm and wants the pipeline proven — author the rules against
+  the observed labels and watch them fire. (ADR-0008 §2.1)
 - **Re-check the `dns.dnssec` workaround whenever the snap bumps FTL.** It is a
   hard-coded exception for a specific FTL version. (ADR-0004)
 - **Security review of the removal path.** The charm's `remove` handler is the only

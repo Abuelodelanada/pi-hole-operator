@@ -45,6 +45,10 @@ ftl_api.py        ← the workload: FTL's HTTP API client
 resolved.py       ← the environment: systemd-resolved and port 53
 ```
 
+The charm provides one optional relation, cos-agent (ADR-0008): relate it to
+opentelemetry-collector and the subordinate takes the snap's logs — through
+its read-only `logs` content slot — and host metrics.
+
 **[`charm.py`](../src/charm.py)** — Observes events and nothing more. Every
 deferrable event routes to one `_reconcile`; only events that **cannot be
 deferred** get a handler of their own (`collect_unit_status`, `remove`, and the

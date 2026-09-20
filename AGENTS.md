@@ -7,8 +7,9 @@ This is not a Kubernetes charm. There is no Pebble, no `lightkube`, no OCI image
 
 ## Where we are
 
-**Stages 1 and 2 are closed** — Stage 2's acceptance is green on LXD and its
-`charm-reviewer` audit is clean (2026-09-07). The charm installs the snap **pinned to `SNAP_REVISIONS` and held against
+**Stages 1, 2 and 5 are closed** — each with acceptance green on LXD and a
+clean `charm-reviewer` pass (Stage 5's: 2026-09-19, fourth pass). The charm
+installs the snap **pinned to `SNAP_REVISIONS` and held against
 auto-refresh** (ADR-0010 — the snap never updates itself), frees port 53, starts
 FTL, closes the snap's default NTP server on 123/udp, owns the admin password,
 applies declarative config through `PATCH /api/config` with a read-back against
@@ -19,8 +20,8 @@ missing feature as a defect rather than as unstarted work.
 The public interface today: two actions (`get-admin-password`,
 `rotate-admin-password`), **five config options** (`upstream-dns`,
 `dns-listening-mode`, `blocking-enabled`, `dnssec-enabled`,
-`ntp-server-enabled`). **Zero relations, and no bindings** — `extra-bindings:
-dns` was withdrawn until something consumes it (BACKLOG). Each option
+`ntp-server-enabled`). **One optional relation** (`cos-agent`, ADR-0008) and **no bindings** —
+`extra-bindings: dns` was withdrawn until something consumes it (BACKLOG). Each option
 is justified in [ADR-0006](docs/adr/0006-configuration-surface.md) §2.1 against
 rule 4's three alternatives; the sixth and seventh (`snap-channel`,
 `snap-revision`) were **removed** because the revision is charm policy, not
@@ -139,7 +140,8 @@ Present today:
 
 ```
 charmcraft.yaml           # base: ubuntu@26.04, platforms: {amd64:, arm64:}
-pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, tenacity
+pyproject.toml            # ops, charmlibs-snap, charmlibs-systemd, tenacity,
+                          # pydantic, cosl (PYDEPS of the vendored cos_agent lib)
 uv.lock
 tox.ini
 docs/
@@ -172,10 +174,12 @@ anything that touches the machine — it reaches the workload only through the
 does. So it is `import pihole` and `import charm`, never `from src.pihole import
 ...` — the latter works nowhere, in the charm or in the tests.
 
-Arriving with later stages, so do not expect them on disk yet:
-`lib/charms/grafana_agent/` (vendored, never edited, never linted) and
-`src/grafana_dashboards/`, `src/prometheus_alert_rules/`, `src/loki_alert_rules/`
-(COSAgentProvider defaults).
+Present since Stage 5: `lib/charms/grafana_agent/` (vendored via
+`charmcraft fetch-libs`, never edited, never linted). The `COSAgentProvider`
+default rule directories (`src/grafana_dashboards/`,
+`src/prometheus_alert_rules/`, `src/loki_alert_rules/`) are empty by decision —
+rules are deferred (ADR-0008 §2.1) and metrics with them (§2.2), so they do not
+exist on disk until that changes.
 
 ## Python conventions
 

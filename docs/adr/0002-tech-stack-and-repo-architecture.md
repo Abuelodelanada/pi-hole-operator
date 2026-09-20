@@ -3,6 +3,21 @@
 **Status:** Accepted
 **Date:** 2026-08-07
 **Accepted:** 2026-08-08
+**Amended:** 2026-09-07 — §2.2.3's residual risk has cleared: `opentelemetry-collector`
+now publishes `ubuntu@26.04` (track `0.130`, every risk level including stable, amd64
+and arm64; verified with §2.2.3's own query, and `0.130/stable` is the store's
+default release, so a bare `juju deploy` resolves to it). The Stage 5 integration
+test is no longer blocked on a third party. The older track `2` still publishes no
+26.04 revision.
+**Amended:** 2026-09-08 — the line above over-claimed. The 26.04 revisions exist
+in track `0.130`, but the channel's recommended pointer for amd64 serves revision
+449 (`ubuntu@22.04`), so a bare `juju deploy` resolves to the wrong base and fails
+subordinate compatibility — `juju info` shows the per-arch recommended revision,
+not the channel's contents. The working invocation pins the revision:
+`--channel=0.130/stable --revision=491` (amd64; 486 is arm64 — per-architecture
+revisions again). Verified live on LXD: with the pin the subordinate deploys on a
+26.04 machine, integrates, and the principal's `config` databag is published.
+"Cleared" holds only with the pin until the channel pointer moves.
 **Related:** [ADR-0001: Charm Scope and Specification](0001-charm-scope-and-specification.md), [ADR-0003: Reconciler and Functional Core](0003-reconciler-and-functional-core.md), [ADR-0009: Split the FTL API client out of `Pihole`](0009-ftl-api-client-module.md)
 
 ---
@@ -67,7 +82,7 @@ The asymmetry decides it:
 | Choice | Cost |
 |---|---|
 | **24.04 now, migrate later** | Rewrite `charmcraft.yaml` and `pyproject.toml`, re-lock, re-run everything on a new interpreter, and **discover any 3.14 incompatibility after the code is written**. Publish a new track, freeze the old one. Churn paid *after* the code exists. |
-| **26.04 now** | Stage 5's integration test waits for the otelcol revision. Integration tests must run in LXD **VMs** rather than containers (§2.2.2). |
+| **26.04 now** | Stage 5's integration test waited for the otelcol revision (state on 2026-08-07; resolved — see the header `Amended:` lines). Integration tests must run in LXD **VMs** rather than containers (§2.2.2). |
 
 Writing the code against the interpreter it will actually run on, from the first
 commit, is worth more than either residual cost.
@@ -139,9 +154,9 @@ that forward rather than creating it.
 This is snapd/26.04 ecosystem lag, not a defect in our charm or in the Pi-hole
 snap. Worth reporting upstream; tracked in [BACKLOG.md](../BACKLOG.md).
 
-#### 2.2.3 Residual risk 2 — `opentelemetry-collector` has no 26.04 revision yet
+#### 2.2.3 Residual risk 2 — `opentelemetry-collector` has no 26.04 revision yet (resolved 2026-09-08)
 
-State on 2026-08-07:
+(State on 2026-08-07 — resolved; see the header `Amended:` lines for how.)
 
 - [`canonical/opentelemetry-collector-operator#369`](https://github.com/canonical/opentelemetry-collector-operator/pull/369)
   *"feat: add ubuntu@26.04 bases"* — **open, unmerged**, `mergeable_state:
@@ -149,9 +164,10 @@ State on 2026-08-07:
 - Charmhub publishes 22.04 and 24.04 only, across **every** channel including
   `dev/edge`.
 
-So it is in flight but not landed. Since Juju enforces base compatibility between
-a principal and its subordinates, until a 26.04 revision is published the
-`cos-agent` integration cannot be exercised without `--force-base`.
+So it was in flight but not landed. Since Juju enforces base compatibility
+between a principal and its subordinates, until a 26.04 revision is published
+the `cos-agent` integration cannot be exercised without `--force-base` — the
+resolution is recorded in the header `Amended:` lines.
 
 **This is a Stage 5 precondition, not a base blocker.** Re-check with:
 
@@ -332,9 +348,10 @@ patches `subprocess` or `charmlibs`, or a test of `compute()` that needs
   them slower and heavier. Every test fixture needs
   `constraints="virt-type=virtual-machine"`, and a contributor who forgets it gets
   an opaque snapd mount failure rather than a clear message.
-- **Stage 5 cannot be integration-tested until `opentelemetry-collector` publishes
-  a 26.04 revision** (§2.2.3). The PR is open but unmerged with failing CI, so the
-  timing is outside our control. Stages 0–4 are unaffected.
+- **Stage 5 could not be integration-tested until `opentelemetry-collector`
+  published a 26.04 revision** (§2.2.3; state on 2026-08-07 — resolved, see the
+  header `Amended:` lines). At the time the PR was open but unmerged with
+  failing CI, so the timing was outside our control. Stages 0–4 were unaffected.
 - Being on the newest LTS means we hit ecosystem lag first, and the snapd
   container bug is proof that we will keep finding it. That is the cost of not
   being one release behind.

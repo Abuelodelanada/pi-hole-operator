@@ -16,6 +16,9 @@ dependencies = [
     "charmlibs-systemd>=1,<2",
     "tenacity",
     "pydantic",
+    # PYDEPS of the vendored grafana_agent.cos_agent library (ADR-0008 §2.4).
+    # The uv plugin does not install transitive deps of charm-libs.
+    "cosl>=0.0.50",
 ]
 
 [dependency-groups]
@@ -87,7 +90,17 @@ log_cli_level = "INFO"
 pythonpath = ["."]
 # ops runs its own unit tests this way: a deprecation warning should fail the
 # build while it is still a warning, not after it becomes a breakage.
-filterwarnings = ["error"]
+# The vendored cos_agent library uses pydantic v1-style APIs that trigger
+# PydanticDeprecatedSince20; we cannot fix vendored code.
+filterwarnings = [
+    "error",
+    # Module-scoped: the vendored cos_agent library calls pydantic v1-style
+    # APIs (.json(), parse_obj) that we cannot fix. If this ever stops
+    # silencing the warning, pydantic changed its stacklevel attribution —
+    # widen the comment, do not widen the filter to the whole repo, which
+    # would also silence v1-style usage in our own modules.
+    "ignore::pydantic.warnings.PydanticDeprecatedSince20:charms.grafana_agent.*",
+]
 
 [tool.coverage.run]
 branch = true

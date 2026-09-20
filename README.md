@@ -6,13 +6,15 @@ v6 on Ubuntu machines — LXD, MAAS, or a public cloud — using the
 
 Not a Kubernetes charm: no Pebble, no OCI image.
 
-> **Status: Stage 2.** The charm installs the snap **pinned to a revision the
+> **Status: Stage 5 (COS) closed.** The charm installs the snap **pinned to a revision the
 > charm's release defines and held against auto-refresh** — the snap never
 > updates itself; updating it is a charm release (see
 > [ADR-0010](docs/adr/0010-snap-revision-is-charm-policy.md)). It frees port 53,
 > starts FTL, owns the admin password, closes the NTP server the snap opens by
 > default, applies declarative config verified against `pihole.toml`, and
-> restores the host resolver on removal. It has no relations yet. See
+> restores the host resolver on removal. It provides one optional relation,
+> `cos-agent`, through which the `opentelemetry-collector` subordinate takes
+> the snap's logs (via its read-only `logs` content slot) and host metrics. See
 > [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Deploy

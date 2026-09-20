@@ -21,6 +21,9 @@ import secrets
 from typing import assert_never
 
 import ops
+from charms.grafana_agent.v0.cos_agent import (  # pyright: ignore[reportMissingTypeStubs]
+    COSAgentProvider,
+)
 
 import pihole
 import pihole_config
@@ -50,6 +53,13 @@ class PiholeCharm(ops.CharmBase):
         # Push-status channel: lives for one hook, not cross-hook
         # state. See ADR-0005 section 2.4.
         self._reconcile_failure: ops.StatusBase | None = None
+
+        self._cos_agent = COSAgentProvider(
+            self,
+            relation_name="cos-agent",
+            log_slots=[f"{pihole_state.SNAP_NAME}:logs"],
+            refresh_events=[self.on.config_changed, self.on.upgrade_charm],
+        )
 
         # Every deferrable event converges the same way, so they all
         # land in the same handler. See ADR-0003 section 2.1.

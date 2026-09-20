@@ -250,7 +250,7 @@ Verified with `ss -tulpn`:
 |---|---|---|
 | 53 tcp+udp | DNS | `ftl.dns.port` |
 | 80 tcp | admin UI + API | default `webserver.port = "80o,443os,[::]:80o,[::]:443os"`; the `o` suffix means *optional* — it does not fail if taken |
-| 443 tcp | HTTPS | self-signed: the launcher generates `tls.pem` on first boot (PR #15, in revision 1400); `webserver.tls.cert` overrides |
+| 443 tcp | HTTPS | self-signed: the launcher generates `tls.pem` on first boot (PR #15; verified in the 1400/1398 pins, re-verified unchanged in 1417/1415 on 2026-09-18); `webserver.tls.cert` overrides |
 | **123 udp** | **NTP server — active by default** | `ntp.ipv4.active` / `ntp.ipv6.active` default `true`. Unexpected attack surface. Both keys are reachable, so the charm should either open it deliberately or set them `false`. |
 | 67 / 547 udp | DHCP / DHCPv6 | only when `dhcp.active=true` |
 | 4711 | **not used** | that was FTL v5's telnet API. v6 serves the API over HTTP on `webserver.port`. |

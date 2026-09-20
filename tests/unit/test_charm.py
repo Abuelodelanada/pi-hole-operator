@@ -11,6 +11,7 @@ between charm logic and workload logic would already have broken.
 """
 
 import dataclasses
+import json
 from unittest.mock import MagicMock
 
 import ops
@@ -801,3 +802,63 @@ def test_an_invalid_config_value_blocks_without_converging(
     # AND the reconcile never ran: no effect reached the workload
     absent_snap.install.assert_not_called()
     absent_snap.hold_refresh.assert_not_called()
+
+
+# -- cos-agent relation tests. ----------------------------------------
+
+
+# Each trigger guards a different wiring decision, which is why all
+# three stay in one parametrised test rather than three near-identical
+# ones:
+#
+# - relation_joined: the library's own observer. Reds if ``log_slots``
+#   is dropped from the provider call.
+# - upgrade_charm: OUR refresh_events entry, and the load-bearing one —
+#   the library's default is ``[config_changed]`` only, so without the
+#   explicit entry an upgrade that changes what we publish leaves the
+#   subordinate reading the pre-upgrade databag. Reds if it is removed.
+# - config_changed: rides the library default when refresh_events is
+#   absent, so it only reds if refresh_events is *narrowed* to exclude
+#   it — the guard against someone trimming the list.
+_COS_AGENT_TRIGGERS = ("relation_joined", "upgrade_charm", "config_changed")
+
+
+@pytest.mark.parametrize("trigger", _COS_AGENT_TRIGGERS)
+def test_cos_agent_databag_publication(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+    trigger: str,
+):
+    """Every trigger that refreshes the cos-agent databag publishes it.
+
+    The databag is the subordinate's only input: it connects its
+    ``logs`` plug to the slot we advertise and tails the files through
+    the content-interface mount. Whatever the trigger, the publication
+    must be complete.
+    """
+    # GIVEN a unit related via cos-agent
+    relation = testing.Relation("cos-agent")
+    state_in = dataclasses.replace(base_state, relations={relation})
+
+    # WHEN a trigger fires — relation_joined carries the relation, the
+    # refresh events do not
+    if trigger == "relation_joined":
+        event = ctx.on.relation_joined(relation)
+    else:
+        event = getattr(ctx.on, trigger)()
+    state_out = ctx.run(event, state_in)
+
+    # THEN the databag carries every field the library publishes, and
+    # log_slots names the snap's read-only logs content slot
+    # (ADR-0008 section 1.2). Rules are still empty (deferred, section
+    # 2.1), as are dashboards and metrics (section 2.2).
+    unit_data = state_out.get_relation(relation.id).local_unit_data
+    assert "config" in unit_data
+    config = json.loads(unit_data["config"])
+    assert "log_alert_rules" in config
+    assert "dashboards" in config
+    assert "metrics_alert_rules" in config
+    assert "metrics_scrape_jobs" in config
+    assert config["log_slots"] == ["pihole-by-rajannpatel:logs"]

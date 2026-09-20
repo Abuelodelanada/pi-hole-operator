@@ -7,6 +7,14 @@ architecture**: the store numbers every build of the same source separately, so
 one number cannot serve both platforms this charm declares. Corrected to a map,
 and the bump ritual made per-architecture. Found by review before any arm64
 deployment existed.
+**Amended:** 2026-09-18 — first bump executed: 1400/1398 → **1417/1415**. The
+new revisions carry one change, upstream PR #18's read-only `logs` content slot,
+which log forwarding now depends on. Ritual run and verified: version strings
+identical across architectures (`v6.4.3+git.f47b8ed`), the slot present in both
+packed revisions' `meta/snap.yaml`, `bin/` byte-identical across architectures
+and unchanged from the previous pin. Gated live on LXD: the revision test
+(equality against the map) and the hold test green. The store output pasted in
+§4 below is the 2026-09-07 record and produced the *previous* pins.
 **Amended:** 2026-09-07 — §4's ritual rewritten. The per-architecture query added
 above did not work: `Snap-Device-Architecture` does not narrow `channel-map`, so
 the loop returned every architecture on every pass. One query filtering on
@@ -121,8 +129,8 @@ dead options proved it.
           print(c['architecture'], e['revision'], e['version'])"
   ```
 
-  Run verbatim 2026-09-07, which is where `SNAP_REVISIONS` in
-  `src/pihole_state.py` comes from:
+  Run verbatim 2026-09-07 — this output produced the pre-2026-09-18 pins
+  (1400/1398); the current pins came from the same query run on the bump date:
 
   ```
   amd64 1400 v6.4.3+git.f47b8ed
@@ -143,8 +151,12 @@ dead options proved it.
      *lower* number for arm64. If they diverge, the builds are not the same source
      and pinning them together needs a reason written down.
   2. **Confirm the fixes the charm depends on are in both.** The charm deleted its
-     webserver-port workaround because upstream PR #15 is present, and its
-     password handling assumes PR #16; verify both are still there by extracting
+     webserver-port workaround because upstream PR #15 is present; its password
+     handling assumes PR #16; and log forwarding assumes PR #18's `logs` content
+     slot — check `meta/snap.yaml` in each extraction for `slots.logs` with
+     `interface: content` and a read-only source, because its failure mode is
+     silent: a missing slot makes the subordinate's `snap connect` fail while
+     the unit stays Active. Verify all three by extracting
      each revision **into its own directory** and diffing. `unsquashfs` refuses a
      `-d` target that already exists, and a bare `*.snap` feeds the second file in
      as an extract path, so name both:

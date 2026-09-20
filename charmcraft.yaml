@@ -10,7 +10,10 @@ description: |
   behind it is filtered without installing anything on the device itself.
 
   This charm deploys and operates Pi-hole v6 on Ubuntu machines — LXD, MAAS, or
-  a public cloud — using the `pihole-by-rajannpatel` snap.
+  a public cloud — using the `pihole-by-rajannpatel` snap. It provides one
+  optional relation, `cos-agent`: relate it to `opentelemetry-collector` and
+  the subordinate takes the snap's logs (through its read-only `logs` content
+  slot) and host metrics, forwarding them to your observability backends.
 
   What the charm does for you:
 
@@ -52,6 +55,23 @@ platforms:
 # to assume.
 assumes:
   - juju >= 3.6.17
+
+# The one relation: optional, so the charm reaches ActiveStatus with zero
+# relations (rule 5). `limit: 1` is decided at birth because Juju enforces
+# it and adding it later breaks `juju refresh` for existing deployments
+# (ADR-0008 §2.3).
+provides:
+  cos-agent:
+    interface: cos_agent
+    limit: 1
+    optional: true
+
+# The one Charmhub-hosted library this repo consumes: the cos_agent
+# provider, vendored via `charmcraft fetch-libs` into lib/charms/...,
+# never edited, never linted. No PyPI replacement exists (ADR-0008 §2.4).
+charm-libs:
+  - lib: grafana_agent.cos_agent
+    version: "0"
 
 # `additionalProperties` is set explicitly on every action: the default
 # differs between Juju 3 (true) and Juju 4 (false), so omitting it means
