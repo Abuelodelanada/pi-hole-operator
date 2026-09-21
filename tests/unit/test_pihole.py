@@ -12,12 +12,13 @@ patched, which is what makes "a workload that lies" expressible at all.
 
 import inspect
 import pathlib
+import subprocess
 import urllib.error
 from collections.abc import Callable, Sequence
 
 import pytest
 import tenacity
-from charmlibs import snap
+from charmlibs import snap, systemd
 
 import pihole
 import resolved
@@ -27,6 +28,9 @@ from pihole_state import (
     PasswordAccepted,
     PasswordUnset,
     ServiceStatus,
+    SnapCheckConfigError,
+    SnapCheckOk,
+    SnapCheckRuntimeError,
 )
 from tests.unit.conftest import (
     AUTH_OK,
@@ -149,7 +153,7 @@ def test_snap_check_returns_its_exit_code_verbatim(
     fake_snap: FakeSnap,
     snap_data: pathlib.Path,
 ):
-    # GIVEN a diagnostic that reports a runtime error
+    # GIVEN a diagnostic that reports a runtime error with output
     runner = FakeRunner(returncode=2)
     workload = pihole.Pihole(
         cache_factory=FakeCache(fake_snap),
@@ -158,12 +162,13 @@ def test_snap_check_returns_its_exit_code_verbatim(
     )
 
     # WHEN it is run
-    code = workload.snap_check()
+    result = workload.snap_check()
 
-    # THEN the semantic exit code survives, and the diagnostic is asked
-    # for by its fully qualified name — the `pihole` alias never
-    # registers, so a bare `pihole` would not be on PATH
-    assert code == 2
+    # THEN the semantic exit code and output survive, and the
+    # diagnostic is asked for by its fully qualified name — the
+    # `pihole` alias never registers
+    assert isinstance(result, SnapCheckRuntimeError)
+    assert result.output == ""
     assert runner.calls == [[pihole.PIHOLE_CMD, "snap-check"]]
 
 
@@ -1355,3 +1360,1015 @@ def test_an_unpinned_architecture_refuses_to_install(
 
     # AND snapd was never asked for anything
     assert fake_snap.ensure_calls == []
+
+
+# -- Stage 3: connected_plugs and connect_plugs. -----------------------
+
+
+def test_connected_plugs_parses_snap_connections_output(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN snap connections output showing three connected plugs AND
+    # one disconnected row (Slot column is "-") — the disconnected
+    # row must be excluded, because the old parser that counted
+    # columns instead of reading the Slot column counted every
+    # disconnected plug as connected
+    output = (
+        "Interface        Plug                            Slot              Notes\n"
+        "network-control  pihole-by-rajannpatel:network-control  :network-control  manual\n"
+        "system-observe   pihole-by-rajannpatel:system-observe   :system-observe   manual\n"
+        "time-control     pihole-by-rajannpatel:time-control     -                 -\n"
+        "hardware-observe pihole-by-rajannpatel:hardware-observe :hardware-observe manual\n"
+    )
+
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+    )
+
+    # WHEN the connected plugs are read
+    plugs = workload.connected_plugs()
+
+    # THEN the three connected plugs are returned; the disconnected
+    # time-control row is excluded
+    assert plugs == frozenset({"network-control", "system-observe", "hardware-observe"})
+
+
+def test_connect_plugs_connects_and_reads_back(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a machine where time-control is not connected
+    connected_output = (
+        "Interface        Plug                            Slot              Notes\n"
+        "system-observe   pihole-by-rajannpatel:system-observe   :system-observe   manual\n"
+    )
+    after_output = (
+        "Interface        Plug                            Slot              Notes\n"
+        "system-observe   pihole-by-rajannpatel:system-observe   :system-observe   manual\n"
+        "time-control     pihole-by-rajannpatel:time-control     :time-control     manual\n"
+    )
+    calls: list[list[str]] = []
+    call_count = 0
+
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal call_count
+        call_count += 1
+        calls.append(list(args))
+        if args[0] == "snap" and args[1] == "connections":
+            if call_count == 1:
+                return subprocess.CompletedProcess(
+                    args=list(args), returncode=0, stdout=connected_output, stderr=""
+                )
+            return subprocess.CompletedProcess(
+                args=list(args), returncode=0, stdout=after_output, stderr=""
+            )
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+    )
+
+    # WHEN time-control is connected
+    workload.connect_plugs(["time-control"])
+
+    # THEN snap connect was called
+    assert ["snap", "connect", "pihole-by-rajannpatel:time-control"] in calls
+
+
+def test_connect_plugs_skips_already_connected(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a machine where all plugs are already connected
+    output = (
+        "Interface        Plug                            Slot              Notes\n"
+        "time-control     pihole-by-rajannpatel:time-control     :time-control     manual\n"
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[0] == "snap" and args[1] == "connections":
+            return subprocess.CompletedProcess(
+                args=list(args), returncode=0, stdout=output, stderr=""
+            )
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+    )
+
+    # WHEN time-control is connected (already connected)
+    workload.connect_plugs(["time-control"])
+
+    # THEN no snap connect was called — it was already connected
+    snap_connect_calls = [c for c in calls if c[0] == "snap" and c[1] == "connect"]
+    assert snap_connect_calls == []
+
+
+# -- Stage 3: gravity timer. -------------------------------------------
+
+
+def test_gravity_schedule_reads_our_drop_in(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+):
+    # GIVEN our drop-in on disk with a known OnCalendar — the fact is
+    # what WE wrote, never the snap's randomized default, or an
+    # unmanaged intent would plan a removal on every reconcile
+    drop_in = tmp_path / "override.conf"
+    drop_in.parent.mkdir(parents=True, exist_ok=True)
+    drop_in.write_text("[Timer]\nOnCalendar=\nOnCalendar=Sun *-*-* 04:00\n")
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN the schedule is read
+    schedule = workload.gravity_schedule()
+
+    # THEN the drop-in's OnCalendar is returned
+    assert schedule == "Sun *-*-* 04:00"
+
+    # AND with no drop-in at all, the fact is None — unmanaged
+    workload_absent = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=tmp_path / "absent.conf",
+    )
+    assert workload_absent.gravity_schedule() is None
+
+
+def test_gravity_schedule_malformed_drop_in_yields_none(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+):
+    # GIVEN a drop-in that exists but carries no OnCalendar line
+    drop_in = tmp_path / "override.conf"
+    drop_in.parent.mkdir(parents=True, exist_ok=True)
+    drop_in.write_text("[Timer]\nSomeOtherKey=1\n")
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN the schedule is read
+    # THEN the fact is None — nothing we recognise as a schedule
+    assert workload.gravity_schedule() is None
+
+
+def test_gravity_schedule_validation_and_drop_in_paths_error_paths(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The validation and DropInPaths read-back failure modes.
+
+    ``write_gravity_timer`` validates the expression with
+    ``systemd-analyze calendar`` before writing, then reads back
+    ``systemctl show -p DropInPaths --value`` after daemon-reload.
+    Both must surface as PiholeError, not as silent success.
+    """
+    drop_in = tmp_path / "override.conf"
+
+    def make_workload(fake_run: object) -> pihole.Pihole:
+        monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+        monkeypatch.setattr(pihole.systemd, "daemon_reload", lambda: None)
+        return pihole.Pihole(
+            cache_factory=FakeCache(fake_snap),
+            snap_data=snap_data,
+            gravity_timer_drop_in=drop_in,
+        )
+
+    def run_ok(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    # GIVEN systemd-analyze rejects the expression as invalid
+    def run_invalid_calendar(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "systemd-analyze":
+            return subprocess.CompletedProcess(
+                args=list(args),
+                returncode=1,
+                stdout="",
+                stderr="Failed to parse calendar specification: not a valid\n",
+            )
+        return run_ok(args)
+
+    workload = make_workload(run_invalid_calendar)
+    with pytest.raises(pihole.PiholeError, match="not a valid systemd OnCalendar"):
+        workload.write_gravity_timer("not-a-valid-schedule")
+
+    # AND nothing was written — validation precedes any filesystem
+    # change, so an invalid expression cannot leave a broken override
+    assert not drop_in.exists()
+
+    # GIVEN systemd-analyze cannot run at all
+    def run_analyze_oserror(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "systemd-analyze":
+            raise OSError(2, "No such file or directory", "systemd-analyze")
+        return run_ok(args)
+
+    workload = make_workload(run_analyze_oserror)
+    with pytest.raises(pihole.PiholeError, match="could not be run"):
+        workload.write_gravity_timer("Sun *-*-* 04:00")
+
+    # GIVEN systemctl show DropInPaths cannot run at all
+    def run_show_oserror(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "systemctl" and args[1] == "show":
+            raise OSError(2, "No such file or directory", "systemctl")
+        return run_ok(args)
+
+    workload = make_workload(run_show_oserror)
+    with pytest.raises(pihole.PiholeError, match="could not be run"):
+        workload.write_gravity_timer("Sun *-*-* 04:00")
+
+    # GIVEN systemctl show answers non-zero
+    def run_show_nonzero(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "systemctl" and args[1] == "show":
+            return subprocess.CompletedProcess(
+                args=list(args), returncode=1, stdout="", stderr="unit not found"
+            )
+        return run_ok(args)
+
+    workload = make_workload(run_show_nonzero)
+    with pytest.raises(pihole.PiholeError, match="could not be read"):
+        workload.write_gravity_timer("Sun *-*-* 04:00")
+
+    # GIVEN systemctl show returns empty — the timer has no DropInPaths
+    def run_show_empty(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "systemctl" and args[1] == "show":
+            return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+        return run_ok(args)
+
+    workload = make_workload(run_show_empty)
+    with pytest.raises(pihole.PiholeError, match="could not be read"):
+        workload.write_gravity_timer("Sun *-*-* 04:00")
+
+
+def test_write_gravity_timer_writes_drop_in_and_reads_back(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a writable drop-in directory and a systemctl that reports
+    # our drop-in is loaded in DropInPaths
+    drop_in_dir = tmp_path / "snap.pihole-by-rajannpatel.gravity-sync.timer.d"
+    drop_in = drop_in_dir / "override.conf"
+
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "systemctl" and args[1] == "show":
+            # Real output shape: the path(s) systemd has loaded.
+            # Our drop-in must appear in this output.
+            return subprocess.CompletedProcess(
+                args=list(args),
+                returncode=0,
+                stdout=f"{drop_in}\n",
+                stderr="",
+            )
+        if args[0] == "systemd-analyze":
+            # Validation passes: systemd-analyze calendar exits 0.
+            return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    monkeypatch.setattr(pihole.systemd, "daemon_reload", lambda: None)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN the timer is written
+    workload.write_gravity_timer("Sun *-*-* 03:00")
+
+    # THEN the drop-in exists with OnCalendar= cleared before being set
+    content = drop_in.read_text(encoding="utf-8")
+    assert "OnCalendar=\nOnCalendar=Sun *-*-* 03:00" in content
+
+
+def test_remove_gravity_timer_removes_drop_in(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN an existing drop-in
+    drop_in_dir = tmp_path / "snap.pihole-by-rajannpatel.gravity-sync.timer.d"
+    drop_in = drop_in_dir / "override.conf"
+    drop_in_dir.mkdir(parents=True)
+    drop_in.write_text("[Timer]\nOnCalendar=\nOnCalendar=Sun *-*-* 03:00\n", encoding="utf-8")
+
+    monkeypatch.setattr(pihole.systemd, "daemon_reload", lambda: None)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN the timer is removed
+    workload.remove_gravity_timer()
+
+    # THEN the drop-in is gone
+    assert not drop_in.exists()
+
+
+def test_update_gravity_runs_pihole_g(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a workload
+    runner = FakeRunner()
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=runner,
+        snap_data=snap_data,
+    )
+
+    # WHEN gravity is updated without force
+    workload.update_gravity(force=False)
+
+    # THEN pihole -g is called without --force
+    assert runner.calls == [[pihole.PIHOLE_CMD, "-g"]]
+
+
+def test_update_gravity_with_force_passes_flag(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a workload
+    runner = FakeRunner()
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=runner,
+        snap_data=snap_data,
+    )
+
+    # WHEN gravity is updated with force
+    workload.update_gravity(force=True)
+
+    # THEN pihole -g --force is called
+    assert runner.calls == [[pihole.PIHOLE_CMD, "-g", "--force"]]
+
+
+# -- Stage 3: connected_plugs error paths. -----------------------------
+
+
+def test_connected_plugs_oserror_returns_the_safe_default(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a machine where snap connections cannot be run at all
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "snap" and args[1] == "connections":
+            raise OSError(2, "No such file or directory", "snap")
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+    )
+
+    # WHEN connected_plugs is called
+    # THEN the empty set comes back — a fact is total by contract and
+    # never raises: the status handler calls it outside any try, and
+    # an action hook that raised would error the unit, the failure
+    # mode that costs the machine its DNS. The apply path surfaces
+    # the real error if snapd is truly broken.
+    assert workload.connected_plugs() == frozenset()
+
+
+def test_connected_plugs_nonzero_return_returns_empty(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN snap connections that exits non-zero
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "snap" and args[1] == "connections":
+            return subprocess.CompletedProcess(
+                args=list(args), returncode=1, stdout="", stderr="snapd is not running"
+            )
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+    )
+
+    # WHEN connected_plugs is called
+    plugs = workload.connected_plugs()
+
+    # THEN an empty frozenset is returned — safe direction, every plug
+    # looks disconnected and the idempotent connect will fix it
+    assert plugs == frozenset()
+
+
+def test_connected_plugs_skips_non_matching_lines(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN output with lines that have 4+ parts but a different snap
+    output = (
+        "Interface        Plug                            Slot              Notes\n"
+        "network-control  pihole-by-rajannpatel:network-control  :network-control  manual\n"
+        "system-observe   other-snap:system-observe             :system-observe   manual\n"
+        "time-control     pihole-by-rajannpatel:time-control     :time-control     manual\n"
+    )
+
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+    )
+
+    # WHEN the connected plugs are read
+    plugs = workload.connected_plugs()
+
+    # THEN only the plugs belonging to our snap are returned; the
+    # other-snap line is skipped
+    assert plugs == frozenset({"network-control", "time-control"})
+
+
+# -- Stage 3: connect_plugs error paths. -------------------------------
+
+
+def test_connect_plugs_called_process_error(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a machine where snap connect fails
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "snap" and args[1] == "connect":
+            raise subprocess.CalledProcessError(1, list(args), output="", stderr="denied")
+        if args[0] == "snap" and args[1] == "connections":
+            return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+    )
+
+    # WHEN connect_plugs is called
+    # THEN the failure is converted
+    with pytest.raises(pihole.PiholeError, match="snap connect failed"):
+        workload.connect_plugs(["time-control"])
+
+
+def test_connect_plugs_oserror(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a machine where snap connect raises OSError
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "snap" and args[1] == "connect":
+            raise OSError(2, "No such file or directory", "snap")
+        if args[0] == "snap" and args[1] == "connections":
+            return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+    )
+
+    # WHEN connect_plugs is called
+    # THEN the OSError is converted
+    with pytest.raises(pihole.PiholeError, match="snap connect failed"):
+        workload.connect_plugs(["time-control"])
+
+
+def test_connect_plugs_missing_after_connect(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a machine where snap connect succeeds but the plug still
+    # does not appear as connected afterwards
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "snap" and args[1] == "connections":
+            return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+    )
+
+    # WHEN connect_plugs is called
+    # THEN the read-back catches it
+    with pytest.raises(pihole.PiholeError, match="still disconnected"):
+        workload.connect_plugs(["time-control"])
+
+
+# -- Stage 3: gravity_schedule error paths. ----------------------------
+
+
+def test_gravity_schedule_oserror(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+):
+    # GIVEN a drop-in path that cannot be read as a file — a
+    # directory where the file should be raises IsADirectoryError,
+    # which is an OSError
+    drop_in = tmp_path / "override.conf"
+    drop_in.mkdir(parents=True)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN gravity_schedule is called
+    # THEN None comes back — total by contract, same reasoning as
+    # connected_plugs; a set intent rewrites the unreadable drop-in
+    assert workload.gravity_schedule() is None
+
+
+def test_write_gravity_timer_oserror_write(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a drop-in path whose parent directory cannot be created
+    # (parent is a file, not a directory)
+    parent_file = tmp_path / "not-a-dir"
+    parent_file.write_text("", encoding="utf-8")
+    drop_in = parent_file / "override.conf"
+
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        # systemd-analyze passes
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN the timer is written
+    # THEN the OSError is converted
+    with pytest.raises(pihole.PiholeError, match="the write failed"):
+        workload.write_gravity_timer("Sun *-*-* 03:00")
+
+
+def test_write_gravity_timer_readback_mismatch(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a drop-in that, after being written, does not match —
+    # simulated by making read_text return something else
+    drop_in_dir = tmp_path / "snap.pihole-by-rajannpatel.gravity-sync.timer.d"
+    drop_in = drop_in_dir / "override.conf"
+
+    original_read_text = drop_in.read_text
+
+    def lying_read_text(*args: object, **kwargs: object) -> str:
+        return "[Timer]\nOnCalendar=something-else\n"
+
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        # systemd-analyze passes
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    monkeypatch.setattr(pihole.systemd, "daemon_reload", lambda: None)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # Write it first so it exists, then monkey-patch read_text to lie
+    drop_in_dir.mkdir(parents=True)
+    drop_in.write_text("", encoding="utf-8")
+    monkeypatch.setattr(drop_in.__class__, "read_text", lying_read_text)
+
+    # WHEN the timer is written
+    # THEN the read-back mismatch is caught
+    with pytest.raises(pihole.PiholeError, match="does not match"):
+        workload.write_gravity_timer("Sun *-*-* 03:00")
+
+    # Restore so the tmp_path cleanup works
+    monkeypatch.setattr(drop_in.__class__, "read_text", original_read_text)
+
+
+def test_write_gravity_timer_daemon_reload_error(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a daemon-reload that fails
+    drop_in_dir = tmp_path / "snap.pihole-by-rajannpatel.gravity-sync.timer.d"
+    drop_in = drop_in_dir / "override.conf"
+
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        # systemd-analyze passes
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        pihole.systemd,
+        "daemon_reload",
+        lambda: (_ for _ in ()).throw(systemd.SystemdError("failed")),
+    )
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN the timer is written
+    # THEN the daemon-reload failure is converted
+    with pytest.raises(pihole.PiholeError, match="daemon-reload"):
+        workload.write_gravity_timer("Sun *-*-* 03:00")
+
+
+def test_write_gravity_timer_drop_in_paths_missing(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a machine where systemctl show reports DropInPaths that do
+    # not include our drop-in after daemon-reload
+    drop_in_dir = tmp_path / "snap.pihole-by-rajannpatel.gravity-sync.timer.d"
+    drop_in = drop_in_dir / "override.conf"
+
+    def fake_run(
+        args: Sequence[str],
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[0] == "systemctl" and args[1] == "show":
+            # DropInPaths has OTHER paths but not ours
+            return subprocess.CompletedProcess(
+                args=list(args),
+                returncode=0,
+                stdout="/etc/systemd/system/something-else.conf\n",
+                stderr="",
+            )
+        # systemd-analyze passes
+        return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pihole.subprocess, "run", fake_run)
+    monkeypatch.setattr(pihole.systemd, "daemon_reload", lambda: None)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN the timer is written
+    # THEN the DropInPaths mismatch is caught
+    with pytest.raises(pihole.PiholeError, match="DropInPaths"):
+        workload.write_gravity_timer("Sun *-*-* 03:00")
+
+
+# -- Stage 3: remove_gravity_timer error paths. ------------------------
+
+
+def test_remove_gravity_timer_no_drop_in_is_noop(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+):
+    # GIVEN a machine with no drop-in to remove
+    drop_in = tmp_path / "nonexistent" / "override.conf"
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN the timer is removed
+    # THEN it returns without error — idempotent
+    workload.remove_gravity_timer()
+
+
+def test_remove_gravity_timer_oserror_unlink(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a drop-in that exists but cannot be removed
+    drop_in_dir = tmp_path / "snap.pihole-by-rajannpatel.gravity-sync.timer.d"
+    drop_in = drop_in_dir / "override.conf"
+    drop_in_dir.mkdir(parents=True)
+    drop_in.write_text("[Timer]\nOnCalendar=Sun *-*-* 03:00\n", encoding="utf-8")
+
+    original_unlink = drop_in.unlink
+
+    def failing_unlink(*args: object, **kwargs: object) -> None:
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(drop_in.__class__, "unlink", failing_unlink)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN the timer is removed
+    # THEN the OSError is converted
+    with pytest.raises(pihole.PiholeError, match="deletion failed"):
+        workload.remove_gravity_timer()
+
+    monkeypatch.setattr(drop_in.__class__, "unlink", original_unlink)
+    # Clean up so tmp_path cleanup works
+    drop_in.unlink(missing_ok=True)
+
+
+def test_remove_gravity_timer_still_exists_after_unlink(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a drop-in that claims to unlink but stays on disk
+    drop_in_dir = tmp_path / "snap.pihole-by-rajannpatel.gravity-sync.timer.d"
+    drop_in = drop_in_dir / "override.conf"
+    drop_in_dir.mkdir(parents=True)
+    drop_in.write_text("[Timer]\nOnCalendar=Sun *-*-* 03:00\n", encoding="utf-8")
+
+    original_unlink = drop_in.unlink
+
+    def lying_unlink(*args: object, **kwargs: object) -> None:
+        # Don't actually remove — simulate snapd lying
+        pass
+
+    monkeypatch.setattr(drop_in.__class__, "unlink", lying_unlink)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN the timer is removed
+    # THEN the read-back catches it — the file is still there
+    with pytest.raises(pihole.PiholeError, match="still on disk"):
+        workload.remove_gravity_timer()
+
+    monkeypatch.setattr(drop_in.__class__, "unlink", original_unlink)
+    drop_in.unlink(missing_ok=True)
+
+
+def test_remove_gravity_timer_daemon_reload_error(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GIVEN a daemon-reload that fails after the drop-in is removed
+    drop_in_dir = tmp_path / "snap.pihole-by-rajannpatel.gravity-sync.timer.d"
+    drop_in = drop_in_dir / "override.conf"
+    drop_in_dir.mkdir(parents=True)
+    drop_in.write_text("[Timer]\nOnCalendar=Sun *-*-* 03:00\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        pihole.systemd,
+        "daemon_reload",
+        lambda: (_ for _ in ()).throw(systemd.SystemdError("failed")),
+    )
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        snap_data=snap_data,
+        gravity_timer_drop_in=drop_in,
+    )
+
+    # WHEN the timer is removed
+    # THEN the daemon-reload failure is converted
+    with pytest.raises(pihole.PiholeError, match="daemon-reload"):
+        workload.remove_gravity_timer()
+
+
+# -- Stage 3: update_gravity error paths. ------------------------------
+
+
+def test_update_gravity_pihole_error_on_oserror(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a machine where the pihole wrapper is not on disk
+    def missing_wrapper(
+        args: Sequence[str],
+        **_: object,
+    ) -> None:
+        raise FileNotFoundError(2, "No such file or directory", pihole.PIHOLE_CMD)
+
+    runner = FakeRunner(effect=missing_wrapper)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=runner,
+        snap_data=snap_data,
+    )
+
+    # WHEN gravity is updated
+    # THEN the OSError inside _run_pihole is converted
+    with pytest.raises(pihole.PiholeError, match="could not be run"):
+        workload.update_gravity()
+
+
+def test_update_gravity_called_process_error_converts(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a pihole -g that exits non-zero with check=True
+    runner = FakeRunner(returncode=1)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=runner,
+        snap_data=snap_data,
+    )
+
+    # WHEN gravity is updated
+    # THEN the failure is the workload's own type, carrying the exit
+    # code and the output tail — a raw CalledProcessError stringifies
+    # without its output, which is the part that says why it failed
+    with pytest.raises(pihole.PiholeError, match="exit 1") as exc_info:
+        workload.update_gravity()
+
+    # AND the output tail travels — the FakeRunner's stderr is what a
+    # real failure would quote
+    assert "Usage: pihole [options]" in str(exc_info.value)
+
+
+# -- Stage 3: snap-check exit codes. -------------------------------
+
+
+def test_snap_check_exit_0_returns_ok(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a snap-check that exits 0 (healthy)
+    runner = FakeRunner(returncode=0)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=runner,
+        snap_data=snap_data,
+    )
+    # WHEN the diagnostic is run
+    result = workload.snap_check()
+    # THEN the semantic outcome is SnapCheckOk
+    assert isinstance(result, SnapCheckOk)
+
+
+def test_snap_check_exit_1_returns_config_error(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a snap-check that exits 1 (config error)
+    runner = FakeRunner(returncode=1)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=runner,
+        snap_data=snap_data,
+    )
+    # WHEN the diagnostic is run
+    result = workload.snap_check()
+    # THEN the semantic outcome is SnapCheckConfigError with output
+    assert isinstance(result, SnapCheckConfigError)
+    assert result.output == ""
+
+
+# -- Stage 3: restart. ----------------------------------------------
+
+
+def test_restart_verifies_active_service(
+    workload: pihole.Pihole,
+    fake_snap: FakeSnap,
+):
+    # GIVEN an installed, running snap
+    # WHEN the daemon is restarted
+    workload.restart()
+    # THEN snapd was asked to restart the FTL service
+    assert fake_snap.restart_calls == [(["pihole-ftl"], False)]
+
+
+def test_restart_catches_inactive_service(
+    fake_runner: FakeRunner,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a snapd that accepts the restart and leaves the service
+    # inactive — the same lying shape as every other snapd claim
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(FakeSnap(active=False, honest=False)),
+        run=fake_runner,
+        snap_data=snap_data,
+    )
+    # WHEN the daemon is restarted
+    # THEN the read-back catches it
+    with pytest.raises(pihole.PiholeError, match="EADDRINUSE"):
+        workload.restart()
+
+
+def test_snap_check_unexpected_exit_code(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    # GIVEN a snap-check that exits with a code the charm does not
+    # recognise (3 — not 0, 1, or 2)
+    runner = FakeRunner(returncode=3)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=runner,
+        snap_data=snap_data,
+    )
+    # WHEN the diagnostic is run
+    # THEN it raises PiholeError rather than silently inventing a
+    # semantic code
+    with pytest.raises(pihole.PiholeError, match="unexpected exit code"):
+        workload.snap_check()

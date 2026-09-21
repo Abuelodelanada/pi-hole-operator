@@ -14,9 +14,11 @@ import pytest
 from pihole_state import (
     API_READY_TIMEOUT,
     SNAP_REVISIONS,
+    UNCONDITIONAL_PLUGS,
     AdminPasswordState,
     ApiFacts,
     AwaitApi,
+    ConnectPlugs,
     HoldSnapRefresh,
     InstallSnap,
     Noop,
@@ -27,6 +29,8 @@ from pihole_state import (
     PiholeIntent,
     PiholeOutcome,
     ReleasePort53,
+    RemoveGravityTimer,
+    RestartFtl,
     ServiceStatus,
     SetAdminPassword,
     SetFtlConfig,
@@ -34,9 +38,11 @@ from pihole_state import (
     SnapAbsent,
     SnapPresent,
     StartFtl,
+    WriteGravityTimer,
     compute,
     fetch,
     open_ports,
+    plugs_for,
     revision_for,
 )
 
@@ -61,6 +67,8 @@ def converged(**overrides: object) -> SnapPresent:
         listening_mode=None,
         blocking_enabled=True,
         dnssec_enabled=False,
+        connected_plugs=frozenset(UNCONDITIONAL_PLUGS),
+        gravity_schedule=None,
     )
     return dataclasses.replace(state, **overrides)
 
@@ -89,6 +97,10 @@ class FactsStub:
     mode: str | None = None
     blocking: bool | None = True
     dnssec: bool | None = False
+    plugs: frozenset[str] = dataclasses.field(
+        default_factory=lambda: frozenset(UNCONDITIONAL_PLUGS)
+    )
+    schedule: str | None = None
     reads: list[str] = dataclasses.field(default_factory=list[str])
     passwords_offered: list[str] = dataclasses.field(default_factory=list[str])
 
@@ -153,6 +165,16 @@ class FactsStub:
         self.reads.append("dnssec_enabled")
         return self.dnssec
 
+    def connected_plugs(self) -> frozenset[str]:
+        """Report the set of connected snap plugs."""
+        self.reads.append("connected_plugs")
+        return self.plugs
+
+    def gravity_schedule(self) -> str | None:
+        """Report our drop-in schedule, or None if absent."""
+        self.reads.append("gravity_schedule")
+        return self.schedule
+
 
 def test_absent_snap_yields_the_whole_ordered_install_sequence():
     # GIVEN a machine with nothing installed
@@ -167,6 +189,7 @@ def test_absent_snap_yields_the_whole_ordered_install_sequence():
         InstallSnap(),
         HoldSnapRefresh(),
         ReleasePort53(),
+        ConnectPlugs(plugs=UNCONDITIONAL_PLUGS),
         SetNtpServer(active=False),
         SetAdminPassword(PASSWORD),
         StartFtl(),
@@ -194,9 +217,6 @@ def test_the_bootstrap_order_is_the_correctness_condition():
     # the port and crash-loops on EADDRINUSE. Installing does not start
     # it, because the snap ships install-mode: disable.
     assert kinds.index(ReleasePort53) < kinds.index(StartFtl)
-
-    # AND the webserver port is corrected before the first start, or
-    # the webserver never binds and there is no HTTP API to gate on
 
     # AND the NTP server is closed before the first start, so 123/udp
     # is never served, not even briefly
@@ -381,8 +401,10 @@ def test_fetch_reads_every_fact_exactly_once():
     assert sorted(facts.reads) == [
         "api_facts",
         "blocking_enabled",
+        "connected_plugs",
         "dnssec_enabled",
         "ftl_status",
+        "gravity_schedule",
         "installed_revision",
         "listening_mode",
         "ntp_server_active",
@@ -702,3 +724,144 @@ def test_an_unpinned_architecture_plans_no_reinstall():
     # THEN no re-pin is planned against a revision that does not exist.
     # `install` is what refuses, with the architecture in the message.
     assert outcomes == (Noop(),)
+
+
+# -- plugs_for. --------------------------------------------------------
+
+
+def test_plugs_for_returns_the_unconditional_plugs_only():
+    # GIVEN nothing — plugs are unconditional today
+    # WHEN the required plugs are computed
+    plugs = plugs_for()
+
+    # THEN only the five unconditional plugs are returned
+    assert plugs == UNCONDITIONAL_PLUGS
+
+
+def test_disconnected_plugs_yield_connectplugs_and_restartftl():
+    # GIVEN a converged machine where one required plug is disconnected
+    state = converged(
+        connected_plugs=frozenset({"system-observe", "hardware-observe", "mount-observe"})
+    )
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN the two missing plugs are connected, and because capability
+    # warnings clear only after a restart, FTL is restarted
+    assert outcomes == (
+        ConnectPlugs(plugs=("process-control", "time-control")),
+        RestartFtl(reason="connecting plugs clears capability warnings only after a restart"),
+    )
+
+
+def test_all_plugs_connected_yields_no_connectplugs():
+    # GIVEN a converged machine with all plugs connected
+    state = converged(
+        connected_plugs=frozenset(UNCONDITIONAL_PLUGS),
+    )
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN nothing happens
+    assert outcomes == (Noop(),)
+
+
+# -- WriteGravityTimer. ------------------------------------------------
+
+
+def test_gravity_schedule_drift_yields_writegravitytimer():
+    # GIVEN an intent with a managed schedule that differs from state
+    intent = PiholeIntent(admin_password=PASSWORD, gravity_schedule="Sun *-*-* 03:00")
+    state = converged(gravity_schedule="Sun *-*-* 04:25")
+
+    # WHEN the plan is computed
+    outcomes = compute(state, intent)
+
+    # THEN a write is planned
+    assert outcomes == (WriteGravityTimer(schedule="Sun *-*-* 03:00"),)
+
+
+def test_gravity_schedule_matches_yields_no_write():
+    # GIVEN an intent with a schedule that already matches state
+    intent = PiholeIntent(admin_password=PASSWORD, gravity_schedule="Sun *-*-* 03:00")
+    state = converged(gravity_schedule="Sun *-*-* 03:00")
+
+    # WHEN the plan is computed
+    outcomes = compute(state, intent)
+
+    # THEN nothing happens
+    assert outcomes == (Noop(),)
+
+
+def test_unmanaged_gravity_schedule_with_no_drop_in_yields_no_write():
+    # GIVEN an intent where gravity_schedule is None (unmanaged) and no
+    # drop-in on disk either
+    intent = PiholeIntent(admin_password=PASSWORD, gravity_schedule=None)
+    state = converged(gravity_schedule=None)
+
+    # WHEN the plan is computed
+    outcomes = compute(state, intent)
+
+    # THEN nothing is emitted — unmanaged and already absent
+    assert outcomes == (Noop(),)
+
+
+def test_gravity_schedule_in_bootstrap():
+    # GIVEN an intent with a gravity schedule set
+    intent = PiholeIntent(admin_password=PASSWORD, gravity_schedule="Sun *-*-* 03:00")
+
+    # WHEN a fresh machine is bootstrapped
+    outcomes = compute(SnapAbsent(), intent)
+
+    # THEN WriteGravityTimer appears after SetFtlConfig
+    kinds = [type(o) for o in outcomes]
+    assert WriteGravityTimer in kinds
+    assert kinds.index(SetFtlConfig) < kinds.index(WriteGravityTimer)
+
+
+def test_unsetting_the_schedule_removes_the_drop_in():
+    """Unmanaged intent with a drop-in on disk plans its removal.
+
+    The one-directional version of this drift check was a real bug,
+    found while covering the error paths: unset config left the old
+    override behind forever, and `remove_gravity_timer` was dead code.
+    """
+    # GIVEN a machine with a drop-in active and an intent that no
+    # longer manages the schedule
+    state = converged(gravity_schedule="Sun *-*-* 04:00")
+    intent = PiholeIntent(admin_password=PASSWORD, gravity_schedule=None)
+
+    # WHEN the machine converges
+    outcomes = compute(state, intent)
+
+    # THEN the removal is planned, as its own variant — the
+    # discriminator lives in the type, not in a sentinel value
+    assert outcomes == (RemoveGravityTimer(),)
+
+
+def test_disconnected_plugs_with_ftl_not_active_skips_restart():
+    # GIVEN a machine where plugs are disconnected but FTL is not active
+    # — the daemon is down, so there is nothing to restart
+    state = converged(
+        connected_plugs=frozenset({"system-observe", "hardware-observe", "mount-observe"}),
+        ftl_enabled=False,
+        ftl_active=False,
+        api_ready=False,
+    )
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN the missing plugs are connected, but StartFtl is NOT emitted
+    # as a restart — it will be emitted by the separate ftl_active check
+    # later in _converge. The restart guard only fires when FTL is
+    # already running.
+    kinds = [type(o) for o in outcomes]
+    assert ConnectPlugs in kinds
+    assert RestartFtl not in kinds
+    # StartFtl appears once (from the ftl_active check), not twice
+    assert kinds.count(StartFtl) == 1
+    # The ConnectPlugs comes before the single StartFtl
+    assert kinds.index(ConnectPlugs) < kinds.index(StartFtl)

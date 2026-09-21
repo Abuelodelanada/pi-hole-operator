@@ -530,7 +530,9 @@ The same PATCH with a session authenticated by the **admin password** returns
 Semantic, per `bin/snap-check:39,55,92,97,141`:
 
 - `0` — OK
-- `1` — config error (a required plug is disconnected)
+- `1` — config error (a required plug is disconnected, or the web API is
+  reachable without a password — only `network-bind` is required and
+  auto-connected, so the plug trigger is unreachable for this charm)
 - `2` — runtime error (port conflict)
 
 It checks plugs, ports 53/80/67/546, and AppArmor denials.

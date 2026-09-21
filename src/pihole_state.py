@@ -9,6 +9,11 @@ ADR-0003 section 2.5.
 
 `fetch` is the charm's only impure read path, impure only through the
 `PiholeFacts` collaborator it is handed.
+
+Stage 3 adds connected plugs, a gravity-schedule config option, and
+the outcomes to converge them — ConnectPlugs when a required plug is
+disconnected, WriteGravityTimer when the schedule has drifted. See
+the Stage 3 deliverables in docs/roadmap.md.
 """
 
 from collections.abc import Mapping, Sequence
@@ -71,6 +76,31 @@ first boot."""
 
 NTP_PORTS: tuple[tuple[PortProtocol, int], ...] = (("udp", 123),)
 """The NTP server, only advertised when the operator enabled it."""
+
+GRAVITY_TIMER_UNIT = "snap.pihole-by-rajannpatel.gravity-sync.timer"
+"""The systemd timer unit that drives the weekly gravity update."""
+
+GRAVITY_TIMER_DROP_IN_DIR = Path(f"/etc/systemd/system/{GRAVITY_TIMER_UNIT}.d")
+"""The host directory for the charm's override drop-in."""
+
+GRAVITY_TIMER_DROP_IN = GRAVITY_TIMER_DROP_IN_DIR / "override.conf"
+"""The host file the charm writes to set the gravity schedule."""
+
+UNCONDITIONAL_PLUGS: tuple[str, ...] = (
+    "system-observe",
+    "hardware-observe",
+    "mount-observe",
+    "time-control",
+    "process-control",
+)
+"""Plugs this charm always connects, regardless of config.
+
+Without time-control, process-control, and system-observe, FTL.log
+emits CAP_SYS_TIME, CAP_SYS_NICE, and /proc/<pid>/comm warnings.
+hardware-observe and mount-observe feed the diagnostics page.
+network-control and firewall-control join only when DHCP is enabled
+(Stage 7). See snap-constraints section 3.
+"""
 
 
 def config_value(toml: Mapping[str, object], key: str) -> object | None:
@@ -139,6 +169,37 @@ type AdminPasswordState = PasswordUnset | PasswordAccepted | PasswordRejected | 
 
 @final
 @dataclass(frozen=True)
+class SnapCheckOk:
+    """snap-check exit 0: the snap is healthy."""
+
+
+@final
+@dataclass(frozen=True)
+class SnapCheckConfigError:
+    """snap-check exit 1: a config error (plug disconnected, etc.)."""
+
+    output: str
+
+
+@final
+@dataclass(frozen=True)
+class SnapCheckRuntimeError:
+    """snap-check exit 2: a runtime error (port conflict, etc.)."""
+
+    output: str
+
+
+type SnapCheckResult = SnapCheckOk | SnapCheckConfigError | SnapCheckRuntimeError
+"""The three semantic exit codes of ``pihole snap-check``.
+
+A new exit code fails ``tox -e static`` instead of being silently
+swallowed — every ``match`` on this union ends in ``assert_never``.
+See snap-constraints section 7.3.
+"""
+
+
+@final
+@dataclass(frozen=True)
 class ApiFacts:
     """The two facts one authenticated API session can establish.
 
@@ -184,6 +245,8 @@ class SnapPresent:
     listening_mode: str | None
     blocking_enabled: bool | None
     dnssec_enabled: bool | None
+    connected_plugs: frozenset[str] = field(default_factory=frozenset[str])
+    gravity_schedule: str | None = None
 
 
 type PiholeState = SnapAbsent | SnapPresent
@@ -207,6 +270,7 @@ class PiholeIntent:
     blocking_enabled: bool = True
     dnssec_enabled: bool = False
     ntp_server_enabled: bool = False
+    gravity_schedule: str | None = None
 
 
 @final
@@ -291,6 +355,24 @@ class StartFtl:
 
 @final
 @dataclass(frozen=True)
+class RestartFtl:
+    """Restart the FTL daemon so capability warnings clear.
+
+    ``Snap.start`` on an active service is a no-op, so the plug-drift
+    path needs a genuine restart — the capability warnings from
+    ``CAP_SYS_TIME`` and ``CAP_SYS_NICE`` clear only after one. See
+    snap-constraints section 3.
+
+    Carries the reason: a restart drops DNS for every client, and the
+    cause must reach the log (ADR-0003 section 2.4) — `_apply` logs the
+    outcome, so the field is what makes the log line say why.
+    """
+
+    reason: str
+
+
+@final
+@dataclass(frozen=True)
 class AwaitApi:
     """Wait for the HTTP API, the only honest readiness signal."""
 
@@ -327,6 +409,50 @@ class Noop:
     """Nothing to do: the machine already matches intent."""
 
 
+@final
+@dataclass(frozen=True)
+class ConnectPlugs:
+    """Connect the snap plugs this intent needs.
+
+    Emitted when a required plug is disconnected; connecting a
+    connected plug is idempotent, so this is safe on every reconcile.
+    Because plug-dependent capability warnings (CAP_SYS_TIME,
+    CAP_SYS_NICE) clear only after an FTL restart, the apply order
+    ConnectPlugs → StartFtl is load-bearing — see snap-constraints
+    section 3.
+    """
+
+    plugs: tuple[str, ...]
+
+
+@final
+@dataclass(frozen=True)
+class WriteGravityTimer:
+    """Write the host systemd drop-in for the gravity timer schedule.
+
+    The snap cannot manage its own timer schedule: the configure hook
+    rejects all `timer.*` keys and snapd has no runtime mechanism to
+    change them. The charm writes a host drop-in at
+    `/etc/systemd/system/snap.pihole-by-rajannpatel.gravity-sync.timer.d/override.conf`,
+    with `OnCalendar=` cleared before being set (drop-ins append
+    otherwise). See snap-constraints section 2.2.
+    """
+
+    schedule: str
+
+
+@final
+@dataclass(frozen=True)
+class RemoveGravityTimer:
+    """Remove the host drop-in, restoring the snap's own timer.
+
+    The discriminator lives in the type, not in a sentinel value: a
+    `WriteGravityTimer(schedule=None)` that meant "remove" made the
+    name lie for one of its two values and forced a dispatch `if` on
+    the apply side.
+    """
+
+
 type PiholeOutcome = (
     ReleasePort53
     | InstallSnap
@@ -334,8 +460,12 @@ type PiholeOutcome = (
     | SetNtpServer
     | SetAdminPassword
     | StartFtl
+    | RestartFtl
     | AwaitApi
     | SetFtlConfig
+    | ConnectPlugs
+    | WriteGravityTimer
+    | RemoveGravityTimer
     | Noop
 )
 
@@ -421,6 +551,25 @@ class PiholeFacts(Protocol):
         """
         ...
 
+    def connected_plugs(self) -> frozenset[str]:
+        """The set of snap plugs currently connected.
+
+        Read from ``snap connections``, never assumed.
+        """
+        ...
+
+    def gravity_schedule(self) -> str | None:
+        """The schedule OUR drop-in imposes, or None if absent.
+
+        Deliberately not the effective ``OnCalendar``: the snap ships
+        its own randomized default, so the effective value is never
+        None — and a fact that reported it would make an unmanaged
+        intent plan a removal on every reconcile, forever. The fact
+        is "what did WE write"; the effective schedule is what
+        ``write_gravity_timer`` reads back after writing.
+        """
+        ...
+
 
 def fetch(pihole: PiholeFacts, admin_password: str) -> PiholeState:
     """Read every fact the decision depends on, exactly once.
@@ -459,6 +608,8 @@ def fetch(pihole: PiholeFacts, admin_password: str) -> PiholeState:
         listening_mode=pihole.listening_mode(),
         blocking_enabled=pihole.blocking_enabled(),
         dnssec_enabled=pihole.dnssec_enabled(),
+        connected_plugs=pihole.connected_plugs(),
+        gravity_schedule=pihole.gravity_schedule(),
     )
 
 
@@ -473,6 +624,16 @@ def compute(state: PiholeState, intent: PiholeIntent) -> Sequence[PiholeOutcome]
             assert_never(unreachable)
 
 
+def plugs_for() -> tuple[str, ...]:
+    """Return the snap plugs this charm always connects.
+
+    Unconditional today. ``network-control`` and ``firewall-control``
+    join when DHCP lands (Stage 7) — the function takes no intent
+    parameter until then, because the gate has no consumer.
+    """
+    return UNCONDITIONAL_PLUGS
+
+
 def _bootstrap(intent: PiholeIntent) -> Sequence[PiholeOutcome]:
     """Plan a first install, in the one order that is correct.
 
@@ -483,18 +644,20 @@ def _bootstrap(intent: PiholeIntent) -> Sequence[PiholeOutcome]:
     never move what was just installed (ADR-0010). Port 53 is freed
     second, before the daemon starts, because `restart-condition:
     on-failure` turns `EADDRINUSE` into an indefinite crash loop
-    (snap-constraints sections 2.1 and 11). The NTP server is closed
+    (snap-constraints sections 2.1 and 11). Plugs are connected before
+    the daemon starts, because the capability warnings clear only after
+    a restart (snap-constraints section 3). The NTP server is closed
     before the first start — attack surface nothing asked for. The
-    password is
-    applied before the daemon serves, because an empty `pwhash` opens
-    the config API to the network. The API is the readiness gate, and
-    config lands last because the API only exists after the gate. See
-    ADR-0004 section 4.
+    password is applied before the daemon serves, because an empty
+    `pwhash` opens the config API to the network. The API is the
+    readiness gate, and config lands last because the API only exists
+    after the gate. See ADR-0004 section 4.
     """
     outcomes: list[PiholeOutcome] = [
         InstallSnap(),
         HoldSnapRefresh(),
         ReleasePort53(),
+        ConnectPlugs(plugs=plugs_for()),
         SetNtpServer(active=False),
         SetAdminPassword(intent.admin_password),
         StartFtl(),
@@ -507,6 +670,8 @@ def _bootstrap(intent: PiholeIntent) -> Sequence[PiholeOutcome]:
         ("dns.dnssec", intent.dnssec_enabled),
     ]
     outcomes.append(SetFtlConfig(config=tuple(ftl_config), password=intent.admin_password))
+    if intent.gravity_schedule is not None:
+        outcomes.append(WriteGravityTimer(schedule=intent.gravity_schedule))
     return tuple(outcomes)
 
 
@@ -528,6 +693,26 @@ def _converge(state: SnapPresent, intent: PiholeIntent) -> Sequence[PiholeOutcom
     if not state.port53_released:
         outcomes.append(ReleasePort53())
 
+    # Plug drift: connect any required plug that is not already
+    # connected. Connecting a connected plug is idempotent, but the
+    # capability warnings clear only after an FTL restart, so
+    # ConnectPlugs is emitted before RestartFtl in the sequence.
+    needed = frozenset(plugs_for())
+    if not needed.issubset(state.connected_plugs):
+        missing = sorted(needed - state.connected_plugs)
+        outcomes.append(ConnectPlugs(plugs=tuple(missing)))
+        # Plugs were just connected, so the capability warnings
+        # cannot have cleared yet. Force an FTL restart so the
+        # warnings disappear on the next status check. The restart
+        # itself is idempotent — if the daemon is already down,
+        # StartFtl brings it up instead.
+        if state.ftl_enabled and state.ftl_active:
+            outcomes.append(
+                RestartFtl(
+                    reason="connecting plugs clears capability warnings only after a restart"
+                )
+            )
+
     # An NTP correction restarts FTL (the configure hook restarts
     # only when a value actually changed), so the step brings its own
     # gate rather than leaving an unguarded bounce for the next status
@@ -545,6 +730,16 @@ def _converge(state: SnapPresent, intent: PiholeIntent) -> Sequence[PiholeOutcom
     drifted = _drifted_config(state, intent)
     if drifted:
         outcomes.append(SetFtlConfig(config=drifted, password=intent.admin_password))
+
+    # Gravity timer schedule drift — in both directions: a set schedule
+    # that differs writes the drop-in, and an unset schedule with a
+    # drop-in still on disk removes it. One direction without the
+    # other leaves a stale override behind an unmanaged timer.
+    if intent.gravity_schedule is None:
+        if state.gravity_schedule is not None:
+            outcomes.append(RemoveGravityTimer())
+    elif state.gravity_schedule != intent.gravity_schedule:
+        outcomes.append(WriteGravityTimer(schedule=intent.gravity_schedule))
 
     return tuple(outcomes) if outcomes else (Noop(),)
 

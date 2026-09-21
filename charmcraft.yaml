@@ -28,7 +28,19 @@ description: |
     and applies it before the daemon ever serves; actions retrieve and
     rotate it. There is no configuration option for the password.
   - Reports health from the Pi-hole API, not from the service manager,
-    so `active` means "answering queries".
+    so `active` means "answering queries" — and runs the snap's own
+    `snap-check` diagnostic when collecting status on an installed
+    unit, so a port conflict or a broken config shows up as `blocked`
+    naming the remedy.
+  - Connects the snap's diagnostic plugs (`system-observe`,
+    `hardware-observe`, `mount-observe`, `time-control`,
+    `process-control`), keeping FTL's log free of capability warnings.
+  - Gives the operator escape hatches as actions: `snap-check` (run the
+    diagnostic on demand), `update-gravity` (refresh blocklists now,
+    optionally a full rebuild), and `free-port-53` (recover the port).
+  - Optionally sets the blocklist refresh schedule (`gravity-schedule`,
+    a systemd `OnCalendar` string) through a host drop-in, because the
+    snap cannot manage its own timer.
 
   A single unit is the supported shape. Two Pi-holes are two independent
   resolvers with independently drifting blocklists, not a cluster.
@@ -92,6 +104,28 @@ actions:
       recorded in the action's params and visible via `juju show-task`.
       Rotating invalidates existing admin UI sessions.
     additionalProperties: false
+  snap-check:
+    description: |
+      Run the snap's own diagnostic (plug connections, port conflicts,
+      AppArmor denials) and return its output and exit code verbatim.
+    additionalProperties: false
+  update-gravity:
+    description: |
+      Refresh blocklists immediately instead of waiting for the weekly timer.
+      A full download can take minutes on a slow line — pass ``--wait`` when
+      running it.
+    params:
+      force:
+        type: boolean
+        description: Rebuild gravity.db from scratch rather than incrementally.
+        default: false
+    additionalProperties: false
+  free-port-53:
+    description: |
+      Re-run the port-53 freeing procedure. This is the remedy named in the
+      port-conflict BlockedStatus message. FTL's Restart=on-failure recovers
+      by itself once the port is free.
+    additionalProperties: false
 
 parts:
   charm:
@@ -133,3 +167,12 @@ config:
         Whether the FTL NTP server on 123/udp is enabled.
         The charm default is false, diverging from the snap's default
         of true. See the README.
+    gravity-schedule:
+      type: string
+      default: ""
+      description: |
+        A systemd OnCalendar expression for the weekly gravity update
+        timer (e.g. 'Sun *-*-* 03:00'). Empty means the charm does not
+        manage the schedule — the snap's randomised default applies.
+        The charm writes a host systemd drop-in because the snap's
+        configure hook rejects all timer keys.

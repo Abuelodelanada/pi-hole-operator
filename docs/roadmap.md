@@ -1,6 +1,6 @@
 # Implementation roadmap
 
-**Status:** Accepted — Stages 0-2 closed
+**Status:** Accepted — each stage's acceptance block records its own state
 **Last updated:** 2026-09-07
 **Audience:** `charm-engineer`
 
@@ -286,12 +286,14 @@ hatches.
 
 - `connect_plugs()` — idempotent, safe every reconcile. `system-observe`,
   `hardware-observe`, `mount-observe`, `time-control`, `process-control`
-  unconditionally; `network-control`/`firewall-control` gated on DHCP. **Read
-  `snap connections` back** — the snap's own docs warn that store auto-connection
-  and `--dangerous` installs produce different states.
-- `snap_check()` mapping exit codes into status: `0` OK, `1` config error, `2`
-  runtime/port error → `Blocked` **naming the remedy**. Called from
-  `collect_unit_status`, which must not mutate.
+  unconditionally today; `network-control`/`firewall-control` join with
+  DHCP (Stage 7). **Read `snap connections` back** — the snap's own docs
+  warn that store auto-connection and `--dangerous` installs produce
+  different states.
+- `snap_check()` mapping exit codes into status: `0` OK, `1` config error
+  (plug disconnected or unauthenticated web API — the plug trigger is
+  unreachable for this charm), `2` runtime/port error → `Blocked` **naming
+  the remedy**. Called from `collect_unit_status`, which must not mutate.
 - Actions, each with `additionalProperties` set **explicitly**: `snap-check`,
   `update-gravity` (`force`), `free-port-53`. (`get-admin-password` and
   `rotate-admin-password` ship in Stage 1 with the password itself.)
@@ -310,10 +312,48 @@ hatches.
 
 **Acceptance**
 
-- [ ] An integration test pins the `snap-check` exit codes, since the wiki
-      documents none.
-- [ ] `FTL.log` is free of `CAP_SYS_TIME` / `CAP_SYS_NICE` / `/proc/<pid>/comm`
-      warnings and `dmesg` free of AppArmor `DENIED` after a converged deploy.
+- [x] An integration test pins the `snap-check` exit codes. —
+      `test_snap_check_exit_0_on_a_converged_unit` and
+      `test_snap_check_exit_2_on_a_port_conflict`. The nuance the verification
+      surfaced: exit 1's **plug trigger** is effectively unreachable
+      (`network-bind` auto-connects on install), but its **password trigger**
+      — a network-reachable web API with no password — is a real drift state
+      the charm models (`PasswordUnset`) and reports with its own Blocked
+      message; snap-check's version is a second line of defence, not the
+      primary. The suite pins 0 and 2 and documents this instead of faking 1.
+      Exit 2 is pinned in its real shape: snap-check **skips port checks
+      while FTL is active** ("Port conflict checks skipped"), so the test
+      stops the daemon and holds the port — the crash-loop scenario the code
+      exists for.
+- [x] `FTL.log` free of capability warnings, `dmesg` free of the denials
+      plugs cause. — `test_ftl_log_is_free_of_capability_warnings` and
+      `test_no_capability_denials_for_pihole_snap`. The box's original "dmesg
+      free of AppArmor DENIED" premise was too broad: strict confinement emits
+      noise no plug removes — curl probing `/etc/ldap/ldap.conf` during gravity
+      downloads, and snap-check itself denied `dmesg` by its own sandbox — both
+      observed on a converged, fully-plugged unit. The assertion is scoped to
+      what connecting the plugs actually clears: `operation="capable"`
+      denials and `/proc/*/comm` opens.
+- [x] The gravity timer drop-in is written, loaded, and removed cleanly.
+- [x] `charm-reviewer` clean (2026-09-21, fifth pass over the slice that
+      closes this stage). Five passes, each finding what the previous one's
+      fixes left: a tautological read-back on the remedy path, a status
+      handler that ran the diagnostic before knowing the workload existed, a
+      "restart" that was a no-op, an invented `systemctl show` format, a
+      vacuous plug assertion, a diagnostic banner that suppressed the
+      charm's own message, facts that broke the never-raise contract — all
+      fixed in this commit, and the fifth pass pre-cleared the closure once
+      its one blocker (a docstring asserting the negation of the
+      facts-totality contract) landed. Deferred with triggers: the
+      version-report memo and `RefreshSnap` (the operator is thinking);
+      Loki rules + end-to-end and Pi-hole-specific metrics (ADR-0008). —
+      `test_gravity_schedule_drop_in_lands_and_reads_back` and
+      `test_gravity_schedule_unset_removes_drop_in`. The load signal is
+      `systemctl show -p DropInPaths --value` containing the drop-in path —
+      not `TimersCalendar`, whose real output is a brace-delineated,
+      normalised, time-varying format that can never match the operator's raw
+      expression. The tests wait on `settled` (workload active AND agent idle),
+      because `all_active` alone can pass before config-changed finishes.
 
 ---
 

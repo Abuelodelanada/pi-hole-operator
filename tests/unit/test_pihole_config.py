@@ -160,3 +160,35 @@ def test_model_is_frozen():
     config = PiholeConfig()
     with pytest.raises((ValueError, TypeError, AttributeError)):
         config.blocking_enabled = False
+
+
+def test_gravity_schedule_normalised():
+    # GIVEN a non-empty gravity-schedule string
+    config = PiholeConfig.model_validate({"gravity_schedule": "Sun *-*-* 03:00"})
+
+    # WHEN the model is constructed
+    # THEN the value passes through the normaliser unchanged
+    assert config.gravity_schedule == "Sun *-*-* 03:00"
+    assert dict(config.intent_fields())["gravity_schedule"] == "Sun *-*-* 03:00"
+
+
+def test_gravity_schedule_empty_maps_to_none():
+    # GIVEN an empty gravity-schedule
+    config = PiholeConfig.model_validate({"gravity_schedule": ""})
+
+    # WHEN intent_fields is called
+    fields = dict(config.intent_fields())
+
+    # THEN gravity_schedule is None (unmanaged)
+    assert fields["gravity_schedule"] is None
+
+
+def test_gravity_schedule_none_maps_to_none():
+    # GIVEN None as gravity_schedule
+    config = PiholeConfig.model_validate({"gravity_schedule": None})
+
+    # WHEN intent_fields is called
+    fields = dict(config.intent_fields())
+
+    # THEN gravity_schedule is None (unmanaged)
+    assert fields["gravity_schedule"] is None

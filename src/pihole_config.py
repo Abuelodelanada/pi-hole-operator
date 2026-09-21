@@ -1,6 +1,7 @@
-"""Pydantic model for the charm's config options.
+"""Pydantic model for the charm's config options and action params.
 
-Parsed by `ops` via `self.load_config(PiholeConfig, errors="blocked")`.
+Parsed by `ops` via `self.load_config(PiholeConfig, errors="blocked")`
+and `event.load_params(UpdateGravityParams, errors="fail")`.
 Imports pydantic and stdlib only — no `ops` import, so it is testable
 without a harness. See ADR-0006 section 2.1.
 """
@@ -48,6 +49,7 @@ class IntentFields(TypedDict):
     blocking_enabled: bool
     dnssec_enabled: bool
     ntp_server_enabled: bool
+    gravity_schedule: str | None
 
 
 class PiholeConfig(pydantic.BaseModel):
@@ -85,6 +87,14 @@ class PiholeConfig(pydantic.BaseModel):
         default=False,
         description="Whether the FTL NTP server on 123/udp is enabled. Charm default is false.",
     )
+    gravity_schedule: str | None = pydantic.Field(
+        default=None,
+        description=(
+            "A systemd OnCalendar expression for the weekly gravity update timer. "
+            "Unset means the charm does not manage the schedule (the snap's randomised "
+            "default applies). Example: 'Sun *-*-* 03:00'."
+        ),
+    )
 
     @pydantic.field_validator("upstream_dns", mode="before")
     @classmethod
@@ -97,6 +107,14 @@ class PiholeConfig(pydantic.BaseModel):
     @pydantic.field_validator("dns_listening_mode", mode="before")
     @classmethod
     def _normalise_listening_mode(cls, value: str | None) -> str | None:
+        """Accept empty string as None."""
+        if value is None or value == "":
+            return None
+        return value
+
+    @pydantic.field_validator("gravity_schedule", mode="before")
+    @classmethod
+    def _normalise_gravity_schedule(cls, value: str | None) -> str | None:
         """Accept empty string as None."""
         if value is None or value == "":
             return None
@@ -120,4 +138,16 @@ class PiholeConfig(pydantic.BaseModel):
             "blocking_enabled": self.blocking_enabled,
             "dnssec_enabled": self.dnssec_enabled,
             "ntp_server_enabled": self.ntp_server_enabled,
+            "gravity_schedule": self.gravity_schedule,
         }
+
+
+class UpdateGravityParams(pydantic.BaseModel):
+    """Parameters for the update-gravity action."""
+
+    model_config = pydantic.ConfigDict(frozen=True)
+
+    force: bool = pydantic.Field(
+        default=False,
+        description="Rebuild gravity.db from scratch rather than incrementally.",
+    )

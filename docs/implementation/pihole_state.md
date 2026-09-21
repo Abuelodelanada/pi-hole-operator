@@ -75,10 +75,11 @@ to converge toward — and being a named variant rather than `None` is what keep
 
 ### The outcomes
 
-`PiholeOutcome`, nine variants: `ReleasePort53`, `InstallSnap`,
-`HoldSnapRefresh`, `SetNtpServer`, `SetAdminPassword`, `StartFtl`, `AwaitApi`,
-`SetFtlConfig`, `Noop`. Each is a value, not an action; `charm.py`'s `_apply` is
-the only thing that turns one into an effect.
+`PiholeOutcome` — the union at the top of the module is the list; this
+document deliberately does not copy it, because a copy rots at the next
+outcome. What matters is the shape: each variant is a value, not an
+action, and `charm.py`'s `_apply` is the only thing that turns one into
+an effect.
 
 ### The effect boundary and the two functions
 
@@ -98,13 +99,14 @@ function that only observes, and makes reaching for another intent field inside
 
 `compute` dispatches on the state union:
 
-- `SnapAbsent` → `_bootstrap`, which returns a **fixed eight-outcome tuple**. The
-  order is the correctness condition and is stated once, literally, in that
-  function.
-- `SnapPresent` → `_converge`, which appends conditionally in the same order,
-  minus whatever is already true. Two helpers keep it flat: `_ntp_step` (the
-  tri-state NTP comparison — unknown drifts to a correction) and
-  `_drifted_config` (the FTL config diff).
+- `SnapAbsent` → `_bootstrap`, which returns an ordered tuple of
+  outcomes. The order is the correctness condition and is stated once,
+  literally, in that function. The exact list lives in the source —
+  this document describes shape, not counts.
+- `SnapPresent` → `_converge`, which appends conditionally in the same
+  order, minus whatever is already true. Two helpers keep it flat:
+  `_ntp_step` (the tri-state NTP comparison — unknown drifts to a
+  correction) and `_drifted_config` (the FTL config diff).
 
 ---
 

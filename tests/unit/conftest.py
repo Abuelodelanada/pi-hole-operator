@@ -103,6 +103,9 @@ def mock_pihole(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     mock.listening_mode.return_value = None
     mock.blocking_enabled.return_value = True
     mock.dnssec_enabled.return_value = False
+    mock.connected_plugs.return_value = frozenset(pihole_state.UNCONDITIONAL_PLUGS)
+    mock.gravity_schedule.return_value = None
+    mock.snap_check.return_value = pihole_state.SnapCheckOk()
     monkeypatch.setattr(charm.pihole, "Pihole", lambda: mock)
     return mock
 
@@ -142,6 +145,7 @@ def mock_resolved(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """
     mock = MagicMock()
     mock.ResolvedError = resolved.ResolvedError
+    mock.is_port53_released.return_value = True
     monkeypatch.setattr(charm, "resolved", mock)
     return mock
 
@@ -186,6 +190,7 @@ class FakeSnap:
         self.ensure_calls: list[tuple[snap.SnapState, str | None, str | None]] = []
         self.set_calls: list[dict[str, object]] = []
         self.start_calls: list[tuple[list[str] | None, bool]] = []
+        self.restart_calls: list[tuple[list[str] | None, bool]] = []
         self.has_ftl_service = True
 
     @property
@@ -240,6 +245,14 @@ class FakeSnap:
         if self.honest:
             self.active = True
             self.enabled = self.enabled or enable
+
+    def restart(self, services: list[str] | None = None, reload: bool = False) -> None:
+        """Restart services, or pretend to when dishonest."""
+        self.restart_calls.append((services, reload))
+        if self.refusal is not None:
+            raise self.refusal
+        if self.honest:
+            self.active = True
 
 
 class FakeCache:

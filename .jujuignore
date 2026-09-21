@@ -17,6 +17,6 @@ __pycache__
 AGENTS.md
 CONTRIBUTING.md
 # Upstream bug reports, written up for the snap's maintainer. They belong
-# in the repository and never in the packed charm.
+# in the repository (under docs/) and never in the packed charm.
 snap-issue-*.md
 opencode.json

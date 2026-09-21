@@ -5,15 +5,16 @@
 Every deferrable event routes to a single `_reconcile`, which converges
 the machine toward the operator's declared intent. Only events that
 cannot be deferred get a handler of their own: `collect_unit_status`,
-`remove`, and the two actions.
+`remove`, and the actions.
 
 This module owns `ops` and nothing else — no `charmlibs.*`, no
 `subprocess`, no file writes — which is what keeps it unit-testable.
 The reconciler is three stages: `fetch` reads the machine once,
 `compute` decides purely, `_apply` acts dumbly. See rule 2 and ADR-0003.
 
-Stage 2 adds config-driven intent, the FTL config API path, and
-conditional ports. See ADR-0004 section 5 and ADR-0006 section 2.1.
+Stage 3 adds snap-check in the status path, plug management, and
+the gravity timer. See ADR-0005, ADR-0006 §2.7, and snap-constraints §3
+and §7.3.
 """
 
 import logging
@@ -76,16 +77,18 @@ class PiholeCharm(ops.CharmBase):
 
         # These cannot be deferred, which is the objective test for
         # deserving a handler of their own.
-        framework.observe(self.on.collect_unit_status, self._on_collect_status)
-        framework.observe(self.on.remove, self._on_remove)
-        framework.observe(
-            self.on["get-admin-password"].action,
-            self._on_get_admin_password,
-        )
-        framework.observe(
-            self.on["rotate-admin-password"].action,
-            self._on_rotate_admin_password,
-        )
+        non_reconcile = {
+            self.on.collect_unit_status: self._on_collect_status,
+            self.on.remove: self._on_remove,
+            self.on["get-admin-password"].action: self._on_get_admin_password,
+            self.on["rotate-admin-password"].action: self._on_rotate_admin_password,
+            self.on["snap-check"].action: self._on_snap_check,
+            self.on["update-gravity"].action: self._on_update_gravity,
+            self.on["free-port-53"].action: self._on_free_port_53,
+        }
+
+        for event, handler in non_reconcile.items():
+            framework.observe(event, handler)
 
     # -- The reconciler. -----------------------------------------------
 
@@ -139,16 +142,24 @@ class PiholeCharm(ops.CharmBase):
                 self._pihole.install()
             case pihole_state.HoldSnapRefresh():
                 self._pihole.hold_refresh()
+            case pihole_state.ConnectPlugs(plugs=plugs):
+                self._pihole.connect_plugs(plugs)
             case pihole_state.SetNtpServer(active=active):
                 self._pihole.set_ntp_server(active=active)
             case pihole_state.SetAdminPassword(password=password):
                 self._pihole.set_password(password)
             case pihole_state.StartFtl():
                 self._pihole.start(enable=True)
+            case pihole_state.RestartFtl():
+                self._pihole.restart()
             case pihole_state.AwaitApi(timeout=timeout):
                 self._pihole.await_api(timeout)
             case pihole_state.SetFtlConfig(config=config, password=password):
                 self._pihole.apply_ftl_config(password=password, config=dict(config))
+            case pihole_state.WriteGravityTimer(schedule=schedule):
+                self._pihole.write_gravity_timer(schedule)
+            case pihole_state.RemoveGravityTimer():
+                self._pihole.remove_gravity_timer()
             case pihole_state.Noop():
                 logger.debug("converged: nothing to do.")
             case _ as unreachable:
@@ -188,17 +199,66 @@ class PiholeCharm(ops.CharmBase):
 
         Must not mutate anything, so it reads the password rather
         than generating one. The pushed failure is read first — see
-        ADR-0005 section 2.4.
+        ADR-0005 section 2.4. The snap's presence is established
+        before snap-check runs, because the diagnostic cannot run
+        without the snap installed.
         """
         if self._reconcile_failure is not None:
             event.add_status(self._reconcile_failure)
             return
 
+        # Establish the snap's presence first — snap-check cannot run
+        # without it, and an absent snap is Maintenance, not Blocked.
         match _intent_from(self._read_password()):
             case pihole_state.NoIntentYet():
                 event.add_status(ops.MaintenanceStatus("generating the admin password"))
+                return
             case pihole_state.PiholeIntent() as intent:
-                event.add_status(_machine_status(self._pihole, intent))
+                status = _machine_status(self._pihole, intent)
+            case _ as unreachable:
+                assert_never(unreachable)
+
+        # The charm's own machine status is added BEFORE any
+        # snap-check status: ops resolves equal-priority statuses by
+        # first-added, so a charm-authored Blocked must not lose the
+        # tie to a diagnostic banner (the password-unset condition is
+        # the one that must never be suppressed).
+        event.add_status(status)
+        if isinstance(status, ops.MaintenanceStatus):
+            return
+
+        # snap-check is a read: it inspects plugs, ports, and
+        # AppArmor denials without changing anything. Exit 0 means
+        # healthy; 1 means a config error (a required plug is
+        # disconnected, or the web API is reachable without a
+        # password); 2 means a runtime error (port conflict).
+        # See snap-constraints section 7.3.
+        try:
+            result = self._pihole.snap_check()
+        except pihole.PiholeError as err:
+            event.add_status(ops.BlockedStatus(str(err)))
+            return
+        match result:
+            case pihole_state.SnapCheckOk():
+                pass
+            case pihole_state.SnapCheckConfigError(output=output):
+                # snap-check's first line is unconditionally the
+                # banner "Pi-hole System Diagnostics" — the failures
+                # live in [FAIL] lines further down, so those are
+                # what a Blocked message carries, with the charm's
+                # own remedy appended.
+                fails = [ln for ln in output.splitlines() if "[FAIL]" in ln]
+                detail = " | ".join(fails) if fails else "snap-check exit 1"
+                event.add_status(
+                    ops.BlockedStatus(f"{detail}; run the snap-check action for the full output")
+                )
+            case pihole_state.SnapCheckRuntimeError(output=output):
+                event.add_status(
+                    ops.BlockedStatus(
+                        f"port conflict detected by snap-check: {output}; "
+                        "run the free-port-53 action"
+                    )
+                )
             case _ as unreachable:
                 assert_never(unreachable)
 
@@ -257,6 +317,71 @@ class PiholeCharm(ops.CharmBase):
             event.fail(f"the new password was written but not confirmed: {problem}")
             return
         event.set_results({"result": "the admin UI password has been rotated"})
+
+    def _on_snap_check(self, event: ops.ActionEvent) -> None:
+        """Run snap-check and return its outcome verbatim."""
+        try:
+            result = self._pihole.snap_check()
+        except pihole.PiholeError as err:
+            event.fail(str(err))
+            return
+        match result:
+            case pihole_state.SnapCheckOk():
+                event.set_results({"exit-code": "0", "output": "all checks passed"})
+            case pihole_state.SnapCheckConfigError(output=output):
+                event.set_results({"exit-code": "1", "output": output})
+            case pihole_state.SnapCheckRuntimeError(output=output):
+                event.set_results({"exit-code": "2", "output": output})
+            case _ as unreachable:
+                assert_never(unreachable)
+
+    def _on_update_gravity(self, event: ops.ActionEvent) -> None:
+        """Refresh blocklists now instead of waiting for the timer.
+
+        The ``force`` parameter (default false) passes ``--force`` to
+        ``pihole -g``, which deletes the list cache before downloading
+        — a full rebuild rather than an incremental update. Verified
+        from upstream: ``gravity.sh`` accepts ``-f``/``--force``.
+        """
+        params = event.load_params(pihole_config.UpdateGravityParams, errors="fail")
+        try:
+            self._pihole.update_gravity(force=params.force)
+        except pihole.PiholeError as err:
+            event.fail(f"gravity update failed: {err}")
+            return
+        event.set_results({"result": "gravity update completed"})
+
+    def _on_free_port_53(self, event: ops.ActionEvent) -> None:
+        """Re-run the port-53 freeing procedure and verify it worked.
+
+        ``resolved.disable_stub_listener()`` is idempotent — it
+        writes the drop-in only when it is absent or wrong, and
+        restarts systemd-resolved only when it wrote. Afterwards
+        ``snap-check`` is run because another process may now hold
+        the port: code 2 means the port is still occupied and the
+        action carries snap-check's output so the operator can see
+        what holds it. 0 or 1 means success.
+        """
+        try:
+            resolved.disable_stub_listener()
+        except resolved.ResolvedError as err:
+            event.fail(str(err))
+            return
+        try:
+            result = self._pihole.snap_check()
+        except pihole.PiholeError as err:
+            event.fail(str(err))
+            return
+        match result:
+            case pihole_state.SnapCheckRuntimeError(output=output):
+                event.fail(
+                    f"port 53 is still not free after writing the resolved drop-in; "
+                    f"snap-check says: {output}"
+                )
+            case pihole_state.SnapCheckOk() | pihole_state.SnapCheckConfigError():
+                event.set_results({"result": "port 53 has been freed for Pi-hole"})
+            case _ as unreachable:
+                assert_never(unreachable)
 
     # -- Intent, which for Stage 2 includes config. ---------------
 

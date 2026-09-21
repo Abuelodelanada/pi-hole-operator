@@ -7,8 +7,8 @@ This is not a Kubernetes charm. There is no Pebble, no `lightkube`, no OCI image
 
 ## Where we are
 
-**Stages 1, 2 and 5 are closed** — each with acceptance green on LXD and a
-clean `charm-reviewer` pass (Stage 5's: 2026-09-19, fourth pass). The charm
+**Stages 1, 2, 3 and 5 are closed** — each with acceptance green on LXD
+and a clean `charm-reviewer` pass (Stage 3's: 2026-09-21, fifth pass). The charm
 installs the snap **pinned to `SNAP_REVISIONS` and held against
 auto-refresh** (ADR-0010 — the snap never updates itself), frees port 53, starts
 FTL, closes the snap's default NTP server on 123/udp, owns the admin password,
@@ -17,15 +17,18 @@ applies declarative config through `PATCH /api/config` with a read-back against
 defines the stages and is the source of truth — check it before treating a
 missing feature as a defect rather than as unstarted work.
 
-The public interface today: two actions (`get-admin-password`,
-`rotate-admin-password`), **five config options** (`upstream-dns`,
-`dns-listening-mode`, `blocking-enabled`, `dnssec-enabled`,
-`ntp-server-enabled`). **One optional relation** (`cos-agent`, ADR-0008) and **no bindings** —
+The public interface today: the actions (`get-admin-password`,
+`rotate-admin-password`, `snap-check`, `update-gravity`, `free-port-53`)
+and the config options (`upstream-dns`, `dns-listening-mode`,
+`blocking-enabled`, `dnssec-enabled`, `ntp-server-enabled`,
+`gravity-schedule`) declared in `charmcraft.yaml` — this paragraph
+deliberately carries no counts; the YAML is the list. **One optional
+relation** (`cos-agent`, ADR-0008) and **no bindings** —
 `extra-bindings: dns` was withdrawn until something consumes it (BACKLOG). Each option
 is justified in [ADR-0006](docs/adr/0006-configuration-surface.md) §2.1 against
-rule 4's three alternatives; the sixth and seventh (`snap-channel`,
-`snap-revision`) were **removed** because the revision is charm policy, not
-deployment shape (ADR-0010). Adding the first `requires` is still a decision,
+rule 4's three alternatives; `snap-channel` and `snap-revision` were
+**removed** because the revision is charm policy, not deployment shape
+(ADR-0010). Adding the first `requires` is still a decision,
 not a detail.
 
 ## Non-negotiables

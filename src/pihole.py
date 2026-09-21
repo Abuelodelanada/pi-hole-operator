@@ -11,6 +11,10 @@ section 4.
 Stage 2 adds four new facts from pihole.toml, generalises the NTP
 server toggle, and adds config application via the HTTP API. See
 ADR-0004 section 5 and ADR-0006 section 2.1.
+
+Stage 3 adds plug management, the gravity timer drop-in, and a
+snap-check that returns its output alongside the exit code. See
+docs/roadmap.md Stage 3.
 """
 
 import contextlib
@@ -24,11 +28,13 @@ from pathlib import Path
 from typing import Protocol, cast, final
 
 import tenacity
-from charmlibs import snap
+from charmlibs import snap, systemd
 
 import resolved
 from ftl_api import ApiConfigError, ApiTimeoutError, ApiUnavailableError, FtlApi
 from pihole_state import (
+    GRAVITY_TIMER_DROP_IN,
+    GRAVITY_TIMER_UNIT,
     PIHOLE_TOML,
     PWHASH_KEY,
     SNAP_DATA,
@@ -36,6 +42,10 @@ from pihole_state import (
     AdminPasswordState,
     ApiFacts,
     ServiceStatus,
+    SnapCheckConfigError,
+    SnapCheckOk,
+    SnapCheckResult,
+    SnapCheckRuntimeError,
     config_value,
     revision_for,
 )
@@ -188,6 +198,7 @@ class Pihole:
         run: Runner = _subprocess_run,
         snap_data: Path = SNAP_DATA,
         resolved_drop_in: Path = resolved.DROP_IN,
+        gravity_timer_drop_in: Path = GRAVITY_TIMER_DROP_IN,
         retry_wait: tenacity.wait.WaitBaseT = INSTALL_WAIT,
         machine: Callable[[], str] = platform.machine,
         api: FtlApi | None = None,
@@ -196,6 +207,7 @@ class Pihole:
         self._run = run
         self._snap_data = snap_data
         self._resolved_drop_in = resolved_drop_in
+        self._gravity_timer_drop_in = gravity_timer_drop_in
         self._retry_wait = retry_wait
         self._machine = machine
         self._api = api or FtlApi(snap_data=snap_data)
@@ -296,8 +308,8 @@ class Pihole:
         """Establish both API facts from a single session."""
         return self._api.facts(password)
 
-    def snap_check(self) -> int:
-        """Run the snap's own diagnostic and return its exit code.
+    def snap_check(self) -> SnapCheckResult:
+        """Run snap-check and return its semantic outcome.
 
         Semantic codes: 0 healthy, 1 config error, 2 runtime error.
         Does **not** detect a dead webserver. See snap-constraints
@@ -313,9 +325,365 @@ class Pihole:
             check=False,
             operation=f"running `{PIHOLE_CMD} snap-check`",
         )
-        return completed.returncode
+        output = completed.stdout.strip()
+        match completed.returncode:
+            case 0:
+                return SnapCheckOk()
+            case 1:
+                return SnapCheckConfigError(output=output)
+            case 2:
+                return SnapCheckRuntimeError(output=output)
+            case _:
+                raise PiholeError(
+                    operation=f"running `{PIHOLE_CMD} snap-check`",
+                    expected="exit code 0, 1, or 2",
+                    actual=f"unexpected exit code {completed.returncode}",
+                    remedy="check the snap-check source for new exit codes",
+                )
+
+    def connected_plugs(self) -> frozenset[str]:
+        """Return the set of snap plugs currently connected.
+
+        Parses ``snap connections`` output. An empty set when the
+        command cannot be run or exits non-zero — meaning no
+        diagnostic runs and the pure core treats every plug as
+        disconnected, which is the safe direction because connecting
+        is idempotent. Total by contract: a fact never raises.
+        """
+        try:
+            completed = self._run(
+                ["snap", "connections", SNAP_NAME],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as err:
+            # Total by contract: a fact must never raise (the status
+            # handler calls it outside any try, and an action hook
+            # that raised would error the unit — the failure mode that
+            # costs the machine its DNS). The empty set is the safe
+            # direction; if snapd is truly broken, the apply path
+            # surfaces the real error when it tries to connect.
+            logger.warning("could not read connected plugs: %s", err)
+            return frozenset()
+
+        if completed.returncode != 0:
+            return frozenset()
+
+        connected: set[str] = set()
+        for line in completed.stdout.splitlines():
+            # A connected row is (interface, snap:plug, slot, notes);
+            # a disconnected row is (interface, snap:plug, "-", "-") —
+            # the SAME four columns, so the Slot column is the only
+            # thing that distinguishes them. Verified against real
+            # output: the parser that counted columns instead counted
+            # every disconnected plug as connected, which silenced
+            # ConnectPlugs entirely.
+            stripped = line.strip()
+            if not stripped or stripped.startswith("Interface"):
+                continue
+            parts = stripped.split()
+            if len(parts) >= 3 and parts[1].startswith(f"{SNAP_NAME}:") and parts[2] != "-":
+                connected.add(parts[1].split(":", 1)[1])
+        return frozenset(connected)
 
     # -- Effects. Each one verifies the state it was meant to produce. -
+    def connect_plugs(self, plugs: Sequence[str]) -> None:
+        """Connect the named snap plugs, and verify they are connected.
+
+        ``snap connect`` is idempotent — reconnecting a connected
+        plug is a no-op — so this is safe on every reconcile. Every
+        plug is read back via ``connected_plugs()``; an exit code is
+        never evidence (rule 6).
+
+        Raises:
+            PiholeError: A plug could not be connected or did not
+                appear as connected afterwards.
+        """
+        connected_before = self.connected_plugs()
+        for plug in plugs:
+            if plug in connected_before:
+                logger.debug("Plug %s already connected; skipping.", plug)
+                continue
+            operation = f"connecting {SNAP_NAME}:{plug}"
+            try:
+                self._run(
+                    ["snap", "connect", f"{SNAP_NAME}:{plug}"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except (subprocess.CalledProcessError, OSError) as err:
+                raise PiholeError(
+                    operation=operation,
+                    expected="the plug to be connected",
+                    actual=f"snap connect failed: {err}",
+                    remedy=f"run `snap connect {SNAP_NAME}:{plug}` on the machine as root",
+                ) from err
+        after = self.connected_plugs()
+        missing = [p for p in plugs if p not in after]
+        if missing:
+            raise PiholeError(
+                operation=f"connecting plugs for {SNAP_NAME}",
+                expected=f"all requested plugs ({', '.join(plugs)}) to be connected",
+                actual=f"still disconnected: {', '.join(missing)}",
+                remedy=f"run `snap connections {SNAP_NAME}` on the machine to inspect",
+            )
+
+    def _validate_gravity_schedule(self, schedule: str) -> None:
+        """Validate an OnCalendar expression with systemd-analyze.
+
+        Runs ``systemd-analyze calendar <schedule>`` — non-zero exit
+        means the expression is invalid, and the error names the
+        config option the operator must correct.
+
+        Raises:
+            PiholeError: The expression is invalid, or the command
+                could not be run.
+        """
+        operation = "validating the gravity schedule"
+        try:
+            completed = self._run(
+                ["systemd-analyze", "calendar", schedule],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as err:
+            raise PiholeError(
+                operation=operation,
+                expected="systemd-analyze to validate the expression",
+                actual=f"the command could not be run: {err}",
+                remedy="check that systemd is running on this machine",
+            ) from err
+        if completed.returncode != 0:
+            error_line = completed.stderr.strip() or completed.stdout.strip() or "(no output)"
+            raise PiholeError(
+                operation=operation,
+                expected="a valid systemd OnCalendar expression",
+                actual=error_line,
+                remedy=(
+                    "`gravity-schedule` is not a valid systemd OnCalendar expression; "
+                    "correct it with `juju config`"
+                ),
+            )
+
+    def _drop_in_paths(self) -> str | None:
+        """Return the DropInPaths of the gravity timer unit.
+
+        Uses ``systemctl show -p DropInPaths --value`` — the only
+        honest signal that our override is loaded, since the snap's
+        own randomized default arms the timer regardless and
+        TimersCalendar proves nothing about ours.
+
+        Raises:
+            PiholeError: The systemctl command could not be run.
+        """
+        try:
+            completed = self._run(
+                ["systemctl", "show", GRAVITY_TIMER_UNIT, "-p", "DropInPaths", "--value"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as err:
+            raise PiholeError(
+                operation=f"reading the {GRAVITY_TIMER_UNIT} DropInPaths",
+                expected="`systemctl show` to describe them",
+                actual=f"the command could not be run: {err}",
+                remedy="check that systemd is running on this machine",
+            ) from err
+        if completed.returncode != 0:
+            return None
+        return completed.stdout.strip() or None
+
+    def gravity_schedule(self) -> str | None:
+        """Return the schedule OUR drop-in imposes, or None if absent.
+
+        This is deliberately not the effective ``OnCalendar``: the snap
+        ships its own randomized default (observed ``Sun *-*-* 03:51``,
+        drawn from a 03:00-05:00 window), so the effective value is
+        never None — and a fact that reported it would make an
+        unmanaged intent plan a removal on every reconcile, forever.
+        The fact is "what did WE write"; the effective schedule is
+        what ``write_gravity_timer`` reads back after writing.
+
+        Total by contract: a fact never raises — the same reasoning
+        as ``connected_plugs``, stated inline at the ``OSError`` arm.
+        """
+        drop_in = self._gravity_timer_drop_in
+        try:
+            content = drop_in.read_text()
+        except FileNotFoundError:
+            return None
+        except OSError as err:
+            # Total by contract — same reasoning as connected_plugs:
+            # None is the safe direction (a set intent rewrites the
+            # unreadable drop-in on the next reconcile).
+            logger.warning("could not read the gravity timer drop-in: %s", err)
+            return None
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("OnCalendar=") and stripped != "OnCalendar=":
+                return stripped.removeprefix("OnCalendar=")
+        return None
+
+    def write_gravity_timer(self, schedule: str) -> None:
+        """Write the host systemd drop-in overriding the gravity timer.
+
+        The expression is validated with ``systemd-analyze calendar``
+        before anything is written, so an invalid expression is caught
+        early with a message naming the config option. ``OnCalendar=``
+        is cleared before the new value is set because systemd drop-ins
+        append otherwise, which would leave both the old and new
+        schedules in effect. ``daemon_reload()`` is called afterwards
+        so systemd picks up the change. The drop-in is then verified
+        by reading ``systemctl show -p DropInPaths --value`` — the
+        only honest signal that our override is loaded, since the
+        snap's own randomized default arms the timer regardless.
+
+        Raises:
+            PiholeError: The expression is invalid, the drop-in could
+                not be written, systemd refused to reload, or the
+                drop-in path is absent from the unit's DropInPaths.
+        """
+        # Validate the expression before touching the filesystem.
+        self._validate_gravity_schedule(schedule)
+
+        drop_in = self._gravity_timer_drop_in
+        drop_in_content = f"[Timer]\nOnCalendar=\nOnCalendar={schedule}\n"
+        operation = f"writing the gravity timer drop-in at {drop_in}"
+        try:
+            drop_in.parent.mkdir(parents=True, exist_ok=True)
+            drop_in.write_text(drop_in_content, encoding="utf-8")
+        except OSError as err:
+            raise PiholeError(
+                operation=operation,
+                expected="the drop-in to be on disk",
+                actual=f"the write failed: {err}",
+                remedy=f"check permissions and free space on {drop_in.parent}",
+            ) from err
+        if drop_in.read_text(encoding="utf-8") != drop_in_content:
+            raise PiholeError(
+                operation=operation,
+                expected="the drop-in to contain the desired schedule",
+                actual="the file does not match after the write",
+                remedy=f"check permissions on {drop_in}",
+            )
+
+        # daemon_reload() so systemd sees the new drop-in.
+        try:
+            systemd.daemon_reload()
+        except systemd.SystemdError as err:
+            raise PiholeError(
+                operation="reloading systemd after writing the gravity timer drop-in",
+                expected="daemon-reload to succeed",
+                actual=f"it failed: {err}",
+                remedy="check `systemctl status` on the machine",
+            ) from err
+
+        # Read back that OUR drop-in is armed — DropInPaths is the
+        # discriminator that our override is loaded, not TimersCalendar
+        # (the snap's randomized default arms the timer regardless, so
+        # TimersCalendar proves nothing about ours).
+        drop_in_paths = self._drop_in_paths()
+        if drop_in_paths is None or str(drop_in) not in drop_in_paths:
+            raise PiholeError(
+                operation=operation,
+                expected=f"the drop-in at {drop_in} to appear in the unit's DropInPaths",
+                actual=(
+                    f"DropInPaths does not contain it: {drop_in_paths!r}"
+                    if drop_in_paths is not None
+                    else "the timer unit could not be read"
+                ),
+                remedy=(
+                    "check `systemctl show "
+                    "snap.pihole-by-rajannpatel.gravity-sync.timer "
+                    "-p DropInPaths`"
+                ),
+            )
+
+    def remove_gravity_timer(self) -> None:
+        """Remove the host systemd drop-in, restoring the snap's timer.
+
+        Idempotent: safe to run when the drop-in does not exist.
+        ``daemon_reload()`` is called afterwards so systemd picks up
+        the change. The file-existence check is the honest verification
+        for a removal — the drop-in is either gone or it is not.
+
+        Raises:
+            PiholeError: The drop-in could not be removed, systemd
+                refused to reload, or the file survived the deletion.
+        """
+        drop_in = self._gravity_timer_drop_in
+        operation = f"removing the gravity timer drop-in at {drop_in}"
+        if not drop_in.exists():
+            logger.debug("No gravity timer drop-in to remove; nothing to do.")
+            return
+        try:
+            drop_in.unlink()
+        except OSError as err:
+            raise PiholeError(
+                operation=operation,
+                expected="the drop-in to be gone",
+                actual=f"the deletion failed: {err}",
+                remedy=f"run `rm -f {drop_in}` on the machine",
+            ) from err
+        if drop_in.exists():
+            raise PiholeError(
+                operation=operation,
+                expected="the drop-in to be gone",
+                actual="it is still on disk",
+                remedy=f"run `rm -f {drop_in}` on the machine",
+            )
+        try:
+            systemd.daemon_reload()
+        except systemd.SystemdError as err:
+            raise PiholeError(
+                operation="reloading systemd after removing the gravity timer drop-in",
+                expected="daemon-reload to succeed",
+                actual=f"it failed: {err}",
+                remedy="check `systemctl status` on the machine",
+            ) from err
+        logger.info("Removed the gravity timer drop-in at %s.", drop_in)
+
+    def update_gravity(self, *, force: bool = False) -> None:
+        """Run the full gravity update with ``pihole -g``.
+
+        When ``force`` is True, ``--force`` is passed so gravity.sh
+        deletes the list cache before downloading, which forces a
+        full re-download of all blocklists. Verified from upstream:
+        ``gravity.sh`` accepts ``-f``/``--force``, which does
+        ``rm "${listsCacheDir}/list.*"`` before downloading.
+
+        Raises:
+            PiholeError: The command could not be run, or ``pihole -g``
+                exited non-zero — its exit code and the tail of its
+                output travel inside the error, because the output is
+                what says *why* a download failed, and a raw
+                ``CalledProcessError`` stringifies without it.
+        """
+        args: list[str] = []
+        if force:
+            args.append("--force")
+        try:
+            self._run_pihole("-g", *args, check=True, operation="running `pihole -g`")
+        except subprocess.CalledProcessError as err:
+            # Chained, unlike set_password: this argv carries no
+            # secret. The output can be hundreds of lines of per-list
+            # progress, so only its tail travels.
+            output = (err.stderr or err.stdout or "").strip()
+            tail = "\n".join(output.splitlines()[-5:]) or "(no output)"
+            raise PiholeError(
+                operation="updating gravity",
+                expected="`pihole -g` to complete",
+                actual=f"exit {err.returncode}; last output:\n{tail}",
+                remedy=(
+                    "check the output above — a failed download is"
+                    " usually the network or an unreachable list"
+                ),
+            ) from err
+        logger.info("Gravity update completed (force=%s).", force)
 
     def _ensure_installed(self, revision: str) -> None:
         """Ask snapd for the snap at the pinned revision.
@@ -446,6 +814,35 @@ class Pihole:
                 ),
             )
         logger.info("Started %s.%s (enable=%s).", SNAP_NAME, FTL_SERVICE, enable)
+
+    def restart(self) -> None:
+        """Restart the FTL daemon, and verify it is active afterwards.
+
+        ``Snap.start`` on an active service is a no-op, so plug-drift
+        recovery needs a genuine restart — the capability warnings
+        clear only after one. See snap-constraints section 3.
+
+        Raises:
+            PiholeError: snapd refused the restart, or accepted it and
+                the service is still not active afterwards.
+        """
+        with _converting_snapd_failure(
+            operation=f"restarting {SNAP_NAME}.{FTL_SERVICE}",
+            remedy=f"check `snap logs {SNAP_NAME}.{FTL_SERVICE}` on the machine",
+        ):
+            self._require_snap().restart([FTL_SERVICE])
+        status = self.ftl_status()
+        if not status.active:
+            raise PiholeError(
+                operation=f"restarting {SNAP_NAME}.{FTL_SERVICE}",
+                expected="an active service",
+                actual="snapd reports it as inactive",
+                remedy=(
+                    "port 53 is the usual cause; check "
+                    f"`snap logs {SNAP_NAME}.{FTL_SERVICE}` for EADDRINUSE"
+                ),
+            )
+        logger.info("Restarted %s.%s.", SNAP_NAME, FTL_SERVICE)
 
     def set_ntp_server(self, *, active: bool) -> None:
         """Set both `ftl.ntp.*.active` keys, and verify the TOML.
@@ -674,9 +1071,10 @@ class Pihole:
 
         Raises:
             PiholeError: The command could not be executed.
-            subprocess.CalledProcessError: Passed through untouched
-                when `check` is set, because the caller knows what a
-                non-zero exit means and what it may quote from it.
+            subprocess.CalledProcessError: Propagates when `check` is
+                set. Every caller converts it itself — `set_password`
+                because the plaintext must not leak into a message,
+                `update_gravity` to carry the output to the operator.
         """
         try:
             return self._run(

@@ -52,7 +52,7 @@ its read-only `logs` content slot — and host metrics.
 **[`charm.py`](../src/charm.py)** — Observes events and nothing more. Every
 deferrable event routes to one `_reconcile`; only events that **cannot be
 deferred** get a handler of their own (`collect_unit_status`, `remove`, and the
-two actions). It holds `_apply`, which is deliberately stupid: one `match`, one
+actions). It holds `_apply`, which is deliberately stupid: one `match`, one
 effect per branch, and `assert_never` so that a new outcome fails
 `tox -e static` instead of being skipped in silence. **The only module that
 imports `ops`.**
@@ -80,7 +80,7 @@ mechanisms that lie in two different ways ([ADR-0009](adr/0009-ftl-api-client-mo
 toward a working Pi-hole, it is what you do when there will not be one.
 
 **[`pihole_config.py`](../src/pihole_config.py)** — The pydantic model of the
-five config options. Imports pydantic and stdlib, nothing else.
+config options. Imports pydantic and stdlib, nothing else.
 
 ## The boundary that makes it work
 

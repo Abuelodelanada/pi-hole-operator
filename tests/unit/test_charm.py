@@ -43,8 +43,12 @@ EFFECTS = frozenset(
         "set_ntp_server",
         "set_password",
         "start",
+        "restart",
         "await_api",
         "apply_ftl_config",
+        "connect_plugs",
+        "write_gravity_timer",
+        "remove_gravity_timer",
     }
 )
 """The mutating calls, so a call log can exclude the fact reads."""
@@ -192,6 +196,7 @@ def test_a_fresh_machine_is_installed_started_and_gated(
     assert effects == [
         "install",
         "hold_refresh",
+        "connect_plugs",
         "set_ntp_server",
         "set_password",
         "start",
@@ -241,6 +246,7 @@ def test_the_snap_is_fetched_before_the_host_loses_its_resolver(
         "pihole.install",
         "pihole.hold_refresh",
         "resolved.disable_stub_listener",
+        "pihole.connect_plugs",
         "pihole.set_ntp_server",
         "pihole.set_password",
         "pihole.start",
@@ -281,6 +287,9 @@ def test_an_uninstalled_machine_is_maintenance_not_active(
     assert state_out.unit_status == testing.MaintenanceStatus(
         f"installing the {pihole.SNAP_NAME} snap"
     )
+    # AND snap-check is never run — the snap is not installed, so the
+    # diagnostic cannot run and the status path returns early
+    absent_snap.snap_check.assert_not_called()
 
 
 def test_the_unit_passes_through_maintenance_before_active(
@@ -862,3 +871,404 @@ def test_cos_agent_databag_publication(
     assert "metrics_alert_rules" in config
     assert "metrics_scrape_jobs" in config
     assert config["log_slots"] == ["pihole-by-rajannpatel:logs"]
+
+
+# -- Stage 3: actions. -------------------------------------------------
+
+
+def test_snap_check_action_returns_the_diagnostic(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a snap-check that reports healthy
+    mock_pihole.snap_check.return_value = pihole_state.SnapCheckOk()
+
+    # WHEN the action runs
+    ctx.run(ctx.on.action("snap-check"), base_state)
+
+    # THEN the exit code and output are returned verbatim
+    assert ctx.action_results == {"exit-code": "0", "output": "all checks passed"}
+
+
+def test_snap_check_action_exit_1(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN snap-check exit 1 (config error)
+    mock_pihole.snap_check.return_value = pihole_state.SnapCheckConfigError(
+        output="plug disconnected"
+    )
+
+    # WHEN the action runs
+    ctx.run(ctx.on.action("snap-check"), base_state)
+
+    # THEN the exit code and output are returned
+    assert ctx.action_results == {"exit-code": "1", "output": "plug disconnected"}
+
+
+def test_snap_check_action_exit_2(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN snap-check exit 2 (runtime error)
+    mock_pihole.snap_check.return_value = pihole_state.SnapCheckRuntimeError(
+        output="port conflict"
+    )
+
+    # WHEN the action runs
+    ctx.run(ctx.on.action("snap-check"), base_state)
+
+    # THEN the exit code and output are returned
+    assert ctx.action_results == {"exit-code": "2", "output": "port conflict"}
+
+
+def test_snap_check_action_on_failure(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN snap-check that cannot be run
+    mock_pihole.snap_check.side_effect = pihole.PiholeError(
+        operation="running snap-check",
+        expected="it to run",
+        actual="could not execute",
+    )
+
+    # WHEN the action runs
+    # THEN the failure propagates
+    with pytest.raises(testing.ActionFailed) as exc_info:
+        ctx.run(ctx.on.action("snap-check"), base_state)
+    assert "could not execute" in exc_info.value.message
+
+
+def test_update_gravity_action_runs_pihole_g(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a converged unit
+    # WHEN update-gravity runs without force
+    ctx.run(ctx.on.action("update-gravity"), base_state)
+
+    # THEN the workload is called without --force
+    mock_pihole.update_gravity.assert_called_once_with(force=False)
+    assert ctx.action_results == {"result": "gravity update completed"}
+
+
+def test_update_gravity_action_with_force(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a converged unit
+    # WHEN update-gravity runs with force=true
+    ctx.run(ctx.on.action("update-gravity", params={"force": True}), base_state)
+
+    # THEN --force is passed
+    mock_pihole.update_gravity.assert_called_once_with(force=True)
+
+
+def test_update_gravity_action_on_failure(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a gravity update that fails
+    # The workload converts its own failures — the shell never sees a
+    # raw subprocess exception (rule 2)
+    mock_pihole.update_gravity.side_effect = pihole.PiholeError(
+        operation="updating gravity",
+        expected="`pihole -g` to complete",
+        actual="exit 1; last output:\nUsage: pihole [options]",
+        remedy="check the output above",
+    )
+
+    # WHEN the action runs
+    # THEN it fails cleanly
+    with pytest.raises(testing.ActionFailed) as exc_info:
+        ctx.run(ctx.on.action("update-gravity"), base_state)
+    assert "gravity update failed" in exc_info.value.message
+
+
+def test_free_port_53_action_re_runs_the_procedure(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a converged unit where port 53 is free — snap-check reports
+    # healthy after the resolved procedure
+    mock_pihole.snap_check.return_value = pihole_state.SnapCheckOk()
+
+    # WHEN free-port-53 runs
+    ctx.run(ctx.on.action("free-port-53"), base_state)
+
+    # THEN the idempotent procedure runs
+    mock_resolved.disable_stub_listener.assert_called_once_with()
+    assert ctx.action_results == {"result": "port 53 has been freed for Pi-hole"}
+
+
+def test_free_port_53_action_reports_if_still_not_free(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN port 53 that stayed occupied after the procedure —
+    # snap-check reports exit 2 with the real conflict in its output
+    mock_pihole.snap_check.return_value = pihole_state.SnapCheckRuntimeError(
+        output="port 53 is in use by another process"
+    )
+
+    # WHEN free-port-53 runs
+    # THEN it fails carrying snap-check's output so the operator sees
+    # what actually holds the port
+    with pytest.raises(testing.ActionFailed) as exc_info:
+        ctx.run(ctx.on.action("free-port-53"), base_state)
+    assert "still not free" in exc_info.value.message
+    assert "port 53 is in use" in exc_info.value.message
+
+
+# -- Stage 3: snap-check in the status path. ---------------------------
+
+
+def test_snap_check_exit_0_contributes_to_active(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN snap-check that reports healthy
+    mock_pihole.snap_check.return_value = pihole_state.SnapCheckOk()
+
+    # WHEN the status is collected
+    state_out = ctx.run(ctx.on.update_status(), base_state)
+
+    # THEN the unit is Active
+    assert state_out.unit_status == testing.ActiveStatus()
+
+
+def test_a_charm_authored_blocked_wins_the_precedence_tie(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    """The machine status is added before any snap-check status.
+
+    ops resolves equal-priority statuses by first-added. This is the
+    one configuration where the order is observable — a charm-authored
+    Blocked (password unset) AND a snap-check Blocked (exit 1) — and
+    the charm's message must win: it is the one that names the action.
+    Reverting the two statements that establish the order reds this.
+    """
+    # GIVEN the security condition the charm most wants to report,
+    # AND a snap-check that also fails
+    mock_pihole.api_facts.return_value = api_facts(pihole_state.PasswordUnset())
+    mock_pihole.snap_check.return_value = pihole_state.SnapCheckConfigError(
+        output=(
+            "Pi-hole System Diagnostics\n\n"
+            "[FAIL] Web API has no password but is network-reachable\n"
+        )
+    )
+
+    # WHEN the status is collected
+    state_out = ctx.run(ctx.on.update_status(), base_state)
+
+    # THEN the charm's own message wins the tie — never the
+    # diagnostic's
+    assert isinstance(state_out.unit_status, testing.BlockedStatus)
+    assert "unauthenticated writes" in state_out.unit_status.message
+    assert "rotate-admin-password" in state_out.unit_status.message
+
+
+def test_snap_check_exit_1_is_blocked_with_its_output(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN snap-check exit 1, in the real output shape: the first
+    # line is unconditionally the banner, the failure lives in a
+    # [FAIL] line further down (a single-line fixture made the old
+    # first-line extraction indistinguishable from any other)
+    mock_pihole.snap_check.return_value = pihole_state.SnapCheckConfigError(
+        output=(
+            "Pi-hole System Diagnostics\n\n"
+            "--- INTERFACES ---\n\n"
+            "[FAIL] network-bind (Disconnected)\n"
+            "Remediation: Run the following command on your host:\n\n"
+            "sudo snap connect pihole-by-rajannpatel:network-bind\n"
+        )
+    )
+
+    # WHEN the status is collected
+    state_out = ctx.run(ctx.on.update_status(), base_state)
+
+    # THEN the unit is Blocked carrying the [FAIL] line — never the
+    # banner — plus the charm's remedy
+    assert isinstance(state_out.unit_status, testing.BlockedStatus)
+    assert "[FAIL] network-bind" in state_out.unit_status.message
+    assert "snap-check action" in state_out.unit_status.message
+    assert "Pi-hole System Diagnostics" not in state_out.unit_status.message
+
+
+def test_snap_check_exit_2_names_the_free_port_action(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN snap-check exit 2 (runtime error: port conflict)
+    mock_pihole.snap_check.return_value = pihole_state.SnapCheckRuntimeError(
+        output="port 53 conflict"
+    )
+
+    # WHEN the status is collected
+    state_out = ctx.run(ctx.on.update_status(), base_state)
+
+    # THEN the unit is Blocked naming the free-port-53 action as remedy,
+    # and carrying snap-check's output so the operator sees the conflict
+    assert isinstance(state_out.unit_status, testing.BlockedStatus)
+    assert "free-port-53" in state_out.unit_status.message
+    assert "port 53 conflict" in state_out.unit_status.message
+
+
+# -- Stage 3: WriteGravityTimer in the reconcile path. -----------------
+
+
+def test_write_gravity_timer_with_schedule_flows_to_workload(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a machine with no gravity schedule but intent that sets one
+    state_in = dataclasses.replace(base_state, config={"gravity-schedule": "Sun *-*-* 03:00"})
+
+    # WHEN the config-changed event fires
+    ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the workload module's write_gravity_timer is called with the
+    # schedule from intent
+    mock_pihole.write_gravity_timer.assert_called_once_with("Sun *-*-* 03:00")
+
+
+def test_unsetting_the_schedule_flows_to_the_removal(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    """The removal direction of the timer drift, through apply.
+
+    Covers the `RemoveGravityTimer` branch — dead code until the core
+    learned to emit the removal; the bug was found while covering the
+    error paths.
+    """
+    # GIVEN a machine whose drop-in is active (the fact says so) and an
+    # intent that no longer manages the schedule
+    mock_pihole.gravity_schedule.return_value = "Sun *-*-* 04:00"
+    state_in = dataclasses.replace(base_state, config={"gravity-schedule": ""})
+
+    # WHEN the config-changed event fires
+    ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the workload module's remove_gravity_timer is called — the
+    # stale override does not outlive the config that created it
+    mock_pihole.remove_gravity_timer.assert_called_once_with()
+
+
+def test_gravity_schedule_in_bootstrap_flows_to_workload(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    absent_snap: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a fresh machine with gravity-schedule set in config
+    state_in = dataclasses.replace(base_state, config={"gravity-schedule": "Sun *-*-* 03:00"})
+
+    # WHEN the install hook fires
+    ctx.run(ctx.on.install(), state_in)
+
+    # THEN write_gravity_timer is called as part of the bootstrap
+    absent_snap.write_gravity_timer.assert_called_once_with("Sun *-*-* 03:00")
+
+
+# -- Stage 3: free-port-53 action ResolvedError path. ------------------
+
+
+def test_free_port_53_action_on_resolved_error(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a machine where the resolved procedure itself raises
+    mock_resolved.disable_stub_listener.side_effect = resolved.ResolvedError(
+        operation="disabling the stub listener",
+        expected="the drop-in to be written",
+        actual="the write failed",
+        remedy="check permissions on /etc/systemd",
+    )
+
+    # WHEN free-port-53 runs
+    # THEN the action fails with the error
+    with pytest.raises(testing.ActionFailed) as exc_info:
+        ctx.run(ctx.on.action("free-port-53"), base_state)
+    assert "the write failed" in exc_info.value.message
+
+
+def test_free_port_53_action_on_snap_check_error(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a machine where snap-check cannot run after the procedure
+    mock_pihole.snap_check.side_effect = pihole.PiholeError(
+        operation="running snap-check",
+        expected="it to run",
+        actual="could not execute",
+    )
+
+    # WHEN free-port-53 runs
+    # THEN the action fails with the PiholeError
+    with pytest.raises(testing.ActionFailed) as exc_info:
+        ctx.run(ctx.on.action("free-port-53"), base_state)
+    assert "could not execute" in exc_info.value.message
+
+
+# -- Stage 3: RestartFtl on plug drift. ----------------------------
+
+
+def test_plug_drift_restarts_ftl(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a converged machine where FTL is active but one required
+    # plug is disconnected — the drift path that triggers RestartFtl
+    mock_pihole.connected_plugs.return_value = frozenset(
+        {"system-observe", "hardware-observe", "mount-observe"}
+    )
+
+    # WHEN the reconciler runs
+    ctx.run(ctx.on.update_status(), base_state)
+
+    # THEN plugs are connected AND FTL is restarted — not started, since
+    # it was already running. StartFtl on an active service is a no-op.
+    mock_pihole.connect_plugs.assert_called_once()
+    mock_pihole.restart.assert_called_once()
+    mock_pihole.start.assert_not_called()
