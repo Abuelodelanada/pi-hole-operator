@@ -608,6 +608,10 @@ class FtlApi:
 
 def _decode(raw: bytes) -> Mapping[str, object]:
     """Parse a JSON object, tolerating anything that is not one."""
+    if not raw.strip():
+        # 204 No Content — e.g. DELETE /api/auth on logout — is a
+        # legitimate empty body, not a broken webserver.
+        return {}
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError) as err:

@@ -7,6 +7,7 @@ semantics that most need a regression test. See ADR-0009 section 4.
 """
 
 import http.client
+import logging
 import pathlib
 import urllib.error
 import urllib.request
@@ -257,6 +258,31 @@ def test_a_reply_that_is_not_json_is_not_mistaken_for_a_state(
     # WHEN readiness is checked
     # THEN the unparseable body is not read as a blocking state
     assert ftl.ready() is False
+
+
+def test_a_204_logout_is_not_logged_as_a_broken_webserver(
+    ftl: ftl_api.FtlApi,
+    snap_data: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    # GIVEN a ready API whose logout answers 204 No Content
+    write_cli_pw(snap_data, CLI_PW)
+    api(
+        monkeypatch,
+        {
+            **AUTH_OK,
+            **LOGOUT_OK,
+            "GET dns/blocking": FakeResponse(200, {"blocking": "enabled", "timer": None}),
+        },
+    )
+
+    # WHEN readiness is checked, which logs out at the end
+    with caplog.at_level(logging.DEBUG):
+        assert ftl.ready() is True
+
+    # THEN the empty logout body is not mistaken for a broken webserver
+    assert "not JSON" not in caplog.text
 
 
 @pytest.mark.parametrize(

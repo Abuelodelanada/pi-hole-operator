@@ -419,6 +419,10 @@ class FakeResponse:
 
     def read(self) -> bytes:
         """Return the body as bytes, as `urlopen` would."""
+        if self.status == 204:
+            # 204 No Content has no body — a real FTL logout answers
+            # empty, and the client must not mistake that for JSON.
+            return b""
         return json.dumps(self.payload).encode("utf-8")
 
 
