@@ -1272,3 +1272,330 @@ def test_plug_drift_restarts_ftl(
     mock_pihole.connect_plugs.assert_called_once()
     mock_pihole.restart.assert_called_once()
     mock_pihole.start.assert_not_called()
+
+
+# -- Stage 7.b: DHCP unservable gate. ----------------------------------
+
+
+def test_dhcp_enabled_unservable_blocks_and_still_converges(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    """Enabled + unservable blocks; non-DHCP convergence still happens.
+
+    The unservable gate must not block the whole reconcile -- that
+    would suppress unrelated convergence such as a password fix.
+    """
+    # GIVEN a machine with no IPv4 address in the pool's subnet, and
+    # blocking disabled so a non-DHCP convergence still happens
+    mock_pihole.machine_ipv4_addresses.return_value = frozenset({"10.0.0.1"})
+    mock_pihole.blocking_enabled.return_value = False
+    state_in = dataclasses.replace(
+        base_state,
+        config={
+            "dhcp-enabled": True,
+            "dns-listening-mode": "ALL",
+            "dhcp-range-start": "192.168.1.10",
+            "dhcp-range-end": "192.168.1.50",
+            "dhcp-router": "192.168.1.1",
+            "dhcp-netmask": "255.255.255.0",
+        },
+    )
+
+    # WHEN the config-changed event fires
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the unit is Blocked with the unservable reason
+    assert isinstance(state_out.unit_status, testing.BlockedStatus)
+    assert "cannot be served" in state_out.unit_status.message
+    assert "192.168.1.10-192.168.1.50/255.255.255.0" in state_out.unit_status.message
+
+    # AND non-DHCP convergence still happened — the reconcile did not
+    # short-circuit
+    mock_pihole.apply_ftl_config.assert_called()
+
+
+def test_dhcp_enabled_servable_reaches_active(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    """Enabled + servable → Active, DHCP config applied."""
+    # GIVEN a machine with an IPv4 address in the pool's subnet and
+    # 67/udp free for FTL to bind
+    mock_pihole.machine_ipv4_addresses.return_value = frozenset({"192.168.1.5"})
+    mock_pihole.port67_free.return_value = True
+    state_in = dataclasses.replace(
+        base_state,
+        config={
+            "dhcp-enabled": True,
+            "dns-listening-mode": "ALL",
+            "dhcp-range-start": "192.168.1.10",
+            "dhcp-range-end": "192.168.1.50",
+            "dhcp-router": "192.168.1.1",
+            "dhcp-netmask": "255.255.255.0",
+        },
+    )
+
+    # WHEN the config-changed event fires
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the unit is Active
+    assert state_out.unit_status == testing.ActiveStatus()
+
+    # AND DHCP config was applied — the pool PATCH before the active
+    # PATCH, the order that crash-loops FTL if reversed
+    configs = [
+        call.kwargs["config"]
+        for call in mock_pihole.apply_ftl_config.call_args_list
+        if "dhcp.start" in call.kwargs["config"] or "dhcp.active" in call.kwargs["config"]
+    ]
+    assert configs, "DHCP config was not applied"
+    assert "dhcp.start" in configs[0] and "dhcp.active" not in configs[0], (
+        "the pool PATCH must come before the active PATCH"
+    )
+    assert "dhcp.active" in configs[-1]
+
+    # AND the enable was verified by the bounded bind wait — the PATCH
+    # lands in pihole.toml before FTL binds 67, so the wait closes the
+    # window in which a status collection would Block on a self-clearing
+    # gate (ADR-0006 §2.9)
+    mock_pihole.wait_for_dhcp_bind.assert_called_once()
+
+
+def test_unservable_dhcp_is_reblocked_after_an_action(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    """An action must not clear the unservable Blocked.
+
+    Actions run collect_unit_status without a reconcile, so the pushed
+    failure from the last reconcile is gone (ADR-0005 §2.4); the status
+    handler re-derives the gate from validated config + state.
+    """
+    # GIVEN DHCP enabled with a pool no machine address matches
+    mock_pihole.machine_ipv4_addresses.return_value = frozenset({"10.0.0.1"})
+    mock_pihole.snap_check.return_value = pihole_state.SnapCheckOk()
+    state_in = dataclasses.replace(
+        base_state,
+        config={
+            "dhcp-enabled": True,
+            "dns-listening-mode": "ALL",
+            "dhcp-range-start": "192.168.1.10",
+            "dhcp-range-end": "192.168.1.50",
+            "dhcp-router": "192.168.1.1",
+            "dhcp-netmask": "255.255.255.0",
+        },
+    )
+
+    # WHEN an action runs — no reconcile, only collect_unit_status
+    state_out = ctx.run(ctx.on.action("snap-check"), state_in)
+
+    # THEN the unit is still Blocked with the unservable reason
+    assert isinstance(state_out.unit_status, testing.BlockedStatus)
+    assert "cannot be served" in state_out.unit_status.message
+
+
+def test_an_action_with_invalid_dhcp_config_blocks(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    """An action must not clear an invalid-config Blocked.
+
+    `_on_collect_status` loads config with `errors="blocked"` so the
+    DHCP gate can re-derive intent; an action hook therefore aborts on
+    invalid config the same way a config_changed hook does, instead of
+    re-reporting Active over a config ops already rejected.
+    """
+    # GIVEN DHCP enabled without a pool (the cross-field validator
+    # rejects it) and a machine that would otherwise be Active
+    state_in = dataclasses.replace(
+        base_state,
+        config={
+            "dhcp-enabled": True,
+            "dns-listening-mode": "ALL",
+        },
+    )
+
+    # WHEN an action runs — no reconcile, only collect_unit_status
+    state_out = ctx.run(ctx.on.action("snap-check"), state_in)
+
+    # THEN the unit is Blocked by ops itself, naming the config
+    assert isinstance(state_out.unit_status, testing.BlockedStatus)
+    assert "Invalid config" in state_out.unit_status.message
+
+
+def test_dhcp_enabled_port_blocked_blocks(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    """Enabled + 67/udp occupied → Blocked with the port remedy.
+
+    The key landing in pihole.toml is not evidence FTL can serve: an
+    occupied 67 crash-loops the daemon (snap-constraints §4.4), so the
+    enable step is gated on a port probe — rule 6.
+    """
+    # GIVEN DHCP enabled with a servable pool but 67/udp held by
+    # another service
+    mock_pihole.machine_ipv4_addresses.return_value = frozenset({"192.168.1.5"})
+    mock_pihole.port67_free.return_value = False
+    state_in = dataclasses.replace(
+        base_state,
+        config={
+            "dhcp-enabled": True,
+            "dns-listening-mode": "ALL",
+            "dhcp-range-start": "192.168.1.10",
+            "dhcp-range-end": "192.168.1.50",
+            "dhcp-router": "192.168.1.1",
+            "dhcp-netmask": "255.255.255.0",
+        },
+    )
+
+    # WHEN the config-changed event fires
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the unit is Blocked with the port remedy
+    assert isinstance(state_out.unit_status, testing.BlockedStatus)
+    assert "67/udp" in state_out.unit_status.message
+    assert "stop the other service" in state_out.unit_status.message
+
+    # AND no DHCP step reached the workload — enabling would crash-loop
+    for call in mock_pihole.apply_ftl_config.call_args_list:
+        config = call.kwargs["config"]
+        assert "dhcp.active" not in config, f"DHCP was enabled into an occupied port: {config}"
+
+
+def test_both_dhcp_gates_fire_unservable_wins_the_tie(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    """When both gates fire, the unservable reason is the one shown.
+
+    `_on_collect_status` adds the unservable Blocked before the port
+    Blocked, and ops resolves equal-priority statuses by first-added —
+    so the unservable message must win, not the port message.
+    """
+    # GIVEN DHCP enabled with a pool no machine address matches AND
+    # 67/udp held by another service — both gates fire
+    mock_pihole.machine_ipv4_addresses.return_value = frozenset({"10.0.0.1"})
+    mock_pihole.port67_free.return_value = False
+    state_in = dataclasses.replace(
+        base_state,
+        config={
+            "dhcp-enabled": True,
+            "dns-listening-mode": "ALL",
+            "dhcp-range-start": "192.168.1.10",
+            "dhcp-range-end": "192.168.1.50",
+            "dhcp-router": "192.168.1.1",
+            "dhcp-netmask": "255.255.255.0",
+        },
+    )
+
+    # WHEN the config-changed event fires
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the unit is Blocked with the unservable reason, not the
+    # port reason — first-added wins the tie
+    assert isinstance(state_out.unit_status, testing.BlockedStatus)
+    assert "no machine IPv4 address falls inside the pool's subnet" in (
+        state_out.unit_status.message
+    )
+    assert "67/udp" not in state_out.unit_status.message
+
+
+def test_port_gate_blocked_outranks_maintenance(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    """A firing gate is Blocked even while FTL is down.
+
+    `_installed_status` reports Maintenance while FTL is down; the
+    gate's Blocked is added after, and ops resolves blocked >
+    maintenance — so the port conflict is not hidden behind a
+    transient "starting".
+    """
+    # GIVEN DHCP enabled with a servable pool, 67/udp held, and FTL
+    # down (so the machine status alone would be Maintenance)
+    mock_pihole.machine_ipv4_addresses.return_value = frozenset({"192.168.1.5"})
+    mock_pihole.port67_free.return_value = False
+    mock_pihole.ftl_status.return_value = pihole_state.ServiceStatus(enabled=True, active=False)
+    state_in = dataclasses.replace(
+        base_state,
+        config={
+            "dhcp-enabled": True,
+            "dns-listening-mode": "ALL",
+            "dhcp-range-start": "192.168.1.10",
+            "dhcp-range-end": "192.168.1.50",
+            "dhcp-router": "192.168.1.1",
+            "dhcp-netmask": "255.255.255.0",
+        },
+    )
+
+    # WHEN the config-changed event fires
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the unit is Blocked with the port remedy, not Maintenance
+    assert isinstance(state_out.unit_status, testing.BlockedStatus)
+    assert "67/udp" in state_out.unit_status.message
+
+
+def test_port_gate_wins_over_the_startftl_push_failure(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    """A firing port gate outranks the pushed StartFtl failure.
+
+    After a reboot where another service won 67, FTL is down and the
+    reconcile pushes a StartFtl failure naming port 53. The pull gate
+    is evaluated first and first-added wins, so the operator sees the
+    port-67 remedy, not the generic DNS one (ADR-0005 §2.4).
+    """
+    # GIVEN DHCP active in config (persisted across a reboot), FTL
+    # down, 67/udp held by another service, and a StartFtl push that
+    # fails with the generic port-53 remedy
+    mock_pihole.machine_ipv4_addresses.return_value = frozenset({"192.168.1.5"})
+    mock_pihole.port67_free.return_value = False
+    mock_pihole.dhcp_active.return_value = True
+    mock_pihole.ftl_status.return_value = pihole_state.ServiceStatus(enabled=True, active=False)
+    mock_pihole.start.side_effect = pihole.PiholeError(
+        operation="starting pihole-FTL",
+        expected="the daemon to answer DNS",
+        actual="it crash-loops; port 53 is the usual cause",
+        remedy="check `snap logs pihole` for EADDRINUSE",
+    )
+    state_in = dataclasses.replace(
+        base_state,
+        config={
+            "dhcp-enabled": True,
+            "dns-listening-mode": "ALL",
+            "dhcp-range-start": "192.168.1.10",
+            "dhcp-range-end": "192.168.1.50",
+            "dhcp-router": "192.168.1.1",
+            "dhcp-netmask": "255.255.255.0",
+        },
+    )
+
+    # WHEN the config-changed event fires
+    state_out = ctx.run(ctx.on.config_changed(), state_in)
+
+    # THEN the unit is Blocked with the port-67 remedy, not the
+    # pushed port-53 one — the pull gate is read first
+    assert isinstance(state_out.unit_status, testing.BlockedStatus)
+    assert "67/udp" in state_out.unit_status.message
+    assert "stop the other service" in state_out.unit_status.message
+    assert "port 53" not in state_out.unit_status.message

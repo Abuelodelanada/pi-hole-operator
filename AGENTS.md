@@ -8,12 +8,15 @@ This is not a Kubernetes charm. There is no Pebble, no `lightkube`, no OCI image
 ## Where we are
 
 **Stages 1, 2, 3 and 5 are closed** — each with acceptance green on LXD
-and a clean `charm-reviewer` pass (Stage 3's: 2026-09-21, fifth pass). The charm
+and a clean `charm-reviewer` pass (Stage 3's: 2026-09-21, fifth pass).
+**Stage 7's acceptance is green on LXD; its `charm-reviewer` pass is
+clean** (fifth round, 2026-09-22). The charm
 installs the snap **pinned to `SNAP_REVISIONS` and held against
 auto-refresh** (ADR-0010 — the snap never updates itself), frees port 53, starts
 FTL, closes the snap's default NTP server on 123/udp, owns the admin password,
 applies declarative config through `PATCH /api/config` with a read-back against
-`pihole.toml`, and restores the host resolver on removal. `docs/roadmap.md`
+`pihole.toml`, can serve DHCP from the FTL server (Stage 7.b, ADR-0006 §2.9),
+and restores the host resolver on removal. `docs/roadmap.md`
 defines the stages and is the source of truth — check it before treating a
 missing feature as a defect rather than as unstarted work.
 
@@ -21,7 +24,8 @@ The public interface today: the actions (`get-admin-password`,
 `rotate-admin-password`, `snap-check`, `update-gravity`, `free-port-53`)
 and the config options (`upstream-dns`, `dns-listening-mode`,
 `blocking-enabled`, `dnssec-enabled`, `ntp-server-enabled`,
-`gravity-schedule`) declared in `charmcraft.yaml` — this paragraph
+`gravity-schedule`, `dhcp-enabled`, `dhcp-range-start`, `dhcp-range-end`,
+`dhcp-router`, `dhcp-netmask`) declared in `charmcraft.yaml` — this paragraph
 deliberately carries no counts; the YAML is the list. **One optional
 relation** (`cos-agent`, ADR-0008) and **no bindings** —
 `extra-bindings: dns` was withdrawn until something consumes it (BACKLOG). Each option

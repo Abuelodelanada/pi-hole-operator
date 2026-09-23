@@ -176,7 +176,8 @@ stage; everything after it is elaboration.
 **Acceptance**
 
 - [x] All of the above, plus Stage 0's acceptance still holds. (CI on 3.14
-      lands with `.github/`, deliberately deferred.)
+      lands with `.github/` — the workflow runs `lint`, `static`, `unit` on
+      the sole interpreter in the 26.04 archive.)
 - [x] `charm-reviewer` clean (2026-08-25, against the tree that closes this
       stage; the NTP fact is `bool | None` — a future consumer treating it as
       plain `bool` reopens the fail-open hole).
@@ -463,29 +464,48 @@ and would silently collect nothing.
 
 ### 7.a Verify first
 
-1. Does DHCP work end-to-end under strict confinement, on a host with **port 67
-   free**? The observed failure was `EADDRINUSE` from LXD's `lxdbr0` dnsmasq — a
-   port conflict, not an AppArmor denial — but that was never proven.
-2. **Which key naming scheme actually lands in `pihole.toml`?** The wiki documents
-   two mutually exclusive sets. Set both in a scratch VM and read the TOML back.
+1. **DONE 2026-09-22** — DHCP works end-to-end under strict confinement. On a
+   scratch LXD container with port 67 free, `network-control` +
+   `firewall-control` connected, `dns.listeningMode=ALL`, and a pool matching
+   the interface's subnet, FTL bound `0.0.0.0:67` with no AppArmor denial and
+   no crash-loop, and a client on a dedicated LXD bridge (dnsmasq disabled)
+   received a lease from FTL. The earlier `EADDRINUSE` was LXD's host dnsmasq
+   on `lxdbr0:67` — a port conflict, not confinement. Full record:
+   [snap-constraints §4.4](snap-constraints.md).
+2. **DONE 2026-09-22** — the **flat** scheme lands: `ftl.dhcp.start/end/router/
+   netmask` → `[dhcp]` in `pihole.toml`. The nested scheme
+   (`ftl.dhcp.ipv4.range.*`) is **rejected** by the configure hook (exit 1,
+   transaction rolled back). The wiki's two sets are not both right; the snap
+   decides: flat.
+
+Two design consequences for 7.b, from the same spike:
+
+- The serving interface must have an address in the pool's subnet, or FTL logs
+  `no address range available` and clients fall back to link-local.
+- `snap set` cannot move the pool in place (invalid intermediate ranges abort
+  the transaction), but **one `PATCH /api/config` applies the pool atomically**
+  — and the charm applies config through the API (ADR-0004), so 7.b needs no
+  disable/enable dance. The mandatory order still applies to the first enable.
 
 ### 7.b Implementation
 
 - `dhcp-enabled`, `dhcp-range-start`, `dhcp-range-end`, `dhcp-router`,
   `dhcp-netmask`, with cross-field pydantic validation → `Blocked`, never a crash
   loop.
-- **Mandatory ordering in `compute`'s sequence:** pool → router → `dhcp.active`
-  **last**.
-- `network-control` + `firewall-control` connected only when enabled.
-- 67/udp and 546/udp opened only when enabled.
+- **Mandatory ordering in `compute`'s sequence:** one atomic pool PATCH
+  (`dhcp.start/end/router/netmask`) → `dhcp.active` **last**.
+- `network-control` + `firewall-control` connected when enabled; retained after
+  disable by decision — a connected plug is passive, and re-enabling reconnects
+  via drift (ADR-0006 §2.9).
+- 67/udp opened only when enabled; DHCPv6 is never enabled.
 - README warning: two DHCP servers on one broadcast domain assign conflicting
   addresses.
 
 **Acceptance**
 
-- [ ] Ordering asserted on the **pure `compute` output** — no mocks, which is
+- [x] Ordering asserted on the **pure `compute` output** — no mocks, which is
       precisely why the ordering lives in data.
-- [ ] Integration tests gated behind a pytest marker: on LXD port 67 is normally
+- [x] Integration tests gated behind a pytest marker: on LXD port 67 is normally
       taken and an ungated test will crash-loop the daemon.
 
 ---
@@ -518,12 +538,10 @@ here.**
 |---|---|---|---|
 | ~~1~~ | ~~Which mechanism sets an unreachable FTL key?~~ | — | **Resolved 2026-08-07** → [ADR-0004](adr/0004-ftl-configuration-mechanism.md) is Accepted |
 | ~~2~~ | ~~Is `setpassword` cheap enough to run unconditionally?~~ | — | **Resolved 2026-08-07** → [ADR-0007 §4.2](adr/0007-admin-password-handling.md): use the `/api/auth` oracle |
-| 3 | Which DHCP key naming scheme lands in `pihole.toml`? | Stage 7 | [ADR-0006 §2.9](adr/0006-configuration-surface.md) |
-| 4 | Does DHCP work end-to-end under strict confinement with port 67 free? | Stage 7 | [ADR-0006 §2.9](adr/0006-configuration-surface.md) |
+| ~~3~~ | ~~Which DHCP key naming scheme lands in `pihole.toml`?~~ | — | **Resolved 2026-09-22** → flat scheme, [ADR-0006 §2.9](adr/0006-configuration-surface.md) |
+| ~~4~~ | ~~Does DHCP work end-to-end under strict confinement with port 67 free?~~ | — | **Resolved 2026-09-22** → [ADR-0006 §2.9](adr/0006-configuration-surface.md) |
 
-Only the DHCP spikes remain, and both are Stage 7. **Nothing blocks Stages 0–5.**
-Port 67 is free inside an LXD container, so spikes 3 and 4 are cheaper than
-originally assumed.
+All spikes are resolved. **Nothing blocks any stage.**
 
 Non-blocking, tracked in [BACKLOG.md](BACKLOG.md): the `core26` support matrix and
 the `cos_agent` PyPI migration question.

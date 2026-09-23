@@ -10,23 +10,12 @@ import time
 import jubilant
 
 from pihole_state import SNAP_NAME, UNCONDITIONAL_PLUGS
-from tests.integration.conftest import APP_NAME, DEPLOY_TIMEOUT
+from tests.integration.conftest import APP_NAME, DEPLOY_TIMEOUT, settled
 
 FTL_LOG = f"/var/snap/{SNAP_NAME}/common/var/log/pihole/FTL.log"
 PIHOLE_CMD = f"/snap/bin/{SNAP_NAME}.pihole"
 GRAVITY_TIMER_UNIT = f"snap.{SNAP_NAME}.gravity-sync.timer"
 GRAVITY_TIMER_DROP_IN = f"/etc/systemd/system/{GRAVITY_TIMER_UNIT}.d/override.conf"
-
-
-def settled(status: jubilant.Status) -> bool:
-    """Both the workload and the agent are done.
-
-    ``all_active`` alone gates on *workload* status, which stays
-    ``active`` for the whole reconcile — with ``successes=3`` at one
-    second that window can close before the hook even starts, and the
-    assertions then race the charm.
-    """
-    return jubilant.all_active(status) and jubilant.all_agents_idle(status)
 
 
 # -- Plugs. ------------------------------------------------------------

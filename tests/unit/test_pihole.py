@@ -12,6 +12,7 @@ patched, which is what makes "a workload that lies" expressible at all.
 
 import inspect
 import pathlib
+import socket
 import subprocess
 import urllib.error
 from collections.abc import Callable, Sequence
@@ -21,6 +22,7 @@ import tenacity
 from charmlibs import snap, systemd
 
 import pihole
+import pihole_state
 import resolved
 from pihole_state import (
     SNAP_REVISIONS,
@@ -44,6 +46,7 @@ from tests.unit.conftest import (
     SID,
     VERSION,
     FakeCache,
+    FakeClock,
     FakeResponse,
     FakeRunner,
     FakeSnap,
@@ -170,6 +173,266 @@ def test_snap_check_returns_its_exit_code_verbatim(
     assert isinstance(result, SnapCheckRuntimeError)
     assert result.output == ""
     assert runner.calls == [[pihole.PIHOLE_CMD, "snap-check"]]
+
+
+# -- Stage 7.b: DHCP facts. --------------------------------------------
+
+
+def test_dhcp_active_reads_true(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+):
+    """Whether dhcp.active is true in pihole.toml."""
+    # GIVEN a pihole.toml with dhcp.active = true
+    write_pihole_toml(snap_data, dhcp_active=True)
+
+    # WHEN the fact is read
+    # THEN it is True
+    assert workload.dhcp_active() is True
+
+
+def test_dhcp_active_reads_false(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+):
+    """dhcp_active reads false when dhcp.active is false."""
+    write_pihole_toml(snap_data, dhcp_active=False)
+    assert workload.dhcp_active() is False
+
+
+def test_dhcp_active_absent_is_none(
+    workload: pihole.Pihole,
+):
+    """dhcp_active returns None when the key is absent."""
+    assert workload.dhcp_active() is None
+
+
+def test_dhcp_pool_returns_dhcppool_when_all_four_present(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+):
+    """dhcp_pool returns a DhcpPool when all four keys are present."""
+    pool = pihole_state.DhcpPool(
+        start="192.168.1.10", end="192.168.1.50", router="192.168.1.1", netmask="255.255.255.0"
+    )
+    write_pihole_toml(snap_data, dhcp_pool=pool)
+
+    result = workload.dhcp_pool()
+    assert result == pool
+
+
+def test_dhcp_pool_returns_none_when_any_key_missing(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+):
+    """dhcp_pool returns None when any of the four keys is absent."""
+    # GIVEN a pihole.toml with only dhcp.active, no pool keys
+    write_pihole_toml(snap_data, dhcp_active=True)
+
+    # WHEN the fact is read
+    # THEN it is None — a partial pool is no pool
+    assert workload.dhcp_pool() is None
+
+
+def test_machine_ipv4_addresses_parses_ip_output(
+    snap_data: pathlib.Path,
+    drop_in: pathlib.Path,
+):
+    """machine_ipv4_addresses parses `ip -4 -o addr show` output."""
+    # GIVEN a scripted ip output with a loopback line and two real
+    # interfaces
+    ip_output = (
+        "1: lo    inet 127.0.0.1/8 scope host lo\\       "
+        "valid_lft forever preferred_lft forever\n"
+        "2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0\\       "
+        "valid_lft forever preferred_lft forever\n"
+        "3: eth1    inet 192.168.1.100/24 brd 192.168.1.255 scope global eth1\\       "
+        "valid_lft forever preferred_lft forever\n"
+    )
+
+    def script(args: Sequence[str]) -> str:
+        if args[0] == pihole.IP_CMD:
+            return ip_output
+        return ""
+
+    runner = FakeRunner(stdout_script=script)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(FakeSnap()),
+        run=runner,
+        snap_data=snap_data,
+        resolved_drop_in=drop_in,
+    )
+
+    # WHEN the fact is read
+    addrs = workload.machine_ipv4_addresses()
+
+    # THEN lo is skipped, and the two real addresses are returned
+    assert addrs == frozenset({"10.0.0.5", "192.168.1.100"})
+
+
+def test_machine_ipv4_addresses_excludes_link_and_host_scope(
+    snap_data: pathlib.Path,
+    drop_in: pathlib.Path,
+):
+    """Only global-scope addresses are servable.
+
+    A link-local (169.254/16) or host-scope address on a real
+    interface must not count as servable: DHCP clients cannot reach
+    either, so the unservable gate would be fooled into letting a
+    pool through that FTL cannot serve.
+    """
+    # GIVEN an ip output with a link-local and a host-scope address
+    # on real interfaces, plus one global address
+    ip_output = (
+        "1: lo    inet 127.0.0.1/8 scope host lo\\       "
+        "valid_lft forever preferred_lft forever\n"
+        "2: eth0    inet 169.254.9.9/16 brd 169.254.255.255 scope link eth0\\       "
+        "valid_lft forever preferred_lft forever\n"
+        "3: eth1    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth1\\       "
+        "valid_lft forever preferred_lft forever\n"
+        "4: eth2    inet6 fe80::1/64 scope link eth2\\       "
+        "valid_lft forever preferred_lft forever\n"
+        "5: eth3    inet 10.1.1.1/24 brd 10.1.1.255 eth3\\       "
+        "valid_lft forever preferred_lft forever\n"
+    )
+
+    def script(args: Sequence[str]) -> str:
+        if args[0] == pihole.IP_CMD:
+            return ip_output
+        return ""
+
+    runner = FakeRunner(stdout_script=script)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(FakeSnap()),
+        run=runner,
+        snap_data=snap_data,
+        resolved_drop_in=drop_in,
+    )
+
+    # WHEN the fact is read
+    addrs = workload.machine_ipv4_addresses()
+
+    # THEN only the global-scope address is returned
+    assert addrs == frozenset({"10.0.0.5"})
+
+
+def test_machine_ipv4_addresses_returns_none_on_command_failure(
+    snap_data: pathlib.Path,
+    drop_in: pathlib.Path,
+):
+    """machine_ipv4_addresses returns None on nonzero exit."""
+    # GIVEN an `ip` command that fails
+    runner = FakeRunner(returncode=1)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(FakeSnap()),
+        run=runner,
+        snap_data=snap_data,
+        resolved_drop_in=drop_in,
+    )
+
+    # WHEN the fact is read
+    addrs = workload.machine_ipv4_addresses()
+
+    # THEN it is None — the read failed, which is not "no addresses"
+    assert addrs is None
+
+
+def test_machine_ipv4_addresses_returns_none_on_oserror(
+    snap_data: pathlib.Path,
+    drop_in: pathlib.Path,
+):
+    """machine_ipv4_addresses returns None on OSError."""
+
+    # GIVEN an `ip` command that cannot be run at all
+    def raise_oserror(_args: Sequence[str]) -> None:
+        raise OSError("no such command")
+
+    runner = FakeRunner(effect=raise_oserror)
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(FakeSnap()),
+        run=runner,
+        snap_data=snap_data,
+        resolved_drop_in=drop_in,
+    )
+
+    # WHEN the fact is read
+    addrs = workload.machine_ipv4_addresses()
+
+    # THEN it is None — the read failed, which is not "no addresses"
+    assert addrs is None
+
+
+def test_port67_free_probes_the_port(
+    snap_data: pathlib.Path,
+    drop_in: pathlib.Path,
+):
+    """port67_free probes 67/udp; a successful bind means free."""
+    # GIVEN a probe that binds successfully
+    probed: list[int] = []
+
+    def probe(port: int) -> bool:
+        probed.append(port)
+        return True
+
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(FakeSnap()),
+        run=FakeRunner(),
+        snap_data=snap_data,
+        resolved_drop_in=drop_in,
+        probe_udp_port=probe,
+    )
+
+    # WHEN the fact is read
+    free = workload.port67_free()
+
+    # THEN the probe targeted 67/udp and reported the port free
+    assert probed == [67]
+    assert free is True
+
+
+def test_port67_free_reports_taken_when_bind_fails(
+    snap_data: pathlib.Path,
+    drop_in: pathlib.Path,
+):
+    """port67_free reports False when the bind raises EADDRINUSE."""
+
+    # GIVEN a probe whose bind fails (the port is held)
+    def probe(port: int) -> bool:
+        return False
+
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(FakeSnap()),
+        run=FakeRunner(),
+        snap_data=snap_data,
+        resolved_drop_in=drop_in,
+        probe_udp_port=probe,
+    )
+
+    # WHEN the fact is read
+    free = workload.port67_free()
+
+    # THEN it reports the port taken — the probe is the pre-flight gate
+    assert free is False
+
+
+def test_bind_probe_succeeds_on_a_free_port():
+    """The real probe reports True when nothing holds the port."""
+    # GIVEN a port nothing holds (0 = any free port)
+    # WHEN the probe runs
+    # THEN it reports free
+    assert pihole._bind_probe(0) is True  # pyright: ignore[reportPrivateUsage]
+
+
+def test_bind_probe_reports_taken_when_port_is_held():
+    """The real probe reports False when the port is held."""
+    # GIVEN a port held by a bound socket (the wildcard 0.0.0.0 bind
+    # conflicts with any specific binding)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as holder:
+        holder.bind(("127.0.0.1", 0))
+        port = holder.getsockname()[1]
+        # WHEN the probe runs against that port
+        # THEN it reports taken
+        assert pihole._bind_probe(port) is False  # pyright: ignore[reportPrivateUsage]
 
 
 # -- Install and start. -----------------------------------------------
@@ -935,6 +1198,254 @@ def test_awaiting_the_api_gives_up_and_points_at_the_log(
     # where to look
     with pytest.raises(pihole.PiholeError, match=r"FTL\.log"):
         workload.await_api(timeout=0.0)
+
+
+# -- wait_for_dhcp_bind. -----------------------------------------------
+
+
+def _ss_output(*rows: str) -> str:
+    """Render `ss -lunp` output with the header and the given rows."""
+    header = "State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  Process\n"
+    return header + "".join(rows)
+
+
+def _bound_row() -> str:
+    """A listening 67/udp row owned by pihole-FTL."""
+    return (
+        "UNCONN  0       0       0.0.0.0:67          0.0.0.0:*          "
+        'users:(("pihole-FTL",pid=1234,fd=5))\n'
+    )
+
+
+def test_wait_for_dhcp_bind_returns_when_ftl_holds_the_port(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    """Ss naming pihole-FTL on 67/udp ends the wait."""
+    # GIVEN ss output naming pihole-FTL on 0.0.0.0:67
+    runner = FakeRunner(stdout_script=lambda args: _ss_output(_bound_row()))
+    clock = FakeClock()
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=runner,
+        snap_data=snap_data,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    # WHEN the wait runs
+    workload.wait_for_dhcp_bind(timeout=5.0)
+
+    # THEN it returns without raising, and never slept
+    assert clock.sleeps == []
+
+
+def test_wait_for_dhcp_bind_retries_until_the_bind_appears(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    """A later poll naming pihole-FTL ends the wait."""
+    # GIVEN ss output that names pihole-FTL only on the second poll
+    polls = {"count": 0}
+
+    def script(args: Sequence[str]) -> str:
+        polls["count"] += 1
+        return _ss_output(_bound_row()) if polls["count"] >= 2 else _ss_output()
+
+    clock = FakeClock()
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=FakeRunner(stdout_script=script),
+        snap_data=snap_data,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    # WHEN the wait runs
+    workload.wait_for_dhcp_bind(timeout=5.0)
+
+    # THEN it polled twice and slept once between the polls
+    assert polls["count"] == 2
+    assert clock.sleeps == [pihole.DHCP_BIND_POLL_INTERVAL]
+
+
+def test_wait_for_dhcp_bind_times_out_when_ftl_never_binds(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    """Ss never naming pihole-FTL → PiholeError after the deadline."""
+    # GIVEN ss output with no DHCP listener (only the DNS one)
+    ss_output = _ss_output(
+        "UNCONN  0       0       0.0.0.0:53          0.0.0.0:*          "
+        'users:(("pihole-FTL",pid=1234,fd=5))\n'
+    )
+    clock = FakeClock()
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=FakeRunner(stdout_script=lambda args: ss_output),
+        snap_data=snap_data,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    # WHEN the wait runs past its deadline
+    with pytest.raises(pihole.PiholeError) as excinfo:
+        workload.wait_for_dhcp_bind(timeout=5.0)
+
+    # THEN it names the port and where to look
+    assert "67/udp" in str(excinfo.value)
+    assert "snap logs" in str(excinfo.value)
+    # AND it polled until the deadline: 5.0s / 2.0s interval = 3 sleeps
+    assert clock.sleeps == [pihole.DHCP_BIND_POLL_INTERVAL] * 3
+
+
+def test_wait_for_dhcp_bind_ignores_a_socket_on_port_6700(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    """A :6700 listener must not satisfy the :67 check."""
+    # GIVEN ss output with pihole-FTL on 6700/udp, not 67/udp
+    ss_output = _ss_output(
+        "UNCONN  0       0       0.0.0.0:6700         0.0.0.0:*          "
+        'users:(("pihole-FTL",pid=1234,fd=5))\n'
+    )
+    clock = FakeClock()
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=FakeRunner(stdout_script=lambda args: ss_output),
+        snap_data=snap_data,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    # WHEN the wait runs
+    # THEN it times out — a substring match would have returned early
+    with pytest.raises(pihole.PiholeError):
+        workload.wait_for_dhcp_bind(timeout=1.0)
+
+
+def test_wait_for_dhcp_bind_accepts_the_ipv6_listener_form(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    """The `[::]:67` form ss can print also satisfies the check."""
+    # GIVEN ss output naming pihole-FTL on [::]:67
+    ss_output = _ss_output(
+        "UNCONN  0       0       [::]:67             [::]:*              "
+        'users:(("pihole-FTL",pid=1234,fd=5))\n'
+    )
+    clock = FakeClock()
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=FakeRunner(stdout_script=lambda args: ss_output),
+        snap_data=snap_data,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    # WHEN the wait runs
+    # THEN it returns without raising
+    workload.wait_for_dhcp_bind(timeout=5.0)
+
+
+def test_wait_for_dhcp_bind_tolerates_a_failed_ss_read(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    """A failed ss read is 'not held', not a crash — it polls on."""
+
+    # GIVEN ss that cannot be run at all
+    def failing_run(args: Sequence[str], **_: object) -> subprocess.CompletedProcess[str]:
+        raise OSError("no ss on this machine")
+
+    clock = FakeClock()
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=failing_run,
+        snap_data=snap_data,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    # WHEN the wait runs
+    # THEN it keeps polling and the timeout names the failure
+    with pytest.raises(pihole.PiholeError, match=r"67/udp"):
+        workload.wait_for_dhcp_bind(timeout=1.0)
+
+
+def test_wait_for_dhcp_bind_tolerates_a_nonzero_ss_exit(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    """A non-zero ss exit is 'not held', not a crash — it polls on."""
+    # GIVEN ss that exits non-zero
+    clock = FakeClock()
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=FakeRunner(returncode=1),
+        snap_data=snap_data,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    # WHEN the wait runs
+    # THEN it keeps polling and the timeout names the failure
+    with pytest.raises(pihole.PiholeError, match=r"67/udp"):
+        workload.wait_for_dhcp_bind(timeout=1.0)
+
+
+def test_wait_for_dhcp_bind_skips_malformed_ss_lines(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    """A line with too few columns is skipped, not a crash."""
+    # GIVEN ss output with a truncated row before the real one
+    ss_output = _ss_output(
+        "UNCONN  0       0\n",
+        _bound_row(),
+    )
+    clock = FakeClock()
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=FakeRunner(stdout_script=lambda args: ss_output),
+        snap_data=snap_data,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    # WHEN the wait runs
+    # THEN the malformed line is skipped and the real row ends the wait
+    workload.wait_for_dhcp_bind(timeout=5.0)
+    assert clock.sleeps == []
+
+
+def test_wait_for_dhcp_bind_does_not_accept_a_foreign_owner(
+    fake_snap: FakeSnap,
+    snap_data: pathlib.Path,
+):
+    """67/udp held by another process is not FTL serving DHCP.
+
+    The whole point of naming the owner: a port taken by dnsmasq is
+    the conflict the wait must surface, not a bind to accept.
+    """
+    # GIVEN ss output with 67/udp held by dnsmasq, not pihole-FTL
+    ss_output = _ss_output(
+        "UNCONN  0       0       0.0.0.0:67          0.0.0.0:*          "
+        'users:(("dnsmasq",pid=4321,fd=7))\n'
+    )
+    clock = FakeClock()
+    workload = pihole.Pihole(
+        cache_factory=FakeCache(fake_snap),
+        run=FakeRunner(stdout_script=lambda args: ss_output),
+        snap_data=snap_data,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    # WHEN the wait runs
+    # THEN it times out — the port is taken, but not by FTL
+    with pytest.raises(pihole.PiholeError, match=r"67/udp"):
+        workload.wait_for_dhcp_bind(timeout=1.0)
 
 
 # -- apply_ftl_config. ------------------------------------------------

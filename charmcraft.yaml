@@ -41,6 +41,9 @@ description: |
   - Optionally sets the blocklist refresh schedule (`gravity-schedule`,
     a systemd `OnCalendar` string) through a host drop-in, because the
     snap cannot manage its own timer.
+  - Optionally serves DHCP from the FTL server (`dhcp-enabled` and the
+    pool options), gated so an unservable pool or an occupied 67/udp
+    shows up as `blocked` naming the remedy.
 
   A single unit is the supported shape. Two Pi-holes are two independent
   resolvers with independently drifting blocklists, not a cluster.
@@ -176,3 +179,38 @@ config:
         manage the schedule — the snap's randomised default applies.
         The charm writes a host systemd drop-in because the snap's
         configure hook rejects all timer keys.
+    dhcp-enabled:
+      type: boolean
+      default: false
+      description: |
+        Whether the FTL DHCP server on 67/udp is enabled. Requires a
+        complete pool (dhcp-range-start, dhcp-range-end, dhcp-router,
+        dhcp-netmask) and dns-listening-mode=ALL (the default LOCAL
+        binds localhost only, so DHCP clients could not reach the
+        resolver). The serving interface must have an address in the
+        pool's subnet.
+    dhcp-range-start:
+      type: string
+      default: ""
+      description: |
+        DHCP pool start address (IPv4, e.g. 192.168.1.10). Required
+        when dhcp-enabled is true.
+    dhcp-range-end:
+      type: string
+      default: ""
+      description: |
+        DHCP pool end address (IPv4, e.g. 192.168.1.50). Required
+        when dhcp-enabled is true.
+    dhcp-router:
+      type: string
+      default: ""
+      description: |
+        DHCP router/gateway address (IPv4, e.g. 192.168.1.1).
+        Required when dhcp-enabled is true.
+    dhcp-netmask:
+      type: string
+      default: ""
+      description: |
+        DHCP subnet netmask, dotted-quad only (e.g. 255.255.255.0;
+        prefix-length forms like 24 are rejected). Required when
+        dhcp-enabled is true.

@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-08-07
 **Accepted:** 2026-08-08
+**Amended:** 2026-09-22 — §2.4's example reordered: the DHCP pull gates are evaluated before the pushed failure, because a gate names the specific remedy and first-added wins the tie.
 **Amended:** 2026-09-05 — §2.6's ordering correction removed: the snap self-signs TLS and serves the webserver from the first boot (upstream PR #15, in the pinned revision), so there is no port correction for the API gate to follow. The gate itself is unchanged.
 **Amended:** 2026-08-11 — added §2.9: raising is only safe before the resolved drop-in exists, which reorders install ahead of freeing port 53.
 **Amended:** 2026-08-08 — §2.7 retried `snap.SnapError`, which does not cover its sibling exceptions. Corrected to `snap.Error`.
@@ -157,10 +158,17 @@ def _reconcile(self, _: ops.EventBase) -> None:
         self._reconcile_failure = ops.BlockedStatus(str(e))
 
 def _on_collect_status(self, event: ops.CollectStatusEvent) -> None:
+    # ... the pull gates first (DHCP unservable, port 67)
     if self._reconcile_failure is not None:
         event.add_status(self._reconcile_failure)
-    # ... then the pull statuses
+    # ... then the remaining pull statuses
 ```
+
+The pull gates are evaluated **before** the pushed failure, not after:
+a gate names the specific remedy (the pool, the port), and ops resolves
+equal-priority statuses by first-added, so the gate wins the tie. The
+pushed failure is the fallback for what the pull cannot see — the
+daemon is healthy and only one key silently failed to apply.
 
 This is state, but it lives for one hook execution and is gone. It does **not**
 violate the no-`StoredState` rule in

@@ -284,14 +284,38 @@ error: ... (run hook "configure": Error applying ftl.dhcp.active=true)
         # underlying: "DHCP start address is not valid" (exit 3)
 ```
 
-Write `dhcp.start`, `dhcp.end`, `dhcp.router` **before** `dhcp.active`. And if
+Write `dhcp.start`, `dhcp.end`, `dhcp.router`, `dhcp.netmask` **before**
+`dhcp.active`. And if
 the bind on port 67 fails, FTL does not degrade — it crash-loops via
 `restart-condition: on-failure`.
 
-**NOT VERIFIED:** whether DHCP works end-to-end under strict confinement. In
-testing the bind failed with `EADDRINUSE` (LXD's dnsmasq on `lxdbr0:67`), which
-is a port conflict rather than an AppArmor denial — so confinement does not
-*appear* to be the blocker, but it was never proven on a host with 67 free.
+**VERIFIED 2026-09-22** (spike, Stage 7): DHCP works end-to-end under strict
+confinement. On a scratch LXD container with port 67 free, `network-control` +
+`firewall-control` connected, `dns.listeningMode=ALL`, and a pool matching the
+interface's subnet, FTL bound `0.0.0.0:67` with no AppArmor denial and no
+crash-loop, and a client on a dedicated LXD bridge (dnsmasq disabled) received a
+lease (`10.99.0.172`, 3600s) from FTL. The earlier `EADDRINUSE` was indeed LXD's
+host dnsmasq on `lxdbr0:67` — a port conflict, not confinement.
+
+Further findings from the same spike:
+
+- **The serving interface needs an address in the pool's subnet.** With the
+  server's `eth1` unaddressed, FTL logged `dnsmasq: no address range available
+  for DHCP request via eth1` and the client fell back to link-local. A static
+  address on the interface fixed it. In a real deployment the Pi-hole host is on
+  the LAN, so this is normally satisfied — but the charm must not silently
+  enable DHCP on an interface it cannot serve.
+- **`snap set` cannot move the pool in place.** Changing `start` or `end`
+  individually creates an invalid intermediate range (crossing subnets, or
+  `start > end`) and the whole transaction aborts — the error message lies
+  ("DHCP router address should not be within DHCP range"). The working sequence
+  is `active=false` → pool → `active=true`, each step restarting FTL (~60s).
+- **The HTTP API applies the pool atomically.** One `PATCH /api/config` with
+  `{"dhcp": {"start": ..., "end": ..., "router": ...}}` landed with no
+  intermediate state and no error. The charm applies config through the API
+  (ADR-0004), so Stage 7 does **not** need the disable/enable dance — a single
+  PATCH is enough. The mandatory order still applies to the first enable
+  (`active` false → true).
 
 ### 4.5 Known snap bug
 
@@ -313,7 +337,7 @@ Verified with `ss -tulpn`:
 | 80 tcp | admin UI + API | default `webserver.port = "80o,443os,[::]:80o,[::]:443os"`; the `o` suffix means *optional* — it does not fail if taken |
 | 443 tcp | HTTPS | the `s` suffix; the launcher self-signs `tls.pem` on first boot |
 | **123 udp** | **NTP server — active by default** | `ntp.ipv4.active`/`ntp.ipv6.active` default `true`. Unexpected attack surface for a DNS appliance. Both keys are reachable, so the charm can decide. |
-| 67 / 546 udp | DHCP / DHCPv6 | only when `dhcp.active=true` |
+| 67 udp | DHCP | only when `dhcp.active=true`. DHCPv6 is not enabled: the charm manages no `dhcp.ipv6` key, so FTL's DHCPv6 server (547/udp) never binds. |
 | 4711 | **not used** | that was FTL v5's telnet API. v6 serves the API over HTTP on `webserver.port`. |
 
 ### 5.1 The stock install serves the webserver, self-signed
@@ -599,7 +623,7 @@ choices are traceable.
 
 | Topic | Conflict | Resolution |
 |---|---|---|
-| DHCP pool keys | `Reference: native-configuration` → `ftl.dhcp.start/end/router`. `How-to: configure-DHCP` → `ftl.dhcp.ipv4.range.start/end/router`. **Both cannot be right.** | Use the empirically verified set (`dhcp.start`, `dhcp.end`, `dhcp.router`, `dhcp.netmask`), but **re-verify** before implementing DHCP. |
+| DHCP pool keys | `Reference: native-configuration` → `ftl.dhcp.start/end/router`. `How-to: configure-DHCP` → `ftl.dhcp.ipv4.range.start/end/router`. **Both cannot be right.** | **Resolved 2026-09-22** (spike): the flat set (`dhcp.start`, `dhcp.end`, `dhcp.router`, `dhcp.netmask`) lands in `pihole.toml`; the nested scheme is rejected by the configure hook (exit 1, transaction rolled back). See [ADR-0006 §2.9](adr/0006-configuration-surface.md). |
 | Admin password | Operator runbook: *"Do not use `snap set` to change web passwords."* `Reference: native-configuration` documents `ftl.webserver.api.password` as an ordinary settable key **with no warning**. | Follow the runbook. See [ADR-0007](adr/0007-admin-password-handling.md). |
 | `snap-check` exit codes | **Not documented anywhere in the wiki.** | Use the source-verified codes in §7.3 and pin them with a test. |
 | Metrics / Prometheus | **No mention anywhere** in 25 wiki pages — no exporter, no `/metrics`, no observability integration. | Nothing exists to wire up. See [ADR-0008](adr/0008-cos-integration.md). |

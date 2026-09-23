@@ -14,8 +14,15 @@ Stage 3 adds connected plugs, a gravity-schedule config option, and
 the outcomes to converge them — ConnectPlugs when a required plug is
 disconnected, WriteGravityTimer when the schedule has drifted. See
 the Stage 3 deliverables in docs/roadmap.md.
+
+Stage 7.b adds DHCP server mode: `DhcpPool`, the `_dhcp_steps`
+ordered correction, the unservable gate and the port-67 gate that
+block rather than enabling a broken DHCP server, the bounded bind
+wait that verifies the enable, and the DHCP plug integration. See
+ADR-0006 §2.9, snap-constraints §4.4, and docs/roadmap.md Stage 7.b.
 """
 
+import ipaddress
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +30,9 @@ from typing import Literal, Protocol, assert_never, cast, final
 
 API_READY_TIMEOUT = 120.0
 """Seconds to wait for the HTTP API after starting the daemon."""
+
+DHCP_BIND_TIMEOUT = 30.0
+"""Seconds to wait for FTL to bind 67/udp after the DHCP enable."""
 
 # Shared by `pihole.py` and `ftl_api.py`. They live here because this
 # module imports neither of them, so this is the one place both can
@@ -98,8 +108,24 @@ UNCONDITIONAL_PLUGS: tuple[str, ...] = (
 Without time-control, process-control, and system-observe, FTL.log
 emits CAP_SYS_TIME, CAP_SYS_NICE, and /proc/<pid>/comm warnings.
 hardware-observe and mount-observe feed the diagnostics page.
-network-control and firewall-control join only when DHCP is enabled
-(Stage 7). See snap-constraints section 3.
+network-control and firewall-control join when DHCP is enabled and
+are retained after disable by decision — a connected plug is passive,
+and re-enabling reconnects via drift (ADR-0006 §2.9). See
+snap-constraints section 3.
+"""
+
+DHCP_PLUGS: tuple[str, ...] = ("network-control", "firewall-control")
+"""Plugs the DHCP server needs. Connected when enabled, retained after
+disable by decision (ADR-0006 §2.9)."""
+
+DHCP_PORTS: tuple[tuple[PortProtocol, int], ...] = (("udp", 67),)
+"""The DHCP server port, advertised when DHCP is enabled in config.
+
+Advertised on intent (``dhcp_enabled``), not on ``dhcp.active``: an
+unservable pool still opens the port while the Blocked status tells the
+operator what to fix. DHCPv6 is not advertised: the charm manages no
+``dhcp.ipv6`` key, so FTL's DHCPv6 server (547/udp) is never enabled.
+See ADR-0006 §2.8.
 """
 
 
@@ -121,6 +147,23 @@ def config_value(toml: Mapping[str, object], key: str) -> object | None:
 
 
 # -- Observed facts. What a read of the machine can come back with. ----
+
+
+@final
+@dataclass(frozen=True)
+class DhcpPool:
+    """The complete DHCP lease pool, a unit applied atomically.
+
+    All four fields must be set before ``dhcp.active`` is enabled:
+    setting ``dhcp.active=true`` with an empty pool causes FTL to
+    exit 3 with ``DHCP start address is not valid``. See
+    snap-constraints §4.4.
+    """
+
+    start: str
+    end: str
+    router: str
+    netmask: str
 
 
 @final
@@ -240,13 +283,17 @@ class SnapPresent:
     admin_password: AdminPasswordState
     api_ready: bool
     port53_released: bool
+    port67_free: bool
     ntp_server_active: bool | None
     upstream_dns: tuple[str, ...] | None
     listening_mode: str | None
     blocking_enabled: bool | None
     dnssec_enabled: bool | None
-    connected_plugs: frozenset[str] = field(default_factory=frozenset[str])
-    gravity_schedule: str | None = None
+    connected_plugs: frozenset[str]
+    gravity_schedule: str | None
+    dhcp_active: bool | None
+    dhcp_pool: DhcpPool | None
+    machine_ipv4_addresses: frozenset[str] | None
 
 
 type PiholeState = SnapAbsent | SnapPresent
@@ -271,6 +318,8 @@ class PiholeIntent:
     dnssec_enabled: bool = False
     ntp_server_enabled: bool = False
     gravity_schedule: str | None = None
+    dhcp_enabled: bool = False
+    dhcp_pool: DhcpPool | None = None
 
 
 @final
@@ -405,6 +454,21 @@ class SetFtlConfig:
 
 @final
 @dataclass(frozen=True)
+class WaitForDhcpBind:
+    """Wait until FTL demonstrably holds 67/udp, or fail the reconcile.
+
+    The enable PATCHes land in pihole.toml before FTL binds the port,
+    so a status collection in that window would sample 67 free and
+    Block on a gate that self-clears. The wait closes the window by
+    naming the owner: `ss -lunp` must show pihole-FTL on 67/udp. See
+    ADR-0006 §2.9.
+    """
+
+    timeout: float = DHCP_BIND_TIMEOUT
+
+
+@final
+@dataclass(frozen=True)
 class Noop:
     """Nothing to do: the machine already matches intent."""
 
@@ -463,6 +527,7 @@ type PiholeOutcome = (
     | RestartFtl
     | AwaitApi
     | SetFtlConfig
+    | WaitForDhcpBind
     | ConnectPlugs
     | WriteGravityTimer
     | RemoveGravityTimer
@@ -510,6 +575,10 @@ class PiholeFacts(Protocol):
 
     def port53_released(self) -> bool:
         """Whether port 53 is free for Pi-hole."""
+        ...
+
+    def port67_free(self) -> bool:
+        """Whether 67/udp is free for FTL's DHCP server."""
         ...
 
     def ntp_server_active(self) -> bool | None:
@@ -570,6 +639,34 @@ class PiholeFacts(Protocol):
         """
         ...
 
+    def dhcp_active(self) -> bool | None:
+        """Whether ``dhcp.active`` is true in ``pihole.toml``.
+
+        None when the file cannot answer. The decision treats unknown
+        as open: the correction is idempotent and its own read-back
+        has the final word.
+        """
+        ...
+
+    def dhcp_pool(self) -> DhcpPool | None:
+        """The four DHCP pool keys as ``pihole.toml`` holds them.
+
+        None when any of the four is absent — a partial pool is no
+        pool. Total by contract: a fact never raises.
+        """
+        ...
+
+    def machine_ipv4_addresses(self) -> frozenset[str] | None:
+        """The IPv4 addresses on this machine's non-loopback interfaces.
+
+        None when the command cannot be run or exits non-zero — the
+        read failed, which is not the same as "no addresses". An
+        empty set means the read succeeded and found none. Both make
+        ``dhcp_unservable`` return True, but the Blocked message
+        distinguishes them so the remedy names the real cause.
+        """
+        ...
+
 
 def fetch(pihole: PiholeFacts, admin_password: str) -> PiholeState:
     """Read every fact the decision depends on, exactly once.
@@ -603,6 +700,7 @@ def fetch(pihole: PiholeFacts, admin_password: str) -> PiholeState:
         admin_password=api.admin_password,
         api_ready=api.api_ready,
         port53_released=pihole.port53_released(),
+        port67_free=pihole.port67_free(),
         ntp_server_active=pihole.ntp_server_active(),
         upstream_dns=pihole.upstream_dns(),
         listening_mode=pihole.listening_mode(),
@@ -610,6 +708,9 @@ def fetch(pihole: PiholeFacts, admin_password: str) -> PiholeState:
         dnssec_enabled=pihole.dnssec_enabled(),
         connected_plugs=pihole.connected_plugs(),
         gravity_schedule=pihole.gravity_schedule(),
+        dhcp_active=pihole.dhcp_active(),
+        dhcp_pool=pihole.dhcp_pool(),
+        machine_ipv4_addresses=pihole.machine_ipv4_addresses(),
     )
 
 
@@ -624,13 +725,14 @@ def compute(state: PiholeState, intent: PiholeIntent) -> Sequence[PiholeOutcome]
             assert_never(unreachable)
 
 
-def plugs_for() -> tuple[str, ...]:
-    """Return the snap plugs this charm always connects.
+def plugs_for(intent: PiholeIntent) -> tuple[str, ...]:
+    """Return the snap plugs this intent needs.
 
-    Unconditional today. ``network-control`` and ``firewall-control``
-    join when DHCP lands (Stage 7) — the function takes no intent
-    parameter until then, because the gate has no consumer.
+    Unconditional plugs always; ``network-control`` and
+    ``firewall-control`` join when DHCP is enabled.
     """
+    if intent.dhcp_enabled:
+        return UNCONDITIONAL_PLUGS + DHCP_PLUGS
     return UNCONDITIONAL_PLUGS
 
 
@@ -657,7 +759,7 @@ def _bootstrap(intent: PiholeIntent) -> Sequence[PiholeOutcome]:
         InstallSnap(),
         HoldSnapRefresh(),
         ReleasePort53(),
-        ConnectPlugs(plugs=plugs_for()),
+        ConnectPlugs(plugs=plugs_for(intent)),
         SetNtpServer(active=False),
         SetAdminPassword(intent.admin_password),
         StartFtl(),
@@ -665,6 +767,11 @@ def _bootstrap(intent: PiholeIntent) -> Sequence[PiholeOutcome]:
     ]
     # Always-managed keys applied in one idempotent PATCH after the API
     # is up. Unmanaged keys (None) are excluded from bootstrap.
+    # DHCP deliberately does not appear here: the unservable check needs
+    # SnapPresent facts (machine_ipv4_addresses), which bootstrap has
+    # none of. DHCP lands on the first converge — the config-changed
+    # hook that follows install immediately — gated by dhcp_unservable.
+    # See snap-constraints §4.4.
     ftl_config: list[tuple[str, str | bool | tuple[str, ...]]] = [
         ("dns.blocking.active", intent.blocking_enabled),
         ("dns.dnssec", intent.dnssec_enabled),
@@ -697,7 +804,8 @@ def _converge(state: SnapPresent, intent: PiholeIntent) -> Sequence[PiholeOutcom
     # connected. Connecting a connected plug is idempotent, but the
     # capability warnings clear only after an FTL restart, so
     # ConnectPlugs is emitted before RestartFtl in the sequence.
-    needed = frozenset(plugs_for())
+    needed = frozenset(plugs_for(intent))
+    restarted = False
     if not needed.issubset(state.connected_plugs):
         missing = sorted(needed - state.connected_plugs)
         outcomes.append(ConnectPlugs(plugs=tuple(missing)))
@@ -712,11 +820,13 @@ def _converge(state: SnapPresent, intent: PiholeIntent) -> Sequence[PiholeOutcom
                     reason="connecting plugs clears capability warnings only after a restart"
                 )
             )
+            restarted = True
 
     # An NTP correction restarts FTL (the configure hook restarts
     # only when a value actually changed), so the step brings its own
     # gate rather than leaving an unguarded bounce for the next status
-    # check.
+    # check. The plug-drift restart above is the same class: the DHCP
+    # PATCHes that follow would hit a daemon that is still down.
     ntp_step = _ntp_step(state, intent)
     if ntp_step is not None:
         outcomes.append(ntp_step)
@@ -724,12 +834,21 @@ def _converge(state: SnapPresent, intent: PiholeIntent) -> Sequence[PiholeOutcom
         outcomes.append(SetAdminPassword(intent.admin_password))
     if not (state.ftl_enabled and state.ftl_active):
         outcomes.append(StartFtl())
-    if ntp_step is not None or not state.api_ready:
+    if ntp_step is not None or not state.api_ready or restarted:
         outcomes.append(AwaitApi())
 
     drifted = _drifted_config(state, intent)
     if drifted:
         outcomes.append(SetFtlConfig(config=drifted, password=intent.admin_password))
+
+    # DHCP config, conditionally emitted and strictly ordered — pool
+    # PATCH before active PATCH for the first enable. See _dhcp_steps
+    # and snap-constraints §4.4. When the pool is unservable the steps
+    # are empty, but the plugs above were still connected and FTL
+    # restarted: deliberate — granting capabilities is harmless, the
+    # restart is a one-shot DNS blip, and the Blocked status tells the
+    # operator what to fix.
+    outcomes.extend(_dhcp_steps(state, intent))
 
     # Gravity timer schedule drift — in both directions: a set schedule
     # that differs writes the drop-in, and an unset schedule with a
@@ -796,15 +915,195 @@ def _needs_password(password: AdminPasswordState) -> bool:
             assert_never(unreachable)
 
 
-def open_ports(intent: PiholeIntent) -> tuple[tuple[PortProtocol, int], ...]:
-    """The ports this intent serves: DNS and web always, NTP when on.
+# -- DHCP server mode (Stage 7.b). -------------------------------------
 
-    Takes the whole intent rather than one extracted flag so later
-    options (DHCP's 67/546) grow the body, not the signature. Pure so
-    the mapping is tested without touching ops. See ADR-0006 section
-    2.8.
+
+def _pool_config(pool: DhcpPool) -> tuple[tuple[str, str], ...]:
+    """Return the four ``(key, value)`` pairs for the pool PATCH.
+
+    The keys are applied atomically via ``PATCH /api/config`` before
+    ``dhcp.active`` is enabled. See snap-constraints §4.4.
+    """
+    return (
+        ("dhcp.start", pool.start),
+        ("dhcp.end", pool.end),
+        ("dhcp.router", pool.router),
+        ("dhcp.netmask", pool.netmask),
+    )
+
+
+def _dhcp_steps(
+    state: SnapPresent, intent: PiholeIntent
+) -> tuple[SetFtlConfig | WaitForDhcpBind, ...]:
+    """The ordered DHCP corrections, or empty when a gate fires.
+
+    The mandatory order for the first enable is pool PATCH first,
+    then active PATCH — see snap-constraints §4.4. When the pool
+    already matches, only the active step is emitted. When DHCP is
+    disabled, the active-false step is emitted if the state is not
+    already False (unknown ``None`` counts as drift — the "unknown
+    as open" pattern, same as NTP). The enable ends with
+    ``WaitForDhcpBind``: the PATCH lands in pihole.toml before FTL
+    binds 67, and the wait closes the window in which a status
+    collection would sample the port free and Block on a gate that
+    self-clears (ADR-0006 §2.9).
+
+    Returns an empty tuple when ``dhcp_unservable`` or
+    ``dhcp_port_blocked`` is true: the status handler re-derives the
+    Blocked message (it is not pushed from ``_reconcile``), and
+    everything else still converges.
+    """
+    if dhcp_unservable(state, intent):
+        return ()
+    if dhcp_port_blocked(state, intent):
+        return ()
+
+    if not intent.dhcp_enabled:
+        if state.dhcp_active is not False:
+            return (
+                SetFtlConfig(
+                    config=(("dhcp.active", False),),
+                    password=intent.admin_password,
+                ),
+            )
+        return ()
+
+    # Enabled: pool must be present (config validation guarantees it).
+    assert intent.dhcp_pool is not None
+    steps: list[SetFtlConfig | WaitForDhcpBind] = []
+    if state.dhcp_pool != intent.dhcp_pool:
+        steps.append(
+            SetFtlConfig(
+                config=_pool_config(intent.dhcp_pool),
+                password=intent.admin_password,
+            )
+        )
+    if state.dhcp_active is not True:
+        steps.append(
+            SetFtlConfig(
+                config=(("dhcp.active", True),),
+                password=intent.admin_password,
+            )
+        )
+        # The active PATCH is what makes FTL bind 67; the wait closes
+        # the window between the PATCH landing and the bind, so a
+        # status collection cannot sample 67 free and Block on a gate
+        # that self-clears (ADR-0006 §2.9).
+        steps.append(WaitForDhcpBind())
+    return tuple(steps)
+
+
+def dhcp_unservable(state: SnapPresent, intent: PiholeIntent) -> bool:
+    """Whether the DHCP pool cannot be served on this machine.
+
+    True when DHCP is enabled, a pool is set, and no machine IPv4
+    address falls inside the pool's subnet — FTL would log ``no
+    address range available`` and clients would fall back to
+    link-local. Narrowed to ``SnapPresent``: the status handler
+    guards on ``isinstance`` and ``_dhcp_steps`` takes ``SnapPresent``,
+    so the gate is only ever reached with the snap installed. See
+    snap-constraints §4.4.
+    """
+    if not intent.dhcp_enabled or intent.dhcp_pool is None:
+        return False
+    if state.machine_ipv4_addresses is None:
+        return True
+    return not any(in_pool_subnet(addr, intent.dhcp_pool) for addr in state.machine_ipv4_addresses)
+
+
+def dhcp_unservable_reason(state: SnapPresent, intent: PiholeIntent) -> str:
+    """Name why the DHCP pool cannot be served, for a Blocked message.
+
+    The state distinguishes a failed address read from a successful
+    read with no match, so the remedy names the real cause. The pool
+    is guaranteed present when DHCP is enabled (config validation).
+    Narrowed to ``SnapPresent``: the status handler guards on
+    ``isinstance`` and ``_dhcp_steps`` takes ``SnapPresent``.
+    """
+    assert intent.dhcp_pool is not None
+    pool = intent.dhcp_pool
+    if state.machine_ipv4_addresses is None:
+        return (
+            f"DHCP pool {pool.start}-{pool.end}/{pool.netmask} cannot be served: "
+            "the machine's IPv4 addresses could not be read; "
+            "check the unit's network tooling"
+        )
+    return (
+        f"DHCP pool {pool.start}-{pool.end}/{pool.netmask} cannot be served: "
+        "no machine IPv4 address falls inside the pool's subnet; "
+        "the serving interface needs an address in the pool's subnet "
+        "(see snap-constraints §4.4)"
+    )
+
+
+def dhcp_port_blocked(state: SnapPresent, intent: PiholeIntent) -> bool:
+    """Whether DHCP is enabled but FTL is not demonstrably serving 67.
+
+    True when DHCP is enabled and FTL is not holding 67/udp: either
+    the port is held by someone else (enabling would crash-loop FTL)
+    or FTL is up with DHCP active but never bound it. The exemption
+    is evidence-based — FTL up, DHCP active, *and* the port taken —
+    not inferred from the config key alone (rule 6): ``dhcp.active``
+    says "we configured DHCP", not "FTL bound 67". After a reboot
+    where another service won the port, the key is still true but the
+    daemon is down, and the gate must fire with the port remedy
+    rather than let the StartFtl push name port 53. Narrowed to
+    ``SnapPresent``: the status handler guards on ``isinstance`` and
+    ``_dhcp_steps`` takes ``SnapPresent``. See snap-constraints §4.4.
+    """
+    if not intent.dhcp_enabled or intent.dhcp_pool is None:
+        return False
+    if state.port67_free:
+        # Port free: only a problem when FTL is up with DHCP
+        # active but never bound it.
+        return state.ftl_active and state.dhcp_active is True
+    # Port taken: a problem unless FTL itself holds it.
+    return not (state.ftl_active and state.dhcp_active is True)
+
+
+def dhcp_port_blocked_reason(state: SnapPresent) -> str:
+    """Name why DHCP is not being served, for a Blocked message.
+
+    Narrowed to ``SnapPresent``: the status handler guards on
+    ``isinstance`` and ``_dhcp_steps`` takes ``SnapPresent``. The
+    two firing states name different remedies.
+    """
+    if state.port67_free:
+        return (
+            "DHCP is enabled but FTL is not holding 67/udp; check "
+            "`snap logs pihole` for why the DHCP server did not start"
+        )
+    return (
+        "DHCP cannot be served: 67/udp is already in use, and FTL "
+        "crash-loops when it cannot bind the port (snap-constraints "
+        "§4.4); stop the other service so FTL can bind the port"
+    )
+
+
+def in_pool_subnet(address: str, pool: DhcpPool) -> bool:
+    """Whether an IPv4 address falls inside the pool's subnet.
+
+    Any ``ValueError`` from malformed values answers False — the
+    config validator already caught them, so this is a safety net.
+    """
+    try:
+        network = ipaddress.IPv4Network(f"{pool.start}/{pool.netmask}", strict=False)
+        return ipaddress.IPv4Address(address) in network
+    except ValueError:
+        return False
+
+
+def open_ports(intent: PiholeIntent) -> tuple[tuple[PortProtocol, int], ...]:
+    """The ports this intent serves.
+
+    DNS and web always; NTP and DHCP when enabled. Takes the whole
+    intent rather than one extracted flag so later options grow the
+    body, not the signature. Pure so the mapping is tested without
+    touching ops. See ADR-0006 section 2.8.
     """
     ports = DNS_PORTS + WEB_PORTS
     if intent.ntp_server_enabled:
         ports += NTP_PORTS
+    if intent.dhcp_enabled:
+        ports += DHCP_PORTS
     return ports

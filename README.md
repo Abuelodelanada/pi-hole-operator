@@ -95,6 +95,16 @@ LXD test that your exposure posture is correct.
 127.0.0.1 and disables its stub listener so Pi-hole can bind port 53. Removing
 the application restores that; force-removing a unit in error state does not.
 
+**Two DHCP servers on one broadcast domain assign conflicting addresses.**
+The charm can enable the FTL DHCP server with `dhcp-enabled=true` and a
+complete pool (`dhcp-range-start`, `dhcp-range-end`, `dhcp-router`,
+`dhcp-netmask`). Enabling it also requires `dns-listening-mode=ALL` — the
+default `LOCAL` binds localhost only, so every lease would point at a
+resolver that refuses the client. The serving interface must have an
+address in the pool's subnet, or the unit goes `blocked` rather than
+enabling a broken server. Disable any other DHCP server on the same
+network before enabling this one.
+
 ## Development
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`AGENTS.md`](AGENTS.md).

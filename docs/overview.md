@@ -80,7 +80,9 @@ mechanisms that lie in two different ways ([ADR-0009](adr/0009-ftl-api-client-mo
 toward a working Pi-hole, it is what you do when there will not be one.
 
 **[`pihole_config.py`](../src/pihole_config.py)** — The pydantic model of the
-config options. Imports pydantic and stdlib, nothing else.
+config options. Imports pydantic, stdlib, and the pure core (`pihole_state`,
+for the `DhcpPool` type and the subnet check) — nothing that touches the
+machine.
 
 ## The boundary that makes it work
 

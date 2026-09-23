@@ -101,6 +101,9 @@ filterwarnings = [
     # would also silence v1-style usage in our own modules.
     "ignore::pydantic.warnings.PydanticDeprecatedSince20:charms.grafana_agent.*",
 ]
+markers = [
+    "dhcp: DHCP tests; need port 67 free — excluded from the default integration run",
+]
 
 [tool.coverage.run]
 branch = true

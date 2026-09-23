@@ -19,6 +19,7 @@ from pihole_state import (
     ApiFacts,
     AwaitApi,
     ConnectPlugs,
+    DhcpPool,
     HoldSnapRefresh,
     InstallSnap,
     Noop,
@@ -38,9 +39,15 @@ from pihole_state import (
     SnapAbsent,
     SnapPresent,
     StartFtl,
+    WaitForDhcpBind,
     WriteGravityTimer,
     compute,
+    dhcp_port_blocked,
+    dhcp_port_blocked_reason,
+    dhcp_unservable,
+    dhcp_unservable_reason,
     fetch,
+    in_pool_subnet,
     open_ports,
     plugs_for,
     revision_for,
@@ -62,6 +69,7 @@ def converged(**overrides: object) -> SnapPresent:
         admin_password=PasswordAccepted(),
         api_ready=True,
         port53_released=True,
+        port67_free=True,
         ntp_server_active=False,
         upstream_dns=None,
         listening_mode=None,
@@ -69,6 +77,9 @@ def converged(**overrides: object) -> SnapPresent:
         dnssec_enabled=False,
         connected_plugs=frozenset(UNCONDITIONAL_PLUGS),
         gravity_schedule=None,
+        dhcp_active=False,
+        dhcp_pool=None,
+        machine_ipv4_addresses=frozenset(),
     )
     return dataclasses.replace(state, **overrides)
 
@@ -92,6 +103,7 @@ class FactsStub:
     password: AdminPasswordState = dataclasses.field(default_factory=PasswordAccepted)
     ready: bool = True
     port53_free: bool = True
+    port67_free_value: bool = True
     ntp: bool | None = False
     upstreams: tuple[str, ...] | None = None
     mode: str | None = None
@@ -101,6 +113,9 @@ class FactsStub:
         default_factory=lambda: frozenset(UNCONDITIONAL_PLUGS)
     )
     schedule: str | None = None
+    dhcp_active_value: bool | None = False
+    pool: DhcpPool | None = None
+    machine_addrs: frozenset[str] | None = frozenset()
     reads: list[str] = dataclasses.field(default_factory=list[str])
     passwords_offered: list[str] = dataclasses.field(default_factory=list[str])
 
@@ -140,6 +155,11 @@ class FactsStub:
         self.reads.append("port53_released")
         return self.port53_free
 
+    def port67_free(self) -> bool:
+        """Report whether 67/udp is free."""
+        self.reads.append("port67_free")
+        return self.port67_free_value
+
     def ntp_server_active(self) -> bool | None:
         """Report whether FTL's NTP server is enabled."""
         self.reads.append("ntp_server_active")
@@ -174,6 +194,21 @@ class FactsStub:
         """Report our drop-in schedule, or None if absent."""
         self.reads.append("gravity_schedule")
         return self.schedule
+
+    def dhcp_active(self) -> bool | None:
+        """Report whether dhcp.active is true."""
+        self.reads.append("dhcp_active")
+        return self.dhcp_active_value
+
+    def dhcp_pool(self) -> DhcpPool | None:
+        """Report the DHCP pool."""
+        self.reads.append("dhcp_pool")
+        return self.pool
+
+    def machine_ipv4_addresses(self) -> frozenset[str] | None:
+        """Report machine's IPv4 addresses, or None if unreadable."""
+        self.reads.append("machine_ipv4_addresses")
+        return self.machine_addrs
 
 
 def test_absent_snap_yields_the_whole_ordered_install_sequence():
@@ -402,14 +437,18 @@ def test_fetch_reads_every_fact_exactly_once():
         "api_facts",
         "blocking_enabled",
         "connected_plugs",
+        "dhcp_active",
+        "dhcp_pool",
         "dnssec_enabled",
         "ftl_status",
         "gravity_schedule",
         "installed_revision",
         "listening_mode",
+        "machine_ipv4_addresses",
         "ntp_server_active",
         "pinned_revision",
         "port53_released",
+        "port67_free",
         "refresh_held",
         "upstream_dns",
         "workload_version",
@@ -730,9 +769,9 @@ def test_an_unpinned_architecture_plans_no_reinstall():
 
 
 def test_plugs_for_returns_the_unconditional_plugs_only():
-    # GIVEN nothing — plugs are unconditional today
+    # GIVEN an intent without DHCP enabled
     # WHEN the required plugs are computed
-    plugs = plugs_for()
+    plugs = plugs_for(INTENT)
 
     # THEN only the five unconditional plugs are returned
     assert plugs == UNCONDITIONAL_PLUGS
@@ -748,10 +787,13 @@ def test_disconnected_plugs_yield_connectplugs_and_restartftl():
     outcomes = compute(state, INTENT)
 
     # THEN the two missing plugs are connected, and because capability
-    # warnings clear only after a restart, FTL is restarted
+    # warnings clear only after a restart, FTL is restarted — and the
+    # restart is gated: the API is down until it comes back, so AwaitApi
+    # follows rather than leaving an unguarded bounce.
     assert outcomes == (
         ConnectPlugs(plugs=("process-control", "time-control")),
         RestartFtl(reason="connecting plugs clears capability warnings only after a restart"),
+        AwaitApi(),
     )
 
 
@@ -865,3 +907,546 @@ def test_disconnected_plugs_with_ftl_not_active_skips_restart():
     assert kinds.count(StartFtl) == 1
     # The ConnectPlugs comes before the single StartFtl
     assert kinds.index(ConnectPlugs) < kinds.index(StartFtl)
+
+
+# -- Stage 7.b: DHCP server mode. --------------------------------------
+
+DHCP_POOL = DhcpPool(
+    start="192.168.1.10", end="192.168.1.50", router="192.168.1.1", netmask="255.255.255.0"
+)
+DHCP_INTENT = PiholeIntent(admin_password=PASSWORD, dhcp_enabled=True, dhcp_pool=DHCP_POOL)
+
+
+def test_dhcp_first_enable_orders_pool_before_active():
+    """The roadmap acceptance criterion: pool PATCH before active.
+
+    The spike recorded that one PATCH /api/config applies the pool
+    atomically, but the mandatory order still applies to the first
+    enable (active false → true). See snap-constraints §4.4.
+    """
+    # GIVEN a converged machine with DHCP disabled and no pool
+    state = converged(
+        dhcp_active=False,
+        dhcp_pool=None,
+        machine_ipv4_addresses=frozenset[str]({"192.168.1.5"}),
+    )
+
+    # WHEN the plan is computed with DHCP enabled
+    outcomes = compute(state, DHCP_INTENT)
+
+    # THEN the pool SetFtlConfig (contains dhcp.start) strictly
+    # precedes the active SetFtlConfig (contains dhcp.active)
+    set_ftl_indices = [i for i, o in enumerate(outcomes) if isinstance(o, SetFtlConfig)]
+    assert len(set_ftl_indices) >= 2
+    pool_step = outcomes[set_ftl_indices[0]]
+    active_step = outcomes[set_ftl_indices[1]]
+    assert isinstance(pool_step, SetFtlConfig)
+    assert isinstance(active_step, SetFtlConfig)
+    assert any(k == "dhcp.start" for k, _ in pool_step.config)
+    assert any(k == "dhcp.active" for k, _ in active_step.config)
+    assert set_ftl_indices[0] < set_ftl_indices[1]
+
+
+def test_dhcp_enable_with_pool_already_matching_emits_active_only():
+    """Pool already matches, only active step needed."""
+    # GIVEN a machine where the pool already matches but active is False
+    state = converged(
+        dhcp_active=False,
+        dhcp_pool=DHCP_POOL,
+        machine_ipv4_addresses=frozenset[str]({"192.168.1.5"}),
+    )
+
+    # WHEN the plan is computed
+    outcomes = compute(state, DHCP_INTENT)
+
+    # THEN only the active step is emitted
+    set_ftls = [o for o in outcomes if isinstance(o, SetFtlConfig)]
+    assert len(set_ftls) == 1
+    assert set_ftls[0].config == (("dhcp.active", True),)
+
+
+def test_dhcp_pool_drift_with_active_true_emits_pool_only():
+    """Pool drifted but active is already True — pool step only."""
+    # GIVEN a machine with a different pool but active already True
+    # (FTL holds 67, so the port gate's exemption applies)
+    old_pool = DhcpPool(
+        start="10.0.0.10", end="10.0.0.50", router="10.0.0.1", netmask="255.255.255.0"
+    )
+    state = converged(
+        dhcp_active=True,
+        dhcp_pool=old_pool,
+        port67_free=False,
+        machine_ipv4_addresses=frozenset[str]({"10.0.0.5", "192.168.1.5"}),
+    )
+
+    # WHEN the plan is computed
+    outcomes = compute(state, DHCP_INTENT)
+
+    # THEN only the pool step is emitted
+    set_ftls = [o for o in outcomes if isinstance(o, SetFtlConfig)]
+    assert len(set_ftls) == 1
+    assert any(k == "dhcp.start" for k, _ in set_ftls[0].config)
+
+
+def test_dhcp_first_enable_waits_for_the_bind():
+    """The enable ends with WaitForDhcpBind, after the active PATCH.
+
+    The PATCH lands in pihole.toml before FTL binds 67, so the wait
+    closes the window in which a status collection would sample the
+    port free and Block on a gate that self-clears (ADR-0006 §2.9).
+    """
+    # GIVEN a converged machine with DHCP disabled and no pool
+    state = converged(
+        dhcp_active=False,
+        dhcp_pool=None,
+        machine_ipv4_addresses=frozenset[str]({"192.168.1.5"}),
+    )
+
+    # WHEN the plan is computed with DHCP enabled
+    outcomes = compute(state, DHCP_INTENT)
+
+    # THEN the last DHCP outcome is the bind wait, after the active
+    # PATCH
+    dhcp_outcomes = [o for o in outcomes if isinstance(o, (SetFtlConfig, WaitForDhcpBind))]
+    assert isinstance(dhcp_outcomes[-1], WaitForDhcpBind)
+    active_index = next(
+        i
+        for i, o in enumerate(dhcp_outcomes)
+        if isinstance(o, SetFtlConfig) and any(k == "dhcp.active" for k, _ in o.config)
+    )
+    assert active_index < len(dhcp_outcomes) - 1
+
+
+def test_dhcp_pool_drift_with_active_true_does_not_wait():
+    """Pool drift with active already True → no bind wait.
+
+    FTL already demonstrably holds 67 (the port gate's exemption
+    requires it), so there is nothing to wait for.
+    """
+    # GIVEN a machine with a different pool but active already True
+    old_pool = DhcpPool(
+        start="10.0.0.10", end="10.0.0.50", router="10.0.0.1", netmask="255.255.255.0"
+    )
+    state = converged(
+        dhcp_active=True,
+        dhcp_pool=old_pool,
+        port67_free=False,
+        machine_ipv4_addresses=frozenset[str]({"10.0.0.5", "192.168.1.5"}),
+    )
+
+    # WHEN the plan is computed
+    outcomes = compute(state, DHCP_INTENT)
+
+    # THEN no WaitForDhcpBind is emitted
+    assert not any(isinstance(o, WaitForDhcpBind) for o in outcomes)
+
+
+def test_dhcp_disable_does_not_wait_for_a_bind():
+    """Disabling DHCP never waits for a bind."""
+    # GIVEN a machine with DHCP active
+    state = converged(
+        dhcp_active=True,
+        dhcp_pool=DHCP_POOL,
+        machine_ipv4_addresses=frozenset[str]({"192.168.1.5"}),
+    )
+
+    # WHEN the plan is computed with DHCP disabled
+    outcomes = compute(state, INTENT)
+
+    # THEN no WaitForDhcpBind is emitted
+    assert not any(isinstance(o, WaitForDhcpBind) for o in outcomes)
+
+
+def test_dhcp_disable_with_active_true_emits_active_false():
+    """Disabling DHCP when active emits the active-false step."""
+    # GIVEN a machine with DHCP active
+    state = converged(
+        dhcp_active=True,
+        dhcp_pool=DHCP_POOL,
+        machine_ipv4_addresses=frozenset[str]({"192.168.1.5"}),
+    )
+
+    # WHEN the plan is computed with DHCP disabled
+    outcomes = compute(state, INTENT)
+
+    # THEN the active-false step is emitted
+    set_ftls = [o for o in outcomes if isinstance(o, SetFtlConfig)]
+    assert len(set_ftls) == 1
+    assert set_ftls[0].config == (("dhcp.active", False),)
+
+
+def test_dhcp_disabled_with_active_none_emits_active_false():
+    """Unknown as open: active None drifts to the active-false step."""
+    # GIVEN a machine where dhcp_active is None (unreadable)
+    state = converged(dhcp_active=None, dhcp_pool=None)
+
+    # WHEN the plan is computed with DHCP disabled
+    outcomes = compute(state, INTENT)
+
+    # THEN the active-false step is emitted — unknown is not False
+    set_ftls = [o for o in outcomes if isinstance(o, SetFtlConfig)]
+    assert len(set_ftls) == 1
+    assert set_ftls[0].config == (("dhcp.active", False),)
+
+
+def test_dhcp_enabled_converged_yields_no_dhcp_steps():
+    """Enabled + converged → no DHCP steps from _dhcp_steps."""
+    # GIVEN a machine where DHCP is already enabled with the right pool
+    state = converged(
+        dhcp_active=True,
+        dhcp_pool=DHCP_POOL,
+        machine_ipv4_addresses=frozenset[str]({"192.168.1.5"}),
+    )
+
+    # WHEN the plan is computed
+    outcomes = compute(state, DHCP_INTENT)
+
+    # THEN no SetFtlConfig for DHCP is emitted
+    dhcp_keys = {"dhcp.start", "dhcp.end", "dhcp.router", "dhcp.netmask", "dhcp.active"}
+    for o in outcomes:
+        if isinstance(o, SetFtlConfig):
+            for k, _ in o.config:
+                assert k not in dhcp_keys
+
+
+def test_dhcp_unservable_skips_dhcp_steps():
+    """Enabled + unservable → no DHCP steps even though pool drifted."""
+    # GIVEN a machine with no IPv4 addresses in the pool's subnet
+    state = converged(
+        dhcp_active=False,
+        dhcp_pool=None,
+        machine_ipv4_addresses=frozenset({"10.0.0.1"}),
+    )
+
+    # WHEN the plan is computed with DHCP enabled
+    outcomes = compute(state, DHCP_INTENT)
+
+    # THEN no DHCP steps are emitted — the status handler re-derives
+    # the Blocked message from the same state
+    dhcp_keys = {"dhcp.start", "dhcp.end", "dhcp.router", "dhcp.netmask", "dhcp.active"}
+    for o in outcomes:
+        if isinstance(o, SetFtlConfig):
+            for k, _ in o.config:
+                assert k not in dhcp_keys
+
+
+# -- plugs_for with DHCP. ----------------------------------------------
+
+
+def test_plugs_for_with_dhcp_enabled_includes_dhcp_plugs():
+    """plugs_for(enabled) includes network/firewall control plugs."""
+    # GIVEN an intent with DHCP enabled
+    # WHEN the required plugs are computed
+    plugs = plugs_for(DHCP_INTENT)
+    # THEN the DHCP plugs are included alongside the unconditional ones
+    assert "network-control" in plugs
+    assert "firewall-control" in plugs
+    for plug in UNCONDITIONAL_PLUGS:
+        assert plug in plugs
+
+
+def test_plugs_for_with_dhcp_disabled_equals_unconditional():
+    """plugs_for(disabled) equals UNCONDITIONAL_PLUGS."""
+    # GIVEN an intent with DHCP disabled
+    # WHEN the required plugs are computed
+    plugs = plugs_for(INTENT)
+    # THEN only the unconditional plugs are required
+    assert plugs == UNCONDITIONAL_PLUGS
+
+
+def test_first_dhcp_enable_with_missing_plugs_gates_restart_before_patch():
+    """The plug-drift restart is gated before the DHCP PATCHes.
+
+    The first DHCP enable on a machine whose DHCP plugs are missing
+    emits ConnectPlugs + RestartFtl (plug drift) followed by the DHCP
+    PATCHes. The restart leaves the API down, so AwaitApi must sit
+    between RestartFtl and the first SetFtlConfig — without it the
+    first enable goes Blocked with an unreachable-API error (the NTP
+    restart already had this gate; the plug-drift restart is the same
+    class).
+    """
+    # GIVEN a machine where DHCP plugs are not connected and DHCP is
+    # not yet enabled (the first-enable shape: pool and active both
+    # drift, so the DHCP PATCHes follow the plug-drift restart)
+    state = converged(
+        connected_plugs=frozenset(UNCONDITIONAL_PLUGS),
+        machine_ipv4_addresses=frozenset[str]({"192.168.1.5"}),
+    )
+
+    # WHEN the plan is computed with DHCP enabled
+    outcomes = compute(state, DHCP_INTENT)
+
+    # THEN ConnectPlugs carries the DHCP plugs, and RestartFtl follows
+    kinds = [type(o) for o in outcomes]
+    assert ConnectPlugs in kinds
+    connect_idx = kinds.index(ConnectPlugs)
+    connect = outcomes[connect_idx]
+    assert isinstance(connect, ConnectPlugs)
+    assert "network-control" in connect.plugs
+    assert "firewall-control" in connect.plugs
+    assert RestartFtl in kinds
+    # The restart leaves the API down, so the DHCP PATCHes that follow
+    # must be gated: AwaitApi sits between RestartFtl and the first
+    # SetFtlConfig, or the first enable goes Blocked with an
+    # unreachable-API error (the NTP restart already had this gate; the
+    # plug-drift restart is the same class).
+    restart_idx = kinds.index(RestartFtl)
+    await_idx = kinds.index(AwaitApi)
+    first_set_ftl = next(i for i, o in enumerate(outcomes) if isinstance(o, SetFtlConfig))
+    assert restart_idx < await_idx < first_set_ftl
+
+
+# -- open_ports with DHCP. --------------------------------------------
+
+
+def test_open_ports_with_dhcp_enabled_includes_dhcp_ports():
+    """open_ports(enabled) includes 67/udp — DHCPv6 is not managed."""
+    # GIVEN an intent with DHCP enabled
+    # WHEN the ports to open are computed
+    ports = open_ports(DHCP_INTENT)
+    # THEN 67/udp is opened and 547/udp (DHCPv6) is not
+    assert ("udp", 67) in ports
+    assert ("udp", 547) not in ports
+
+
+def test_open_ports_with_dhcp_disabled_excludes_dhcp_ports():
+    """open_ports(disabled) does not include DHCP ports."""
+    # GIVEN an intent with DHCP disabled
+    # WHEN the ports to open are computed
+    ports = open_ports(INTENT)
+    # THEN no DHCP port is opened
+    assert ("udp", 67) not in ports
+    assert ("udp", 547) not in ports
+
+
+# -- dhcp_unservable (pure). ------------------------------------------
+
+
+def test_dhcp_unservable_with_address_in_subnet_is_false():
+    """An address inside the pool subnet → False."""
+    # GIVEN a machine with an address inside the pool subnet
+    state = converged(machine_ipv4_addresses=frozenset[str]({"192.168.1.5"}))
+    # THEN the pool is servable
+    assert dhcp_unservable(state, DHCP_INTENT) is False
+
+
+def test_dhcp_unservable_with_only_addresses_outside_is_true():
+    """Only addresses outside the pool subnet → True."""
+    # GIVEN a machine with only addresses outside the pool subnet
+    state = converged(machine_ipv4_addresses=frozenset[str]({"10.0.0.1", "172.16.0.1"}))
+    # THEN the pool is unservable
+    assert dhcp_unservable(state, DHCP_INTENT) is True
+
+
+def test_dhcp_unservable_with_empty_addresses_is_true():
+    """Empty address set -> True (unknown is unservable -- safe)."""
+    # GIVEN a machine with no readable addresses
+    state = converged(machine_ipv4_addresses=frozenset[str]())
+    # THEN the pool is unservable
+    assert dhcp_unservable(state, DHCP_INTENT) is True
+
+
+def test_dhcp_unservable_with_unreadable_addresses_is_true():
+    """Unreadable addresses (None) -> True (safe direction)."""
+    # GIVEN a machine whose addresses could not be read
+    state = converged(machine_ipv4_addresses=None)
+    # THEN the pool is unservable
+    assert dhcp_unservable(state, DHCP_INTENT) is True
+
+
+def test_dhcp_unservable_disabled_is_false():
+    """Disabled DHCP -> False regardless of addresses."""
+    # GIVEN DHCP disabled with no readable addresses
+    state = converged(machine_ipv4_addresses=frozenset[str]())
+    # THEN the gate does not fire
+    assert dhcp_unservable(state, INTENT) is False
+
+
+def test_in_pool_subnet_inside():
+    """An address inside the pool subnet returns True."""
+    # GIVEN an address inside the pool subnet
+    # THEN it is in the subnet
+    assert in_pool_subnet("192.168.1.5", DHCP_POOL) is True
+
+
+def test_in_pool_subnet_outside():
+    """An address outside the pool subnet returns False."""
+    # GIVEN an address outside the pool subnet
+    # THEN it is not in the subnet
+    assert in_pool_subnet("10.0.0.1", DHCP_POOL) is False
+
+
+def test_in_pool_subnet_malformed_returns_false():
+    """Malformed pool values return False (safety net)."""
+    # GIVEN a malformed pool
+    bad_pool = DhcpPool(start="bad", end="bad", router="bad", netmask="bad")
+    # THEN no address is in it
+    assert in_pool_subnet("192.168.1.5", bad_pool) is False
+
+
+def test_dhcp_unservable_reason_names_the_pool():
+    """The reason message names the pool range and netmask."""
+    # GIVEN a machine with no address in the pool subnet
+    state = converged(machine_ipv4_addresses=frozenset[str]({"10.0.0.1"}))
+    # WHEN the reason is computed
+    reason = dhcp_unservable_reason(state, DHCP_INTENT)
+    # THEN it names the pool and points at snap-constraints
+    assert "192.168.1.10-192.168.1.50/255.255.255.0" in reason
+    assert "snap-constraints" in reason
+
+
+def test_dhcp_unservable_reason_names_unreadable_addresses():
+    """The reason names the failed read, not a missing match."""
+    # GIVEN a machine whose addresses could not be read
+    state = converged(machine_ipv4_addresses=None)
+    # WHEN the reason is computed
+    reason = dhcp_unservable_reason(state, DHCP_INTENT)
+    # THEN it names the failed read
+    assert "could not be read" in reason
+
+
+def test_dhcp_does_not_appear_in_bootstrap():
+    """DHCP not in bootstrap: deferred to first converge."""
+    # GIVEN a machine with no snap and DHCP enabled in intent
+    outcomes = compute(SnapAbsent(), DHCP_INTENT)
+    # THEN no bootstrap step touches a DHCP key
+    dhcp_keys = {"dhcp.start", "dhcp.end", "dhcp.router", "dhcp.netmask", "dhcp.active"}
+    for o in outcomes:
+        if isinstance(o, SetFtlConfig):
+            for k, _ in o.config:
+                assert k not in dhcp_keys
+
+
+# -- dhcp_port_blocked (pure). -----------------------------------------
+
+
+def test_dhcp_port_blocked_when_enabled_and_port_taken():
+    """Enabled + not active + 67 taken → True."""
+    # GIVEN DHCP enabled in intent, not yet active, and 67/udp held
+    state = converged(dhcp_active=False, port67_free=False)
+    # THEN the gate fires
+    assert dhcp_port_blocked(state, DHCP_INTENT) is True
+
+
+def test_dhcp_port_blocked_false_when_already_active():
+    """Active + FTL up + 67 taken → False (FTL holds the port)."""
+    # GIVEN DHCP already active with FTL up and 67/udp held
+    state = converged(dhcp_active=True, ftl_active=True, port67_free=False)
+    # THEN the gate does not fire — the listener is the daemon's own
+    assert dhcp_port_blocked(state, DHCP_INTENT) is False
+
+
+def test_dhcp_port_blocked_fires_when_active_but_ftl_down():
+    """Active + FTL down + 67 taken → True (someone else holds it).
+
+    The exemption keys on the daemon owning the listener, not on the
+    config key: after a reboot where another service won 67,
+    ``dhcp.active`` is still true but FTL is down, so the port holder
+    is not FTL and the gate must fire with the port remedy.
+    """
+    # GIVEN DHCP configured active but FTL down, with 67/udp held
+    state = converged(dhcp_active=True, ftl_active=False, port67_free=False)
+    # THEN the gate fires — the config key alone is not evidence FTL
+    # bound the port
+    assert dhcp_port_blocked(state, DHCP_INTENT) is True
+
+
+def test_dhcp_port_blocked_false_when_port_free():
+    """Enabled + not active + 67 free → False."""
+    # GIVEN DHCP enabled in intent, not yet active, and 67/udp free
+    state = converged(dhcp_active=False, port67_free=True)
+    # THEN the gate does not fire
+    assert dhcp_port_blocked(state, DHCP_INTENT) is False
+
+
+def test_dhcp_port_blocked_fires_when_ftl_up_but_port_free():
+    """Active + FTL up + 67 free → True (FTL never bound the port).
+
+    The inverse of the exemption: FTL being up is not evidence it
+    serves DHCP — the port must be taken for the daemon to hold it.
+    """
+    # GIVEN DHCP active with FTL up but 67/udp free
+    state = converged(dhcp_active=True, ftl_active=True, port67_free=True)
+    # THEN the gate fires — FTL is not demonstrably serving
+    assert dhcp_port_blocked(state, DHCP_INTENT) is True
+
+
+def test_dhcp_port_blocked_false_when_ftl_down_and_port_free():
+    """Active + FTL down + 67 free → False (no port conflict)."""
+    # GIVEN DHCP active but FTL down with 67/udp free
+    state = converged(dhcp_active=True, ftl_active=False, port67_free=True)
+    # THEN the gate does not fire — StartFtl owns that state
+    assert dhcp_port_blocked(state, DHCP_INTENT) is False
+
+
+def test_dhcp_port_blocked_fires_when_ftl_down_and_not_active_and_port_taken():
+    """Not active + FTL down + 67 taken → True (no daemon to hold it).
+
+    The first-enable case with the daemon down: FTL cannot be the
+    port holder, so enabling would crash-loop it, and the gate must
+    fire with the port remedy rather than let StartFtl push first.
+    """
+    # GIVEN DHCP enabled in intent, not yet active, FTL down, 67 held
+    state = converged(dhcp_active=False, ftl_active=False, port67_free=False)
+    # THEN the gate fires — nothing demonstrably serves DHCP
+    assert dhcp_port_blocked(state, DHCP_INTENT) is True
+
+
+def test_dhcp_port_blocked_false_when_ftl_down_and_not_active_and_port_free():
+    """Not active + FTL down + 67 free → False (StartFtl owns it)."""
+    # GIVEN DHCP enabled in intent, not yet active, FTL down, 67 free
+    state = converged(dhcp_active=False, ftl_active=False, port67_free=True)
+    # THEN the gate does not fire — the daemon is down, not conflicted
+    assert dhcp_port_blocked(state, DHCP_INTENT) is False
+
+
+def test_dhcp_port_blocked_false_when_disabled():
+    """Disabled DHCP → False regardless of the port."""
+    # GIVEN DHCP disabled with 67/udp held
+    state = converged(dhcp_active=False, port67_free=False)
+    # THEN the gate does not fire
+    assert dhcp_port_blocked(state, INTENT) is False
+
+
+def test_dhcp_port_blocked_skips_dhcp_steps():
+    """Enabled + port taken → no DHCP steps even though pool drifted."""
+    # GIVEN DHCP enabled in intent, not yet active, and 67/udp held
+    state = converged(
+        dhcp_active=False,
+        dhcp_pool=None,
+        port67_free=False,
+        machine_ipv4_addresses=frozenset[str]({"192.168.1.5"}),
+    )
+
+    # WHEN the plan is computed with DHCP enabled
+    outcomes = compute(state, DHCP_INTENT)
+
+    # THEN no DHCP step is emitted — enabling would crash-loop FTL
+    dhcp_keys = {"dhcp.start", "dhcp.end", "dhcp.router", "dhcp.netmask", "dhcp.active"}
+    for o in outcomes:
+        if isinstance(o, SetFtlConfig):
+            for k, _ in o.config:
+                assert k not in dhcp_keys
+
+
+def test_dhcp_port_blocked_reason_names_the_remedy():
+    """The conflict reason names the port and the working remedy."""
+    # GIVEN DHCP enabled in intent with 67/udp held by another service
+    state = converged(dhcp_active=False, port67_free=False)
+    # WHEN the reason is computed
+    reason = dhcp_port_blocked_reason(state)
+    # THEN it names the port and the remedy that works with FTL down
+    assert "67/udp" in reason
+    assert "stop the other service" in reason
+    assert "dhcp-enabled=false" not in reason
+
+
+def test_dhcp_port_blocked_reason_names_the_unbound_daemon():
+    """The not-serving reason points at FTL's own logs."""
+    # GIVEN FTL up with DHCP active but 67/udp free
+    state = converged(dhcp_active=True, ftl_active=True, port67_free=True)
+    # WHEN the reason is computed
+    reason = dhcp_port_blocked_reason(state)
+    # THEN it names the unbound daemon, not a port conflict
+    assert "not holding 67/udp" in reason
+    assert "snap logs pihole" in reason

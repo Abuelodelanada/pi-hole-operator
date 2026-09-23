@@ -20,7 +20,9 @@ docs/roadmap.md Stage 3.
 import contextlib
 import logging
 import platform
+import socket
 import subprocess
+import time
 import tomllib
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
@@ -41,6 +43,7 @@ from pihole_state import (
     SNAP_NAME,
     AdminPasswordState,
     ApiFacts,
+    DhcpPool,
     ServiceStatus,
     SnapCheckConfigError,
     SnapCheckOk,
@@ -51,6 +54,20 @@ from pihole_state import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _bind_probe(port: int) -> bool:
+    """Whether a UDP socket can bind ``0.0.0.0:port``.
+
+    The read for the DHCP port gate: a successful bind means nothing
+    holds the port. Total by contract — a fact never raises.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.bind(("0.0.0.0", port))
+    except OSError:
+        return False
+    return True
 
 
 FTL_SERVICE = "pihole-ftl"
@@ -68,6 +85,14 @@ BLOCKING_ACTIVE_KEY = "dns.blocking.active"
 DNSSEC_KEY = "dns.dnssec"
 """FTL config keys read from pihole.toml for the Stage 2 diff."""
 
+DHCP_ACTIVE_KEY = "dhcp.active"
+DHCP_POOL_KEYS: tuple[str, ...] = ("dhcp.start", "dhcp.end", "dhcp.router", "dhcp.netmask")
+"""The four DHCP pool keys, applied atomically before ``dhcp.active``.
+
+Read back as a group: a partial pool is no pool. See snap-constraints
+§4.4.
+"""
+
 INSTALL_ATTEMPTS = 3
 INSTALL_WAIT = tenacity.wait_fixed(2) + tenacity.wait_random(0, 5)
 """Bounded, in-hook retry for a snap store that is genuinely flaky."""
@@ -80,6 +105,22 @@ Absolute path because a hook's PATH is Juju's, not a login shell's. A
 failed detection must degrade to "not a container" rather than raise.
 See ADR-0002 section 2.2.2.
 """
+
+IP_CMD = "/usr/bin/ip"
+"""Absolute path for the same reason as `DETECT_VIRT_CMD`: a hook's
+PATH is Juju's, and a missed `ip` would silently block DHCP with a
+misleading remedy."""
+
+SS_CMD = "/usr/bin/ss"
+"""Absolute path for the same reason as `IP_CMD`: a hook's PATH is
+Juju's, and a missed `ss` would fail the DHCP bind wait."""
+
+DHCP_BIND_PROCESS = "pihole-FTL"
+"""The process name FTL runs under: launcher-ftl.sh `exec`s the
+binary."""
+
+DHCP_BIND_POLL_INTERVAL = 2.0
+"""Seconds between `ss -lunp` polls while waiting for the bind."""
 
 SNAPD_REMEDY = "check `snap changes` and `journalctl -u snapd` on the machine"
 """Where to look when snapd failed for a reason we cannot name."""
@@ -202,6 +243,9 @@ class Pihole:
         retry_wait: tenacity.wait.WaitBaseT = INSTALL_WAIT,
         machine: Callable[[], str] = platform.machine,
         api: FtlApi | None = None,
+        probe_udp_port: Callable[[int], bool] = _bind_probe,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._cache_factory = cache_factory
         self._run = run
@@ -211,6 +255,12 @@ class Pihole:
         self._retry_wait = retry_wait
         self._machine = machine
         self._api = api or FtlApi(snap_data=snap_data)
+        self._probe_udp_port = probe_udp_port
+        # Injected together, like FtlApi's: every bounded wait here is
+        # a deadline plus a sleep, and a test that fakes one without
+        # the other measures wall-clock time by accident.
+        self._monotonic = monotonic
+        self._sleep = sleep
 
     # -- Facts. Every one of these is safe to call at any time. --------
 
@@ -292,9 +342,81 @@ class Pihole:
         """Return `dns.dnssec`, or None if unreadable."""
         return self._ftl_config_bool(DNSSEC_KEY)
 
+    def dhcp_active(self) -> bool | None:
+        """Return ``dhcp.active``, or None if unreadable."""
+        return self._ftl_config_bool(DHCP_ACTIVE_KEY)
+
+    def dhcp_pool(self) -> DhcpPool | None:
+        """Return the four DHCP pool keys as a ``DhcpPool``.
+
+        None when any key is absent — a partial pool is no pool.
+        Total by contract: a fact never raises.
+        """
+        start = self._ftl_config_value(DHCP_POOL_KEYS[0])
+        end = self._ftl_config_value(DHCP_POOL_KEYS[1])
+        router = self._ftl_config_value(DHCP_POOL_KEYS[2])
+        netmask = self._ftl_config_value(DHCP_POOL_KEYS[3])
+        if start is None or end is None or router is None or netmask is None:
+            return None
+        return DhcpPool(start=start, end=end, router=router, netmask=netmask)
+
+    def machine_ipv4_addresses(self) -> frozenset[str] | None:
+        """Return the IPv4 addresses on non-loopback interfaces.
+
+        Runs ``ip -4 -o addr show`` and parses the output. None when
+        the command cannot be run or exits non-zero — the read failed,
+        which is not the same as "no addresses". An empty set means
+        the read succeeded and found none. Both make ``dhcp_unservable``
+        return True, but the Blocked message distinguishes them.
+        """
+        try:
+            completed = self._run(
+                [IP_CMD, "-4", "-o", "addr", "show"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as err:
+            logger.warning("could not read machine IPv4 addresses: %s", err)
+            return None
+
+        if completed.returncode != 0:
+            logger.warning("could not read machine IPv4 addresses: %s", completed.stderr.strip())
+            return None
+
+        addresses: set[str] = set()
+        for line in completed.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 6 and parts[2] == "inet":
+                # The scope token's column varies (`brd` is optional),
+                # so find it rather than assume a position. Only
+                # global-scope addresses are servable: host-scope is
+                # loopback-like, and link-scope (169.254/16) is not
+                # routable to DHCP clients.
+                try:
+                    scope_idx = parts.index("scope")
+                except ValueError:
+                    continue
+                if scope_idx + 1 < len(parts) and parts[scope_idx + 1] == "global":
+                    addresses.add(parts[3].split("/", 1)[0])
+        return frozenset(addresses)
+
     def port53_released(self) -> bool:
         """Report whether port 53 is free for Pi-hole."""
         return resolved.is_port53_released(self._resolved_drop_in)
+
+    def port67_free(self) -> bool:
+        """Probe whether 67/udp is free for FTL's DHCP server.
+
+        FTL binds 67/udp when ``dhcp.active`` is true; if something
+        else holds the port, FTL crash-loops via ``restart-condition:
+        on-failure`` (snap-constraints §4.4). A bind probe is the
+        pre-flight gate for the enable — the key landing in
+        ``pihole.toml`` is not evidence the daemon can serve, so the
+        gate is what stops an enable into a conflict. Total by
+        contract: a fact never raises.
+        """
+        return self._probe_udp_port(67)
 
     def api_ready(self) -> bool:
         """Report whether `GET /api/dns/blocking` is answered."""
@@ -944,6 +1066,66 @@ class Pihole:
                     f"/var/snap/{SNAP_NAME}/common/var/log/pihole/FTL.log"
                 ),
             ) from err
+
+    def wait_for_dhcp_bind(self, timeout: float) -> None:
+        """Block until FTL demonstrably holds 67/udp, or give up.
+
+        The DHCP enable PATCHes land in pihole.toml before FTL binds
+        the port, so the wait closes the window in which a status
+        collection would sample 67 free and Block on a gate that
+        self-clears. The evidence is the owner, not the port:
+        `ss -lunp` must name pihole-FTL on a 67/udp socket — a free
+        port is not proof FTL serves DHCP (rule 6).
+
+        Raises:
+            PiholeError: FTL never bound the port within `timeout`.
+        """
+        deadline = self._monotonic() + timeout
+        while True:
+            if self._dhcp_bind_held():
+                return
+            if self._monotonic() >= deadline:
+                raise PiholeError(
+                    operation="waiting for FTL to bind 67/udp",
+                    expected=f"pihole-FTL to hold the port within {timeout:.0f}s",
+                    actual="it never bound it",
+                    remedy=(
+                        "check `snap logs pihole-by-rajannpatel` for why the "
+                        "DHCP server did not start"
+                    ),
+                )
+            self._sleep(DHCP_BIND_POLL_INTERVAL)
+
+    def _dhcp_bind_held(self) -> bool:
+        """Whether `ss -lunp` names pihole-FTL on a 67/udp socket.
+
+        Total by contract: a fact never raises. A failed read is "not
+        held" — the wait keeps polling and the timeout names the
+        failure.
+        """
+        try:
+            completed = self._run(
+                [SS_CMD, "-lunp"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as err:
+            logger.warning("could not read listening UDP sockets: %s", err)
+            return False
+        if completed.returncode != 0:
+            return False
+        for line in completed.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            # The local address column ends in :67 for the DHCP
+            # listener; a bare substring check would match :6700.
+            if not parts[3].endswith(":67"):
+                continue
+            if DHCP_BIND_PROCESS in line:
+                return True
+        return False
 
     def apply_ftl_config(self, password: str, config: Mapping[str, object]) -> None:
         """Apply FTL config keys via the HTTP API, and read back.

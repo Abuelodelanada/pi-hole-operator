@@ -19,7 +19,7 @@ from typing import cast
 import jubilant
 
 from pihole_state import SNAP_REVISIONS
-from tests.integration.conftest import APP_NAME, DEPLOY_TIMEOUT
+from tests.integration.conftest import APP_NAME, DEPLOY_TIMEOUT, settled
 
 FTL_SERVICE = "snap.pihole-by-rajannpatel.pihole-ftl.service"
 PIHOLE_TOML = "/var/snap/pihole-by-rajannpatel/current/etc/pihole/pihole.toml"
@@ -42,17 +42,6 @@ def ftl_pid(juju: jubilant.Juju) -> str:
     pid = result.stdout.strip()
     assert pid not in ("", "0"), "FTL is not running, so a PID comparison proves nothing"
     return pid
-
-
-def settled(status: jubilant.Status) -> bool:
-    """Both the workload and the agent are done.
-
-    `all_active` alone gates on *workload* status, which stays `active`
-    for the whole reconcile — with `successes=3` at one second that
-    window can close before the hook even starts, and the assertions
-    then race the charm.
-    """
-    return jubilant.all_active(status) and jubilant.all_agents_idle(status)
 
 
 def logged(juju: jubilant.Juju, needle: str) -> int:

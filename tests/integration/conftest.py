@@ -33,6 +33,17 @@ BASE = "ubuntu@26.04"
 DEPLOY_TIMEOUT = 900
 
 
+def settled(status: jubilant.Status) -> bool:
+    """Both the workload and the agent are done.
+
+    ``all_active`` alone gates on *workload* status, which stays
+    ``active`` for the whole reconcile — with ``successes=3`` at one
+    second that window can close before the hook even starts, and the
+    assertions then race the charm.
+    """
+    return jubilant.all_active(status) and jubilant.all_agents_idle(status)
+
+
 @pytest.fixture(scope="module")
 def app_name() -> str:
     """The name the charm is deployed under."""

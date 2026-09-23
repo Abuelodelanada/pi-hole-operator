@@ -275,3 +275,24 @@ def _refuse_to_unlink(_path: pathlib.Path, *, missing_ok: bool = False) -> None:
 
 def _unlink_nothing(_path: pathlib.Path, *, missing_ok: bool = False) -> None:
     """Stand in for a deletion that succeeds and deletes nothing."""
+
+
+def test_resolved_error_survives_the_traceback_assignment():
+    """ResolvedError is not frozen — ops assigns __traceback__.
+
+    The `remove` handler re-raises it, so ops' `_event_context` assigns
+    `exc.__traceback__` on the way out; a frozen dataclass would raise
+    `FrozenInstanceError` and bury the real failure.
+    """
+    # GIVEN the one exception this module owns
+    err = resolved.ResolvedError(
+        operation="restarting systemd-resolved",
+        expected="a successful restart",
+        actual="systemctl reported a failure",
+        remedy="run `systemctl status systemd-resolved` on the machine",
+    )
+
+    # WHEN ops' `_event_context` assigns `__traceback__` on the way out
+    err.__traceback__ = err.__traceback__
+
+    # THEN the assignment does not raise — the exception is not frozen

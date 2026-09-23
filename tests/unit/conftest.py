@@ -98,6 +98,7 @@ def mock_pihole(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     mock.api_facts.return_value = api_facts()
     mock.admin_password_state.return_value = pihole_state.PasswordAccepted()
     mock.port53_released.return_value = True
+    mock.port67_free.return_value = True
     mock.ntp_server_active.return_value = False
     mock.upstream_dns.return_value = None
     mock.listening_mode.return_value = None
@@ -105,6 +106,9 @@ def mock_pihole(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     mock.dnssec_enabled.return_value = False
     mock.connected_plugs.return_value = frozenset(pihole_state.UNCONDITIONAL_PLUGS)
     mock.gravity_schedule.return_value = None
+    mock.dhcp_active.return_value = False
+    mock.dhcp_pool.return_value = None
+    mock.machine_ipv4_addresses.return_value = frozenset()
     mock.snap_check.return_value = pihole_state.SnapCheckOk()
     monkeypatch.setattr(charm.pihole, "Pihole", lambda: mock)
     return mock
@@ -294,6 +298,10 @@ class FakeRunner:
     binary does, because the workload module runs it to sharpen an
     install failure. The default is **not** a container, so a test only
     says otherwise when that is the point of the test.
+
+    ``stdout_script`` is consulted for non-detect-virt commands: a
+    callable that receives the argv and returns stdout, defaulting to
+    the empty string so existing tests are unaffected.
     """
 
     def __init__(
@@ -303,11 +311,13 @@ class FakeRunner:
         *,
         container: str | None = None,
         detect_virt_error: OSError | None = None,
+        stdout_script: Callable[[Sequence[str]], str] | None = None,
     ) -> None:
         self.returncode = returncode
         self.effect = effect
         self.container = container
         self.detect_virt_error = detect_virt_error
+        self.stdout_script = stdout_script
         self.calls: list[list[str]] = []
 
     def __call__(
@@ -324,17 +334,20 @@ class FakeRunner:
             return self._detect_virt(args)
         if self.effect is not None:
             self.effect(args)
+        stdout = ""
+        if self.stdout_script is not None:
+            stdout = self.stdout_script(args)
         if check and self.returncode != 0:
             raise subprocess.CalledProcessError(
                 self.returncode,
                 list(args),
-                output="",
+                output=stdout,
                 stderr="Usage: pihole [options]",
             )
         return subprocess.CompletedProcess(
             args=list(args),
             returncode=self.returncode,
-            stdout="",
+            stdout=stdout,
             stderr="",
         )
 
@@ -542,6 +555,8 @@ def write_pihole_toml(
     listening_mode: str | None = None,
     blocking_active: bool | None = None,
     dnssec: bool | None = None,
+    dhcp_active: bool | None = None,
+    dhcp_pool: pihole_state.DhcpPool | None = None,
     raw: str | None = None,
 ) -> None:
     """Write the subset of `pihole.toml` this charm reads back."""
@@ -574,6 +589,15 @@ def write_pihole_toml(
         lines += dns_lines
     if blocking_active is not None:
         lines += ["[dns.blocking]", f"active = {str(blocking_active).lower()}"]
+    if dhcp_active is not None or dhcp_pool is not None:
+        lines.append("[dhcp]")
+        if dhcp_active is not None:
+            lines.append(f"active = {str(dhcp_active).lower()}")
+        if dhcp_pool is not None:
+            lines.append(f'start = "{dhcp_pool.start}"')
+            lines.append(f'end = "{dhcp_pool.end}"')
+            lines.append(f'router = "{dhcp_pool.router}"')
+            lines.append(f'netmask = "{dhcp_pool.netmask}"')
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -624,7 +648,11 @@ def workload(
         snap_data=snap_data,
         resolved_drop_in=drop_in,
         retry_wait=tenacity.wait_none(),
-        # The clock belongs to the API client, not to the snap wrapper:
-        # `Pihole` never reads the time itself.
+        # The clock is shared by the API client and the snap wrapper:
+        # both bounded waits (API readiness, DHCP bind) are a deadline
+        # plus a sleep, and a test that fakes one without the other
+        # measures wall-clock time by accident.
         api=ftl_api.FtlApi(snap_data=snap_data, sleep=clock.sleep, monotonic=clock.monotonic),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
     )

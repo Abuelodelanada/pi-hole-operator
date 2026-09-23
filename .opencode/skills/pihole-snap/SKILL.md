@@ -145,9 +145,12 @@ error: ... (invalid option name: "listeningMode")
 
 Notable unreachable keys:
 
-- **`dns.listeningMode`** — the worst one. Default is `LISTEN_LOCAL`; a Pi-hole
-  serving a network needs `LISTEN_ALL`. **The charm's primary use case cannot be
-  configured declaratively.**
+- **`dns.listeningMode`** — the worst one. Default is `LOCAL`; a Pi-hole
+  serving a network needs `ALL`. **The charm's primary use case cannot be
+  configured declaratively.** The accepted values are `LOCAL`, `SINGLE`,
+  `BIND`, `ALL`, `NONE` — *not* the `LISTEN_LOCAL`/`LISTEN_ALL` spellings the
+  wiki uses (verified 2026-09-22: `pihole-FTL --config dns.listeningMode
+  LISTEN_ALL` is rejected as invalid).
 - `dns.queryLogging`, `dns.blockTTL`, `dns.revServers`, `dns.cnameRecords`,
   `dns.hostRecord`, `dns.bogusPriv`, `dns.domainNeeded`, `dns.expandHosts`,
   `dns.rateLimit.count`, `dns.rateLimit.interval`,
@@ -202,15 +205,32 @@ error: ... (run hook "configure": Error applying ftl.dhcp.active=true)
         #   -> "DHCP start address is not valid" (exit 3)
 ```
 
-Write `dhcp.start`, `dhcp.end`, `dhcp.router` **before** `dhcp.active`. And if
+Write `dhcp.start`, `dhcp.end`, `dhcp.router`, `dhcp.netmask` **before**
+`dhcp.active`. And if
 the bind on port 67 fails, FTL does not degrade — it crash-loops via
 `Restart=on-failure`.
 
-**NOT VERIFIED**: whether DHCP works end-to-end under strict confinement. In
-testing the bind failed with `EADDRINUSE` (LXD's dnsmasq on `lxdbr0:67`), which
-is a port conflict rather than an AppArmor denial — so confinement does not
-*appear* to be the blocker, but it was never proven on a host with 67 free. Test
-in a dedicated VM before exposing DHCP in the charm.
+**VERIFIED 2026-09-22** (Stage 7 spike): DHCP works end-to-end under strict
+confinement. On a scratch LXD container with port 67 free, `network-control` +
+`firewall-control` connected, `dns.listeningMode=ALL`, and a pool matching the
+interface's subnet, FTL bound `0.0.0.0:67` with no AppArmor denial and no
+crash-loop, and a client on a dedicated LXD bridge (dnsmasq disabled) received a
+lease from FTL. The earlier `EADDRINUSE` was LXD's host dnsmasq on `lxdbr0:67` —
+a port conflict, not confinement.
+
+Further findings from the same spike:
+
+- **The serving interface needs an address in the pool's subnet.** Unaddressed,
+  FTL logs `dnsmasq: no address range available for DHCP request via <iface>`
+  and clients fall back to link-local.
+- **`snap set` cannot move the pool in place** — each single-key change creates
+  an invalid intermediate range and the transaction aborts (the error message
+  lies: "DHCP router address should not be within DHCP range"). Sequence:
+  `active=false` → pool → `active=true`, each restarting FTL (~60s).
+- **The HTTP API applies the pool atomically** — one `PATCH /api/config` with
+  the whole `dhcp` object lands with no intermediate state. The charm applies
+  config through the API, so Stage 7 needs no disable/enable dance; the
+  mandatory order still applies to the first enable.
 
 ### Admin password
 
@@ -252,7 +272,7 @@ Verified with `ss -tulpn`:
 | 80 tcp | admin UI + API | default `webserver.port = "80o,443os,[::]:80o,[::]:443os"`; the `o` suffix means *optional* — it does not fail if taken |
 | 443 tcp | HTTPS | self-signed: the launcher generates `tls.pem` on first boot (PR #15; verified in the 1400/1398 pins, re-verified unchanged in 1417/1415 on 2026-09-18); `webserver.tls.cert` overrides |
 | **123 udp** | **NTP server — active by default** | `ntp.ipv4.active` / `ntp.ipv6.active` default `true`. Unexpected attack surface. Both keys are reachable, so the charm should either open it deliberately or set them `false`. |
-| 67 / 547 udp | DHCP / DHCPv6 | only when `dhcp.active=true` |
+| 67 udp | DHCP | only when `dhcp.active=true`. DHCPv6 (547/udp) is not enabled by this charm — it manages no `dhcp.ipv6` key. |
 | 4711 | **not used** | that was FTL v5's telnet API. v6 serves the API over HTTP on `webserver.port`. |
 
 ## Paths

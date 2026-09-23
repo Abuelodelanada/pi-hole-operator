@@ -119,6 +119,7 @@ class PiholeCharm(ops.CharmBase):
                         self._apply(outcome)
 
                     self._report_version(state)
+
                 case _ as unreachable:
                     assert_never(unreachable)
         except WORKLOAD_ERRORS as err:
@@ -156,6 +157,8 @@ class PiholeCharm(ops.CharmBase):
                 self._pihole.await_api(timeout)
             case pihole_state.SetFtlConfig(config=config, password=password):
                 self._pihole.apply_ftl_config(password=password, config=dict(config))
+            case pihole_state.WaitForDhcpBind(timeout=timeout):
+                self._pihole.wait_for_dhcp_bind(timeout)
             case pihole_state.WriteGravityTimer(schedule=schedule):
                 self._pihole.write_gravity_timer(schedule)
             case pihole_state.RemoveGravityTimer():
@@ -166,13 +169,14 @@ class PiholeCharm(ops.CharmBase):
                 assert_never(unreachable)
 
     def _advertise_ports(self, intent: pihole_state.PiholeIntent) -> None:
-        """Tell Juju which ports this intent serves, NTP's when enabled.
+        """Tell Juju which ports this intent serves.
 
-        Declares, it does not open: FTL binds these itself, and
-        `set_ports` only records them on the unit. Whether anything
-        acts on the record is the provider's business — the LXD
-        provider has no firewaller at all, and `open-port` does
-        nothing until the application is exposed (ADR-0006 §2.8).
+        NTP's and DHCP's only when enabled. Declares, it does not
+        open: FTL binds these itself, and `set_ports` only records
+        them on the unit. Whether anything acts on the record is the
+        provider's business — the LXD provider has no firewaller at
+        all, and `open-port` does nothing until the application is
+        exposed (ADR-0006 §2.8).
 
         The pure core answers protocol-and-number pairs because it
         cannot import `ops`; the conversion to `ops.Port` lives here,
@@ -198,25 +202,63 @@ class PiholeCharm(ops.CharmBase):
         """Report the unit's status.
 
         Must not mutate anything, so it reads the password rather
-        than generating one. The pushed failure is read first — see
-        ADR-0005 section 2.4. The snap's presence is established
-        before snap-check runs, because the diagnostic cannot run
-        without the snap installed.
-        """
-        if self._reconcile_failure is not None:
-            event.add_status(self._reconcile_failure)
-            return
+        than generating one. The pull gates (DHCP unservable and
+        port) are read before the pushed failure — a gate names the
+        more specific remedy, and first-added wins the tie (ADR-0005
+        §2.4). The snap's presence is established before snap-check
+        runs, because the diagnostic cannot run without the snap
+        installed.
 
+        Config is loaded (validated, read-only) because the DHCP
+        unservable gate needs the declared intent: without it, an
+        action hook — which runs collect_unit_status without a
+        reconcile — would re-report Active while DHCP was never
+        enabled. See ADR-0006 §2.9.
+        """
+        config = self.load_config(pihole_config.PiholeConfig, errors="blocked")
         # Establish the snap's presence first — snap-check cannot run
         # without it, and an absent snap is Maintenance, not Blocked.
-        match _intent_from(self._read_password()):
+        match _intent_from(self._read_password(), config):
             case pihole_state.NoIntentYet():
+                # No intent exists yet, so no pull gate can fire — the
+                # pushed failure is the only truth available (e.g. the
+                # secret write that silently did nothing).
+                if self._reconcile_failure is not None:
+                    event.add_status(self._reconcile_failure)
+                    return
                 event.add_status(ops.MaintenanceStatus("generating the admin password"))
                 return
             case pihole_state.PiholeIntent() as intent:
-                status = _machine_status(self._pihole, intent)
+                status, state = _machine_status(self._pihole, intent.admin_password)
             case _ as unreachable:
                 assert_never(unreachable)
+
+        # The unservable gate is re-derived here, not pushed from
+        # _reconcile: the pull is the single source of truth (ADR-0005
+        # §2.5), and actions run this handler without a reconcile. The
+        # gate is evaluated on every collection, so the Blocked status
+        # is not hidden behind a transient "starting" — ops resolves
+        # blocked > maintenance. The reasons are narrowed to SnapPresent
+        # and only reached under the isinstance guard.
+        if isinstance(state, pihole_state.SnapPresent):
+            if pihole_state.dhcp_unservable(state, intent):
+                event.add_status(
+                    ops.BlockedStatus(pihole_state.dhcp_unservable_reason(state, intent))
+                )
+            # The port gate is the same shape: enabling DHCP into an
+            # occupied 67/udp crash-loops FTL (snap-constraints §4.4),
+            # and the key landing in pihole.toml is not evidence the
+            # daemon can serve — rule 6. First-added wins the tie, so
+            # the unservable reason outranks this one when both fire.
+            if pihole_state.dhcp_port_blocked(state, intent):
+                event.add_status(ops.BlockedStatus(pihole_state.dhcp_port_blocked_reason(state)))
+
+        # The pushed failure is read after the pull gates: a gate
+        # names the specific remedy (the pool, the port), and
+        # first-added wins the tie — see ADR-0005 §2.4.
+        if self._reconcile_failure is not None:
+            event.add_status(self._reconcile_failure)
+            return
 
         # The charm's own machine status is added BEFORE any
         # snap-check status: ops resolves equal-priority statuses by
@@ -444,7 +486,7 @@ class PiholeCharm(ops.CharmBase):
 
 def _intent_from(
     password: str | None,
-    config: pihole_config.PiholeConfig | None = None,
+    config: pihole_config.PiholeConfig,
 ) -> pihole_state.DeclaredIntent:
     """Name what the charm can declare, given the password it holds.
 
@@ -456,28 +498,35 @@ def _intent_from(
     because that handler must not mutate anything. See rule 7 and
     ADR-0005 section 2.4.
 
-    The status handler passes no config: it needs the intent only to
-    offer the password to the API oracle, and building one from
-    unvalidated config there would invent values the reconciler never
-    applied.
+    The status handler passes validated config: it needs the intent to
+    offer the password to the API oracle and to re-derive the DHCP
+    unservable gate. `load_config(errors="blocked")` yields the same
+    validated values the reconciler applies, so nothing is invented.
     """
     if password is None:
         return pihole_state.NoIntentYet()
-    if config is None:
-        return pihole_state.PiholeIntent(admin_password=password)
     return pihole_state.PiholeIntent(admin_password=password, **config.intent_fields())
 
 
 def _machine_status(
     facts: pihole_state.PiholeFacts,
-    intent: pihole_state.PiholeIntent,
-) -> ops.StatusBase:
-    """Read the machine once and map what it finds onto one status."""
-    match pihole_state.fetch(facts, intent.admin_password):
-        case pihole_state.SnapAbsent():
-            return ops.MaintenanceStatus(f"installing the {pihole.SNAP_NAME} snap")
+    admin_password: str,
+) -> tuple[ops.StatusBase, pihole_state.PiholeState]:
+    """Read the machine once and map what it finds onto one status.
+
+    Returns the state alongside the status so the caller can re-derive
+    statuses that need the facts — the DHCP unservable and port gates.
+    Takes the password, not the intent: `fetch` is the only consumer
+    and it wants the candidate, not the whole declaration (rule 8).
+    """
+    match pihole_state.fetch(facts, admin_password):
+        case pihole_state.SnapAbsent() as absent:
+            return (
+                ops.MaintenanceStatus(f"installing the {pihole.SNAP_NAME} snap"),
+                absent,
+            )
         case pihole_state.SnapPresent() as state:
-            return _installed_status(state)
+            return _installed_status(state), state
         case _ as unreachable:
             assert_never(unreachable)
 

@@ -18,6 +18,9 @@ not the channel's contents. The working invocation pins the revision:
 revisions again). Verified live on LXD: with the pin the subordinate deploys on a
 26.04 machine, integrates, and the principal's `config` databag is published.
 "Cleared" holds only with the pin until the channel pointer moves.
+**Amended:** 2026-09-22 — §2.7's module layout gains `src/pihole_config.py` and
+`tests/unit/test_pihole_config.py`, which Stage 2 introduced (the pydantic config
+model) and the original tree did not list.
 **Related:** [ADR-0001: Charm Scope and Specification](0001-charm-scope-and-specification.md), [ADR-0003: Reconciler and Functional Core](0003-reconciler-and-functional-core.md), [ADR-0009: Split the FTL API client out of `Pihole`](0009-ftl-api-client-module.md)
 
 ---
@@ -290,12 +293,13 @@ src/
   pihole.py              # snapd + $SNAP_DATA reads. Never imports ops.
   ftl_api.py             # FTL's HTTP API and its sessions. Never imports ops.
   pihole_state.py        # frozen snapshot + outcome ADT + pure compute(). No IO.
+  pihole_config.py       # pydantic model of the config options. Never imports ops.
   resolved.py            # systemd-resolved drop-in. Never imports ops.
   grafana_dashboards/
   prometheus_alert_rules/
   loki_alert_rules/
 tests/
-  unit/{conftest.py,test_charm.py,test_pihole.py,test_ftl_api.py,test_pihole_state.py,test_resolved.py}
+  unit/{conftest.py,test_charm.py,test_pihole.py,test_ftl_api.py,test_pihole_state.py,test_pihole_config.py,test_resolved.py}
   integration/{conftest.py,test_deploy.py}
 ```
 

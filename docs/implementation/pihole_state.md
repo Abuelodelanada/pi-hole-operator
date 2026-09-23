@@ -21,11 +21,11 @@ It imports neither `ops` nor any workload module, which has two consequences:
    other for anything but the `FtlApi` class itself. This is why the snap path
    constants live here rather than in `pihole.py` (ADR-0009 §4).
 
-Reading `compute`, `_bootstrap`, `_converge` and their two helpers
-(`_ntp_step`, `_drifted_config`) tells you everything the charm does. They fit on
-two screens, and no number is quoted here on purpose: an exact count that no gate
-verifies goes stale on the next change, and this document has shipped stale counts
-three times.
+Reading `compute`, `_bootstrap`, `_converge` and their helpers (`_ntp_step`,
+`_drifted_config`, `_dhcp_steps`, `dhcp_unservable`, `dhcp_port_blocked`)
+tells you everything the charm does. They fit on a few screens, and no number is quoted here on purpose:
+an exact count that no gate verifies goes stale on the next change, and this
+document has shipped stale counts three times.
 
 ---
 
@@ -63,9 +63,10 @@ its refresh is held".
 
 ### The intent
 
-`PiholeIntent`, six fields: `admin_password` (declared `field(repr=False)` so
-the password cannot reach a log line through a `repr()`) plus the five Stage 2
-config values. `None` in an optional field means *not managed*: the charm never
+`PiholeIntent`: `admin_password` (declared `field(repr=False)` so the password
+cannot reach a log line through a `repr()`) plus the config values — the Stage 2
+set, `gravity_schedule`, and the Stage 7 DHCP pair (`dhcp_enabled`,
+`dhcp_pool`). `None` in an optional field means *not managed*: the charm never
 writes that key, and drift on it is not computed.
 
 What `charm.py` actually holds is `DeclaredIntent = NoIntentYet | PiholeIntent`.
@@ -104,9 +105,12 @@ function that only observes, and makes reaching for another intent field inside
   literally, in that function. The exact list lives in the source —
   this document describes shape, not counts.
 - `SnapPresent` → `_converge`, which appends conditionally in the same
-  order, minus whatever is already true. Two helpers keep it flat:
+  order, minus whatever is already true. Helpers keep it flat:
   `_ntp_step` (the tri-state NTP comparison — unknown drifts to a
-  correction) and `_drifted_config` (the FTL config diff).
+  correction), `_drifted_config` (the FTL config diff), and `_dhcp_steps`
+  (the ordered DHCP corrections — one atomic pool PATCH then the
+  `dhcp.active` PATCH, empty when `dhcp_unservable` or `dhcp_port_blocked`
+  so the Blocked gates and the rest of convergence do not fight).
 
 ---
 
@@ -115,6 +119,10 @@ function that only observes, and makes reaching for another intent field inside
 | Case | Behaviour | Why |
 |---|---|---|
 | `ntp_server_active()` returns `None` (unreadable TOML) | Treated as *open* | Unknown drifts toward the correction: it is idempotent and its own read-back adjudicates. Treating it as closed would leave 123/udp bound on a machine the charm could have fixed. |
+| `dhcp_active` returns `None` | Treated as *open*, same as NTP | Unknown drifts toward the correction. The read-back after the PATCH adjudicates. |
+| DHCP enabled but no machine address in the pool's subnet | `_dhcp_steps` returns empty; `Blocked` with the reason named | FTL would log `no address range available` and clients fall back to link-local (snap-constraints §4.4). The gate is a configuration error, not a crash loop — and everything else still converges. |
+| DHCP enabled but 67/udp is held by another process | `_dhcp_steps` returns empty; `Blocked` naming the port and the remedy | FTL crash-loops via `restart-condition: on-failure` when it cannot bind 67 (snap-constraints §4.4). The exemption is evidence-based — FTL up, DHCP active, *and* the port taken — so the inverse state (FTL up, 67 free) also Blocks, naming the unbound daemon (ADR-0006 §2.9). |
+| Pool drift while DHCP is enabled | One atomic pool PATCH, then the `dhcp.active` PATCH | `snap set` cannot move the pool in place (invalid intermediate ranges abort the transaction); one `PATCH /api/config` applies it atomically (ADR-0006 §2.9). |
 | `version` is `None` on an installed snap | `SnapPresent.version: str \| None` | The snap may declare no version. `charm.py` matches `version=str() as version` so it only reports a real one. |
 | The installed revision is not the pin for this architecture | `InstallSnap()` again — a re-pin | The hold stops snapd's timer, but a manual `snap refresh` can still move the snap. The drift check is the second line of defence (ADR-0010). |
 | An NTP correction is needed | `AwaitApi()` appended too, for the same reason | The configure hook restarts FTL whenever a *changed* value lands, so a plan that closes 123/udp cannot trust a readiness fact read before it. |
@@ -143,6 +151,7 @@ Four groups:
 | The bootstrap sequence and its order | `test_the_bootstrap_order_is_the_correctness_condition` |
 | Drift: one wrong fact yields exactly one outcome | `test_one_drifted_fact_yields_exactly_one_outcome` (parametrized) |
 | Password policy | `test_an_unverifiable_password_is_left_alone`, `test_an_empty_pwhash_is_always_reapplied` |
+| DHCP: the unservable and port gates, the ordered steps, and the bind wait | `test_dhcp_unservable_reason_names_the_pool`, `test_dhcp_port_blocked_reason_names_the_remedy`, `test_dhcp_first_enable_orders_pool_before_active`, `test_dhcp_first_enable_waits_for_the_bind` |
 | `fetch` discipline | `test_fetch_reports_an_uninstalled_machine_without_reading_further`, `test_fetch_reads_every_fact_exactly_once` |
 
 Two tests exist specifically to defend properties that no linter checks:

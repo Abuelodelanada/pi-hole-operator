@@ -7,6 +7,12 @@
 **Amended:** 2026-09-05 — `snap-channel` and `snap-revision` moved from accepted to rejected: the revision is charm policy, pinned per release and held against auto-refresh, per [ADR-0010](0010-snap-revision-is-charm-policy.md).
 **Amended:** 2026-09-05 — §2.10 removed and §2.8 rewritten: the snap self-signs TLS and self-protects its API since upstream PRs #15/#16 (byte-identical in the pinned revision 1400), so the charm no longer manages `webserver.port`.
 **Amended:** 2026-09-07 — `dns-listening-mode` narrowed to `LOCAL | ALL | NONE`; the two dropped values and the widen-vs-narrow asymmetry are recorded in the new §2.11.
+**Amended:** 2026-09-22 — §2.1 gains the five `dhcp-*` options and §2.9 is rewritten: both Stage 7 spikes are answered (flat key scheme; DHCP verified end-to-end under strict confinement), the order is two-step (pool PATCH → active PATCH), `dns-listening-mode=ALL` is required, and the unservable gate is recorded.
+**Amended:** 2026-09-22 — §2.9's port-67 exemption is now evidence-based: FTL up *and* the port taken, so the inverse state (FTL up, 67 free) also Blocks with the unbound-daemon remedy.
+**Amended:** 2026-09-22 — §2.9 gains the port-67 gate: `dhcp_port_blocked` stops an enable into an occupied 67/udp, with the exemption keyed on FTL owning the listener rather than on the config key alone.
+**Amended:** 2026-09-22 — §2.9 records the plug-retention decision: `network-control` + `firewall-control` stay connected after DHCP is disabled, because a connected plug is passive and re-enabling reconnects via drift.
+
+**Amended:** 2026-09-22 — §2.9 gains the bounded bind wait: `WaitForDhcpBind` after the enable PATCH closes the window in which a status collection would sample 67 free and Block on a self-clearing gate.
 **Related:** [ADR-0001: Charm Scope and Specification](0001-charm-scope-and-specification.md), [ADR-0004: FTL Configuration Mechanism](0004-ftl-configuration-mechanism.md), [ADR-0007: Admin Password Handling](0007-admin-password-handling.md)
 
 ---
@@ -41,6 +47,11 @@ re-added.
 | `ntp-server-enabled` | boolean, **default `false`** | See §2.3. |
 | `dnssec-enabled` | boolean | Must route through the ADR-0004 fallback — `snap set` silently drops it. |
 | `gravity-schedule` | string (systemd `OnCalendar`) | The snap **physically cannot** do this: the configure hook rejects all `timer.*` keys and the schedule is static in snap metadata. The charm writes a host systemd drop-in. Legitimately charm-owned. |
+| `dhcp-enabled` | boolean | Operational intent — whether this appliance serves DHCP. No charm owns it; not placement; not deployment shape. See §2.9. |
+| `dhcp-range-start` | string (IPv4) | Deployment-local addressing data: the *served* range, which no charm owns and Juju spaces do not express. See §2.9. |
+| `dhcp-range-end` | string (IPv4) | Same class as `dhcp-range-start`. See §2.9. |
+| `dhcp-router` | string (IPv4) | The gateway advertised to clients — deployment-local data, not placement. See §2.9. |
+| `dhcp-netmask` | string (dotted-quad IPv4) | Same class as `dhcp-range-start`; dotted-quad only, so the validator rejects prefix-length forms. The served subnet need not equal the unit's own — the unservable gate (see §2.9) is what stops a pool the machine cannot serve. See §2.9. |
 
 `pydantic` parses all of these via `self.load_config(PiholeConfig,
 errors="blocked")`. Dashes map to underscores automatically, `Field(alias=...)` is
@@ -170,7 +181,9 @@ under you.
 ops.Port("tcp", 53), ops.Port("udp", 53), ops.Port("tcp", 80), ops.Port("tcp", 443)
 ```
 
-plus 123/udp only when NTP is enabled, and 67/udp + 546/udp only when DHCP is.
+plus 123/udp only when NTP is enabled, and 67/udp only when DHCP is. DHCPv6 is
+never advertised — the charm manages no `dhcp.ipv6` key, so FTL's DHCPv6 server
+(547/udp) is never enabled.
 
 **443 is advertised** because the snap's launcher self-signs a TLS certificate on
 first boot and serves it — a real listener, with a self-signed certificate the
@@ -192,26 +205,85 @@ Three traps:
 `set_ports` is declarative and diffs against `opened_ports()`, which is what makes
 it a correct reconcile step. Do not mix it with `ops.hookcmds.open_port`.
 
-### 2.9 DHCP is accepted in principle, gated in practice
+### 2.9 DHCP is accepted, verified, and gated on servability
 
 `dhcp-enabled`, `dhcp-range-start`, `dhcp-range-end`, `dhcp-router`,
 `dhcp-netmask` — with cross-field pydantic validation so enabling DHCP without a
 complete pool is `Blocked` rather than a crash loop.
 
-**Gated on two verifications** ([snap-constraints §4.4, §9](../snap-constraints.md)):
+**Both Stage 7 spikes are answered (2026-09-22)**
+([snap-constraints §4.4](../snap-constraints.md)):
 
-1. End-to-end operation under strict confinement was never proven. The observed
-   failure was `EADDRINUSE` from LXD's `lxdbr0` dnsmasq — a port conflict, not an
-   AppArmor denial — so confinement does not *appear* to be the blocker, but that
-   must be shown on a host with 67 free.
-2. **The wiki contradicts itself on the key names**: `ftl.dhcp.start/end/router`
-   versus `ftl.dhcp.ipv4.range.start/end/router`. Both cannot be right.
+1. **DHCP works end-to-end under strict confinement.** On a scratch LXD container
+   with port 67 free, `network-control` + `firewall-control` connected,
+   `dns.listeningMode=ALL`, and a pool matching the interface's subnet, FTL bound
+   `0.0.0.0:67` with no AppArmor denial and no crash-loop, and a client on a
+   dedicated LXD bridge received a lease from FTL. The earlier `EADDRINUSE` was
+   LXD's host dnsmasq on `lxdbr0:67` — a port conflict, not confinement.
+2. **The flat key scheme lands.** `ftl.dhcp.start/end/router/netmask` → `[dhcp]`
+   in `pihole.toml`. The nested scheme (`ftl.dhcp.ipv4.range.*`) is rejected by
+   the configure hook (exit 1, transaction rolled back). The wiki's two sets are
+   not both right; the snap decides: flat.
 
-Ordering is mandatory and lives in `compute`'s output sequence: pool → router →
-`dhcp.active` **last**. Setting `active` first fails with *"DHCP start address is
-not valid"*, and `restart-condition: on-failure` turns that into a crash loop
-rather than a degraded service.
+**Ordering is two-step and lives in `compute`'s output sequence:** one atomic
+pool PATCH (`dhcp.start/end/router/netmask` together) → `dhcp.active` PATCH
+**last**. Setting `active` first fails with *"DHCP start address is not valid"*,
+and `restart-condition: on-failure` turns that into a crash loop rather than a
+degraded service. `snap set` cannot move the pool in place (invalid intermediate
+ranges abort the transaction), but one `PATCH /api/config` applies the pool
+atomically — the charm applies config through the API (ADR-0004), so no
+disable/enable dance is needed.
 
+**`dns-listening-mode=ALL` is required when DHCP is enabled.** FTL's default
+`LOCAL` binds localhost only, so every lease would point at a resolver that
+refuses the client. The pydantic validator raises → `Blocked`.
+
+**The charm must not silently enable DHCP on an interface it cannot serve.** The
+serving interface needs an address in the pool's subnet, or FTL logs `no address
+range available` and clients fall back to link-local. `compute` gates on the
+`machine_ipv4_addresses` fact: `dhcp_unservable(state, intent)` → `Blocked` with
+the reason named, and `_dhcp_steps` returns empty so everything else still
+converges. A pool whose subnet contains no machine address is a configuration
+error, not a crash loop.
+
+**The charm must not enable DHCP into an occupied 67/udp.** FTL crash-loops via
+`restart-condition: on-failure` when it cannot bind the port, so `compute` gates
+on the `port67_free` fact (a UDP bind probe): `dhcp_port_blocked(state, intent)`
+→ `Blocked` naming the port and the remedy, and `_dhcp_steps` returns empty. The
+exemption is evidence-based — FTL up **and** the port taken — not inferred from
+the config key alone (rule 6): `dhcp.active` says "we configured DHCP", not
+"FTL bound 67". After a reboot where another service won the port, the key is
+still true but the daemon is down, and the gate must fire with the port remedy
+rather than let the StartFtl push name port 53. The inverse state fires too:
+FTL up with 67/udp free means the DHCP server never bound the port, and the
+Blocked names that rather than reporting Active.
+
+**The enable is verified by a bounded wait, not by the gate alone.** The
+`dhcp.active` PATCH lands in `pihole.toml` before FTL binds 67/udp, so a status
+collection in that window would sample the port free and Block on a gate that
+self-clears. `compute` therefore appends `WaitForDhcpBind` after the enable
+PATCH: the apply step polls `ss -lunp` until `pihole-FTL` is named on a 67/udp
+socket, and fails the reconcile if the daemon never binds. The evidence is the
+owner, not the port — a free port is not proof FTL serves DHCP (rule 6).
+
+**The DHCP plugs are connected when enabled and retained after disable —
+deliberately.** `network-control` + `firewall-control` are connected on the
+first enable and never disconnected, even though the roadmap's draft promised
+"connected only when enabled". Retention is the decision, not an oversight: a
+connected plug is *passive* — it grants capability and does nothing unless FTL
+uses it, so a disabled DHCP server holds no active effect (unlike the gravity
+timer, whose `RemoveGravityTimer` exists because a running timer *is* an active
+effect). Disconnecting is itself a privileged operation that can fail mid-
+reconcile, and re-enabling reconnects through the existing plug-drift check
+(`ConnectPlugs` + `RestartFtl`), so the cycle is safe. The cost is a retained
+capability on machines that once served DHCP; revisit if a least-privilege
+review or a real conflict ever makes it matter (BACKLOG).
+
+**Ports:** 67/udp only, advertised when DHCP is enabled in config (on intent,
+not on `dhcp.active` — an unservable pool still opens the port while the Blocked
+status tells the operator what to fix). DHCPv6 is never advertised — the charm
+manages no `dhcp.ipv6` key, so FTL's DHCPv6 server (547/udp) is never enabled
+(§2.8).
 
 ### 2.11 The enum is narrower than FTL's, deliberately
 
