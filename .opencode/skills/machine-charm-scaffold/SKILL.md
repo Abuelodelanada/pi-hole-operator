@@ -7,7 +7,7 @@ description: >-
   dependencies belong. Load before running charmcraft init or hand-writing any
   of those files.
 metadata:
-  verified: "2026-08-06"
+  verified: "2026-10-04"
 ---
 
 # Machine charm scaffolding
@@ -39,13 +39,14 @@ description: |
   - Optional DHCP server mode
   - Metrics, logs, dashboards, and alerts via the cos-agent interface
 
-base: ubuntu@24.04
+base: ubuntu@26.04
 platforms:
   amd64:
   arm64:
 
+# Support for the ubuntu@26.04 base landed in Juju 3.6.17.
 assumes:
-  - juju >= 3.6
+  - juju >= 3.6.17
 
 parts:
   charm:
@@ -79,71 +80,26 @@ Notes:
 - Supported bases today: `ubuntu@22.04`, `ubuntu@24.04`, `ubuntu@24.10`,
   `ubuntu@25.04`, `ubuntu@25.10`, `ubuntu@26.04`, `almalinux@9`.
 
-## Why 24.04 and not 26.04 (verified 2026-08-07)
+## Why 26.04 (verified 2026-10-04)
 
-Ubuntu 26.04 LTS (*Resolute Raccoon*) shipped 2026-04-23, and **everything in our
-own stack is ready for it**:
+The charm is already on `base: ubuntu@26.04`. The migration happened after the
+one blocker — `opentelemetry-collector` not publishing 26.04 revisions — was
+resolved on 2026-09-07 (ADR-0002 §2.2, amended with the title "correcting an
+earlier error in this ADR"). The subordinate now publishes 26.04, so the charm
+can be on 26.04 without losing COS integration.
 
-| Component | 26.04 status |
-|---|---|
-| Juju | supported since **3.6.17** and **4.0.6**; current stable is well past both |
-| charmcraft | `base: ubuntu@26.04` valid; **`build-base` not needed** (it is LTS, not interim) |
-| Python | **3.14** — and `charmlibs` CI literally lists `'3.14',  # Ubuntu 26.04` |
-| `pydantic-core` | `cp314` manylinux wheels for every arch we target |
-| snapd | same 2.76 series as 24.04 |
-| the Pi-hole snap | already `base: core26`, so 26.04 would align host and workload |
-
-**The blocker is a third-party charm.** `opentelemetry-collector` publishes
-revisions for `22.04` and `24.04` only — **nothing for 26.04 in any channel,
-including `edge`**. Juju enforces base compatibility for a principal's
-*subordinates* (`state/application.go`, inside the loop over
-`unit.SubordinateNames()`, gated by `if !force`). So a Pi-hole unit on 26.04 cannot
-be related to `opentelemetry-collector` without `--force-base`, which means
-**26.04 today is a charm with no COS integration** — contradicting this repo's own
-design, where `cos_agent` is the one charm library we justify vendoring.
-
-Not a Store limitation: the `ubuntu` charm publishes 26.04 fine. It is ecosystem
-lag — no machine charm of operational significance (`postgresql`, `nrpe`,
-`telegraf`, `opentelemetry-collector`) had 26.04 at 3.5 months post-release.
-
-### The migration trigger
-
-Check with this, not with intuition:
-
-```bash
-curl -s "https://api.charmhub.io/v2/charms/info/opentelemetry-collector?fields=channel-map" \
-  | python3 -c "import json,sys;print(sorted({b['channel'] for e in json.load(sys.stdin)['channel-map'] for b in (e['revision']['bases'] or [])}))"
-```
-
-When `26.04` appears, migrate.
-
-### Staying 26.04-ready now, at zero cost
+### Rules that still apply on 26.04
 
 - **Never put `/` in a part name.** Forbidden on 26.04 and later bases. Use a
   hyphen.
-- **Never switch to the `charm` plugin.** It **does not exist** on the 26.04 base.
-  `uv` is the only forward-compatible choice, which we already use.
-- **Target Python 3.12, not 3.10.** The charm only ever runs on the base's
-  interpreter — 3.12 on 24.04, 3.14 on 26.04. There is no scenario where it runs on
-  3.10, and claiming `>=3.10` breaks the functional style this repo mandates:
-  ```
-  pyright pythonVersion=3.10 → error: Type alias statement requires Python 3.12 or newer
-  ruff    target-version=py310 → Cannot use `type` alias statement on Python 3.10
-  ```
-  3.12 syntax is valid on 3.14, so `>=3.12` is correct for both bases.
-- **Do not use anything that exists only in 3.12 or only in 3.14.** 26.04 jumps
-  straight from 3.12 to 3.14 (skipping 3.13) and ships **no other Python in the
-  archive** — there is no fallback interpreter to fall back to.
-- When CI is added, run the matrix on `[3.12, 3.14]` — the same shape `charmlibs`
-  uses. Cheap now, and it turns the migration into a non-event.
-
-### When you do migrate: single-base, not multi-base
-
-Multi-base is supported (`platforms: {ubuntu@24.04:amd64:, ubuntu@26.04:amd64:}`,
-and it forbids top-level `base`/`build-base`), but it doubles the revisions per
-release and forces the code to stay correct on 3.12 *and* 3.14 permanently. A charm
-with no installed user base does not need that. Publish 26.04 on a new track and
-freeze the 24.04 track. Reserve multi-base for when real users cannot move.
+- **Never switch to the `charm` plugin.** It **does not exist** on the 26.04
+  base. `uv` is the only forward-compatible choice, which we already use.
+- **Python 3.14, no fallback.** 26.04 ships Python 3.14 and **no other Python in
+  the archive** — there is no 3.13 or 3.12 to fall back to. `requires-python =
+  ">=3.14"`, `ruff target-version = "py314"`, `pyright pythonVersion = "3.14"`.
+- **Do not use anything that exists only in 3.12 or only in 3.14.** The charm
+  runs on exactly one interpreter, so code that works on 3.12 but not 3.14 (or
+  vice versa) is broken in production.
 
 - **`parts:` is not optional in practice.** Omit it and charmcraft applies the
   legacy `charm` plugin, which builds from `requirements.txt` — not what we want
@@ -175,13 +131,16 @@ freeze the 24.04 track. Reserve multi-base for when real users cannot move.
 [project]
 name = "pihole-operator"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "ops~=3.8",
     "charmlibs-snap>=1,<2",
     "charmlibs-systemd>=1,<2",
-    "pydantic>=2,<3",
-    "tenacity>=9,<10",
+    "tenacity",
+    "pydantic",
+    # PYDEPS of the vendored grafana_agent.cos_agent library (ADR-0008 §2.4).
+    # The uv plugin does not install transitive deps of charm-libs.
+    "cosl>=0.0.50",
 ]
 
 [dependency-groups]
@@ -190,7 +149,7 @@ dev = [
     "pytest",
     "pytest-cov",
     "coverage[toml]",
-    "jubilant>=1.12,<2",      # NOT >=2: jubilant 2.x does not exist, latest is 1.12.0
+    "jubilant>=1.12,<2",
     "pytest-jubilant>=2.2,<3",
     "ruff",
     "pyright",
@@ -198,15 +157,22 @@ dev = [
 
 [tool.ruff]
 line-length = 99
-target-version = "py312"
+target-version = "py314"
+extend-exclude = ["lib"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ANN", "D", "PLC0415"]
-# E501 is deliberately NOT ignored: PEP 8 only permits 99 chars on the condition
-# that prose stays at 72, so both limits have to be enforced or neither is.
+# E501 is deliberately NOT ignored: PEP 8 permits 99 characters only on the
+# condition that comments and docstrings stay at 72, so both limits are
+# enforced or neither is.
 # PLC0415 is what actually enforces "no imports inside functions" — E402 only
 # catches late module-level imports and lets `def f(): import x` through.
-ignore = ["D105", "D107"]
+ignore = [
+    "D105", # Magic methods do not need a docstring.
+    "D107", # __init__ is documented by its class docstring.
+    "D203", # Incompatible with D211, which we keep.
+    "D213", # Incompatible with D212, which we keep.
+]
 
 [tool.ruff.lint.pycodestyle]
 max-doc-length = 72   # enables W505, the PEP 8 proviso for comments/docstrings
@@ -215,19 +181,55 @@ max-doc-length = 72   # enables W505, the PEP 8 proviso for comments/docstrings
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["ANN"]
+# A test is documented by its name plus its GIVEN/WHEN/THEN comments; a
+# docstring on top of those is duplication. Annotations on fixtures and
+# helpers are still required, only the test bodies are exempt.
+"tests/*" = ["ANN201", "D103"]
 
 [tool.pyright]
 include = ["src", "tests"]
-pythonVersion = "3.12"
+exclude = ["lib"]
+pythonVersion = "3.14"
 pythonPlatform = "Linux"
 typeCheckingMode = "strict"
+# strict leaves both of these permissive, so neither is redundant. Without
+# them a `# type: ignore[reportFoo]` — mypy's spelling, which pyright does
+# not parse — silently suppresses *every* error on its line and is never
+# reported when it goes stale. `false` makes that spelling stop working, so
+# the only suppression pyright honours is `# pyright: ignore[rule]`, which
+# it validates; the report then fails the gate when one is no longer needed.
+enableTypeIgnoreComments = false
+reportUnnecessaryTypeIgnoreComment = "error"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+log_cli_level = "INFO"
+pythonpath = ["."]
+# ops runs its own unit tests this way: a deprecation warning should fail the
+# build while it is still a warning, not after it becomes a breakage.
+# The vendored cos_agent library uses pydantic v1-style APIs that trigger
+# PydanticDeprecatedSince20; we cannot fix vendored code.
+filterwarnings = [
+    "error",
+    # Module-scoped: the vendored cos_agent library calls pydantic v1-style
+    # APIs (.json(), parse_obj) that we cannot fix.
+    "ignore::pydantic.warnings.PydanticDeprecatedSince20:charms.grafana_agent.*",
+]
+markers = [
+    "dhcp: DHCP tests; need port 67 free — excluded from the default integration run",
+]
 
 [tool.coverage.run]
 branch = true
 source = ["src"]
 
 [tool.coverage.report]
+exclude_also = [
+    # Unreachable by construction. Every `match` over a closed union ends
+    # in this branch, and `tox -e static` already fails if a variant is
+    # unhandled — so pyright, not a test, is what proves it cannot run.
+    "case _ as unreachable:",
+]
 fail_under = 90
 show_missing = true
 ```
@@ -256,32 +258,42 @@ to ease migration — `Harness` is legacy, do not use it in new code.
 [tox]
 no_package = True
 skip_missing_interpreters = True
+min_version = 4.0.0
+work_dir = {env:TOX_WORK_DIR:{env:HOME}/.cache/tox/pi-hole-operator}
+requires =
+    tox-uv>=1.11
 env_list = fmt, lint, static, unit
 
 [vars]
 src_path = {tox_root}/src
 tests_path = {tox_root}/tests
+all_path = {[vars]src_path} {[vars]tests_path}
 
 [testenv]
 runner = uv-venv-lock-runner
+base_python = py314
 set_env =
-    PYTHONPATH = {tox_root}/src
+    PYTHONPATH = {tox_root}/lib:{[vars]src_path}
     PYTHONBREAKPOINT = pdb.set_trace
-pass_env = PYTHONPATH, CHARM_PATH, JUJU_*
+    PY_COLORS = 1
+pass_env =
+    PYTHONPATH
+    CHARM_PATH
+    JUJU_*
 
 [testenv:fmt]
 description = Apply coding style standards
 dependency_groups = dev
 commands =
-    ruff format {[vars]src_path} {[vars]tests_path}
-    ruff check --fix {[vars]src_path} {[vars]tests_path}
+    ruff format {[vars]all_path}
+    ruff check --fix {[vars]all_path}
 
 [testenv:lint]
 description = Check code against coding style standards
 dependency_groups = dev
 commands =
-    ruff check {[vars]src_path} {[vars]tests_path}
-    ruff format --check --diff {[vars]src_path} {[vars]tests_path}
+    ruff check {[vars]all_path}
+    ruff format --check --diff {[vars]all_path}
 
 [testenv:static]
 description = Run static type checks
@@ -292,25 +304,34 @@ commands = pyright {posargs}
 description = Run unit tests
 dependency_groups = dev
 commands =
-    coverage run --module pytest {[vars]tests_path}/unit {posargs}
+    coverage run --module pytest --tb native {[vars]tests_path}/unit {posargs}
     coverage report
 
 [testenv:integration]
-description = Run integration tests against a juju machine model
+description = Run integration tests against a Juju machine model
 dependency_groups = dev
-commands = pytest --exitfirst {[vars]tests_path}/integration {posargs}
+pass_env =
+    CHARM_PATH
+    JUJU_*
+commands = pytest --exitfirst --tb native --log-cli-level=INFO -m "not dhcp" {[vars]tests_path}/integration {posargs}
+
+[testenv:lock]
+description = Update uv.lock
+# Not the lock runner: that syncs from the lock file first, which is precisely
+# what is stale when you need this environment.
+skip_install = true
+runner = virtualenv
+allowlist_externals = uv
+commands = uv lock --upgrade
 
 [testenv:flaplint]
 description = Detect relation-databag ordering churn (advisory, not in env_list)
 skip_install = true
+runner = virtualenv
 allowlist_externals = uvx
 commands =
     uvx --python 3.12 --from git+https://github.com/michaeldmitry/flaplint@v1.1.0 \
-        flaplint {tox_root}/src --own-only --min-confidence high
-
-[testenv:lock]
-description = Update uv.lock
-commands = uv lock --upgrade
+        flaplint {[vars]src_path} --own-only --min-confidence high
 ```
 
 `flaplint` is deliberately **outside** `env_list`. It catches a defect class ruff
@@ -333,20 +354,30 @@ src/
   charm.py            # events -> _reconcile -> collect_unit_status. No snap calls.
   pihole.py           # all snap/filesystem interaction. No ops imports.
   pihole_state.py     # pure core: intent, state/outcome ADTs, fetch, compute
+  pihole_config.py    # pydantic config model + IntentFields TypedDict (ADR-0006)
+  ftl_api.py          # FTL HTTP API client (ADR-0009)
   resolved.py         # systemd-resolved drop-in management. No ops imports.
-  grafana_dashboards/      # COSAgentProvider default, arrives with COS
-  prometheus_alert_rules/  # COSAgentProvider default, arrives with COS
-  loki_alert_rules/        # COSAgentProvider default, arrives with COS
+  grafana_dashboards/      # COSAgentProvider default; empty by decision, untracked
+  prometheus_alert_rules/  # COSAgentProvider default; untracked — no placeholder files
+  loki_alert_rules/        # COSAgentProvider default; untracked — no placeholder files
 tests/
   unit/
     conftest.py
     test_charm.py
     test_pihole.py
+    test_ftl_api.py
     test_pihole_state.py
+    test_pihole_config.py
     test_resolved.py
+    test_filterwarnings_guard.py
   integration/
     conftest.py
     test_deploy.py
+    test_stage1.py
+    test_stage2.py
+    test_stage3.py
+    test_stage5.py
+    test_stage7.py
 ```
 
 The `src/charm.py` / `src/pihole.py` split is mandatory. See
@@ -375,28 +406,61 @@ Every option needs a `description` and, where meaningful, a `default`. Types:
 ```yaml
 config:
   options:
-    snap-revision:
-      type: string
-      description: >-
-        Pin a specific snap revision. Empty means track latest/stable. The snap
-        publishes no versioned tracks, so revision pinning is the only way to
-        get reproducible deployments — at the cost of not receiving updates.
     upstream-dns:
       type: string
-      default: "1.1.1.1,1.0.0.1"
-      description: Comma-separated list of upstream DNS resolvers.
-    listen-all-interfaces:
+      default: ""
+      description: >-
+        Comma-separated upstream DNS resolvers (e.g. 1.1.1.1,9.9.9.9).
+        Empty means the charm does not manage upstreams.
+    dns-listening-mode:
+      type: string
+      default: ""
+      description: >-
+        FTL listening mode: LOCAL (loopback only), ALL (every interface),
+        or NONE (no DNS). Empty means the charm does not manage this
+        setting. SINGLE and BIND are not offered.
+    blocking-enabled:
       type: boolean
       default: true
+      description: Whether DNS-based ad blocking is active.
+    dnssec-enabled:
+      type: boolean
+      default: false
+      description: Whether DNSSEC validation is enabled.
+    ntp-server-enabled:
+      type: boolean
+      default: false
       description: >-
-        Serve DNS to the whole network rather than localhost only. Maps to FTL
-        dns.listeningMode, which snapd cannot set (camelCase), so the charm
-        applies it via pihole-FTL --config directly.
-    web-password:
-      type: secret
+        Whether the FTL NTP server on 123/udp is enabled. The charm
+        default is false, diverging from the snap's default of true.
+    gravity-schedule:
+      type: string
+      default: ""
       description: >-
-        Juju user secret holding the admin UI password. Unset leaves the
-        password unchanged.
+        A systemd OnCalendar expression for the weekly gravity update
+        timer. Empty means the charm does not manage the schedule.
+    dhcp-enabled:
+      type: boolean
+      default: false
+      description: >-
+        Whether the FTL DHCP server on 67/udp is enabled. Requires a
+        complete pool and dns-listening-mode=ALL.
+    dhcp-range-start:
+      type: string
+      default: ""
+      description: DHCP pool start address (IPv4).
+    dhcp-range-end:
+      type: string
+      default: ""
+      description: DHCP pool end address (IPv4).
+    dhcp-router:
+      type: string
+      default: ""
+      description: DHCP router/gateway address (IPv4).
+    dhcp-netmask:
+      type: string
+      default: ""
+      description: DHCP subnet netmask, dotted-quad only.
 ```
 
 Before adding an option, apply the `AGENTS.md` test: does another charm own this
@@ -470,12 +534,12 @@ declare "do not deploy me on Kubernetes". Block style is conventional:
 
 ```yaml
 assumes:
-  - juju >= 3.6
+  - juju >= 3.6.17
 ```
 
 The reference calls `assumes` *"Recommended for Kubernetes charms"*; for a machine
-charm its only real use is a Juju version floor. `juju >= 3.6` is an aggressive
-floor — justify it with a feature we actually need, or lower it.
+charm its only real use is a Juju version floor. `juju >= 3.6.17` is the floor
+because support for the `ubuntu@26.04` base landed in that release.
 
 **Keys that do not apply to a machine charm**, and must not appear:
 

@@ -21,6 +21,23 @@ revisions again). Verified live on LXD: with the pin the subordinate deploys on 
 **Amended:** 2026-09-22 — §2.7's module layout gains `src/pihole_config.py` and
 `tests/unit/test_pihole_config.py`, which Stage 2 introduced (the pydantic config
 model) and the original tree did not list.
+**Amended:** 2026-09-23 — §2.2.2's residual risk has cleared: the snapd snap
+revision 27738 fixed the bootstrap fallback-selection defect, so a Juju-created
+26.04 container (no `snapd` seeded, no `/dev/loop*`) now installs snaps — the
+bootstrap mount of the `snapd` snap falls back to `fuse.snapfuse`. Verified
+empirically on a fresh container from the `juju/ubuntu@26.04/amd64` image
+(`snap install hello-world` succeeds), and by the charm itself running active on
+a Juju-created 26.04 container on the operator's LXD host. The VM constraint in
+the integration suite is retained pending a deliberate decision to move to
+containers (BACKLOG), not because the snap cannot mount.
+**Amended:** 2026-09-23 — the retained constraint named in the previous line is
+gone: the integration suite now deploys LXD containers, and
+`virt-type=virtual-machine` has been removed from the fixtures and from every
+operational document. The DHCP servable test (port 67) is the first thing to
+prove in a container.
+**Amended:** 2026-10-04 — §2.7's tree is illustrative and the tests half has grown
+past it: `test_ftl_api.py`, `test_pihole_config.py`,
+`test_filterwarnings_guard.py`, and `test_stage{1,2,3,5,7}.py` all exist.
 **Related:** [ADR-0001: Charm Scope and Specification](0001-charm-scope-and-specification.md), [ADR-0003: Reconciler and Functional Core](0003-reconciler-and-functional-core.md), [ADR-0009: Split the FTL API client out of `Pihole`](0009-ftl-api-client-module.md)
 
 ---
@@ -85,7 +102,7 @@ The asymmetry decides it:
 | Choice | Cost |
 |---|---|
 | **24.04 now, migrate later** | Rewrite `charmcraft.yaml` and `pyproject.toml`, re-lock, re-run everything on a new interpreter, and **discover any 3.14 incompatibility after the code is written**. Publish a new track, freeze the old one. Churn paid *after* the code exists. |
-| **26.04 now** | Stage 5's integration test waited for the otelcol revision (state on 2026-08-07; resolved — see the header `Amended:` lines). Integration tests must run in LXD **VMs** rather than containers (§2.2.2). |
+| **26.04 now** | Stage 5's integration test waited for the otelcol revision (state on 2026-08-07; resolved — see the header `Amended:` lines). Integration tests must run in LXD **VMs** rather than containers (§2.2.2; state on 2026-08-07 — resolved 2026-09-23, see the header `Amended:` lines). |
 
 Writing the code against the interpreter it will actually run on, from the first
 commit, is worth more than either residual cost.
@@ -105,7 +122,9 @@ commit, is worth more than either residual cost.
 | The Pi-hole snap runs on 26.04 | installed and started in a 26.04 LXD **VM**; `core26` base snap resolves natively |
 | Host and workload align | the snap is `base: core26`; on 24.04 we were running a core26 snap on a 24.04 host |
 
-#### 2.2.2 Residual risk 1 — the snap cannot be installed in a 26.04 LXD *container*
+#### 2.2.2 Residual risk 1 — the snap cannot be installed in a 26.04 LXD *container* (resolved 2026-09-23)
+
+(State on 2026-08-11 — resolved; see the header `Amended:` lines for how.)
 
 Verified, and this is the sharpest cost of the decision:
 
@@ -141,21 +160,24 @@ defect in snapd's bootstrap path inside a container. Worth reporting upstream; s
 [BACKLOG.md](../BACKLOG.md). **NOT VERIFIED:** why snapd picks fuse for later mounts
 but not for the bootstrap one.
 
-The operational consequence for us is unchanged: **integration tests and manual
-deployments must use LXD VMs.**
+**Resolved 2026-09-23 — the defect was fixed in the snapd snap, not the package.**
+The snapd snap went from revision 27591 (the one in the error above) to 27738 with
+the package version unchanged (`2.76.3+ubuntu26.04`), and the bootstrap mount now
+falls back to `fuse.snapfuse`. Verified empirically on this host: a fresh container
+from the `juju/ubuntu@26.04/amd64` image — no `snapd` seeded, no `/dev/loop*` —
+runs `snap install hello-world` to completion, and `mount` shows
+`snapfuse on /snap/snapd/27738 type fuse.snapfuse`. The same host runs this charm
+**active on a Juju-created 26.04 container** (machine 7 of the operator's `pihole`
+model), snap installed and serving DNS — so the port-53/resolver objection to
+containers does not hold in practice either.
 
-In a 26.04 LXD **VM** (`virt-type=virtual-machine`, which has
-`/dev/loop-control`) everything installs normally.
+The operational consequence for us has cleared: **integration tests now run in
+LXD containers** (2026-09-23) — the `virt-type=virtual-machine` constraint is
+gone from the fixtures and from every operational document. The one piece the
+suite had not exercised in a container was DHCP (port 67); that is the first
+thing to prove in a container.
 
-**Consequence: integration tests must use LXD VMs.** That is a real cost — VMs are
-slower and heavier than containers — but note it is a cost we were largely going
-to pay anyway: this charm binds port 53 and rewrites `/etc/systemd/resolved.conf.d`,
-which conflicts with a container's own resolver. The testing guidance already
-warned that a dedicated machine would likely be needed. The base decision brings
-that forward rather than creating it.
-
-This is snapd/26.04 ecosystem lag, not a defect in our charm or in the Pi-hole
-snap. Worth reporting upstream; tracked in [BACKLOG.md](../BACKLOG.md).
+In a 26.04 LXD VM (which has `/dev/loop-control`) everything installs normally.
 
 #### 2.2.3 Residual risk 2 — `opentelemetry-collector` has no 26.04 revision yet (resolved 2026-09-08)
 
@@ -348,10 +370,9 @@ patches `subprocess` or `charmlibs`, or a test of `compute()` that needs
   carries; it only pays off because of ADR-0003 and ADR-0004.
 - `typeCheckingMode = "strict"` will reject third-party stubs and force
   `# pyright: ignore` comments at the `charmlibs` boundary.
-- **Integration tests must run in LXD VMs, not containers** (§2.2.2), which makes
-  them slower and heavier. Every test fixture needs
-  `constraints="virt-type=virtual-machine"`, and a contributor who forgets it gets
-  an opaque snapd mount failure rather than a clear message.
+- **Integration tests run in LXD containers** (§2.2.2; the snap-mount blocker
+  cleared 2026-09-23 and the suite moved to containers the same day). The DHCP
+  servable test (port 67) is the first thing to prove in a container.
 - **Stage 5 could not be integration-tested until `opentelemetry-collector`
   published a 26.04 revision** (§2.2.3; state on 2026-08-07 — resolved, see the
   header `Amended:` lines). At the time the PR was open but unmerged with

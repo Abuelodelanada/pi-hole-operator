@@ -2,7 +2,7 @@
 
 Never imports `ops` (rule 2); collaborators are injected so a test
 double can reproduce the workload's own lying behaviour — see
-ADR-0003 section 2.6. An exit code is never evidence (rule 6): every
+ADR-0003 section 2.7. An exit code is never evidence (rule 6): every
 mutation below reads back its own result, and no foreign exception
 leaves this module unconverted — see ADR-0005 section 2.9. The FTL
 HTTP client lives in `ftl_api.py`, composed below — see ADR-0009
@@ -97,19 +97,10 @@ INSTALL_ATTEMPTS = 3
 INSTALL_WAIT = tenacity.wait_fixed(2) + tenacity.wait_random(0, 5)
 """Bounded, in-hook retry for a snap store that is genuinely flaky."""
 
-DETECT_VIRT_CMD = "/usr/bin/systemd-detect-virt"
-"""Run with `--container`: exit 0 inside one, exit 1 on a VM or bare
-metal, since a VM is virtualisation this charm is happy with.
-
-Absolute path because a hook's PATH is Juju's, not a login shell's. A
-failed detection must degrade to "not a container" rather than raise.
-See ADR-0002 section 2.2.2.
-"""
-
 IP_CMD = "/usr/bin/ip"
-"""Absolute path for the same reason as `DETECT_VIRT_CMD`: a hook's
-PATH is Juju's, and a missed `ip` would silently block DHCP with a
-misleading remedy."""
+"""Absolute path for the same reason as `SS_CMD`: a hook's PATH is
+Juju's, and a missed `ip` would silently block DHCP with a misleading
+remedy."""
 
 SS_CMD = "/usr/bin/ss"
 """Absolute path for the same reason as `IP_CMD`: a hook's PATH is
@@ -123,19 +114,12 @@ DHCP_BIND_POLL_INTERVAL = 2.0
 """Seconds between `ss -lunp` polls while waiting for the bind."""
 
 SNAPD_REMEDY = "check `snap changes` and `journalctl -u snapd` on the machine"
-"""Where to look when snapd failed for a reason we cannot name."""
+"""Where to look when snapd failed for a reason we cannot name.
 
-CONTAINER_REMEDY = (
-    "this unit is in a container, where snapd cannot mount the snap it "
-    "needs to bootstrap; redeploy with "
-    "--constraints virt-type=virtual-machine"
-)
-"""The remedy for the one install failure the charm can fully explain.
-
-Says *a container*, not *a 26.04 LXD container*: a plain `lxc launch`
-installs fine because snapd is pre-seeded there, and only Juju's
-bootstrap mount breaks. See ADR-0002 section 2.2.2 and
-snap-constraints section 1.
+Every install failure lands here. The one failure the charm could once
+fully explain — the snapd bootstrap mount inside a Juju-created 26.04
+container — was fixed in the snapd snap (rev 27738), so there is no
+container-specific remedy left to name. See ADR-0002 section 2.2.2.
 """
 
 
@@ -191,16 +175,6 @@ def _snapd_failure(operation: str, remedy: str, err: snap.Error) -> PiholeError:
         actual=f"it raised {type(err).__name__}: {err}",
         remedy=remedy,
     )
-
-
-def install_remedy(*, in_container: bool) -> str:
-    """Choose where an install failure should send the operator.
-
-    Pure, so the mapping is tested without executing anything: the one
-    impure part is establishing `in_container`, which
-    `Pihole._in_container` does.
-    """
-    return CONTAINER_REMEDY if in_container else SNAPD_REMEDY
 
 
 class Runner(Protocol):
@@ -871,7 +845,7 @@ class Pihole:
         except snap.Error as err:
             raise _snapd_failure(
                 operation=operation,
-                remedy=self._install_remedy(),
+                remedy=SNAPD_REMEDY,
                 err=err,
             ) from err
 
@@ -881,7 +855,7 @@ class Pihole:
                 operation=operation,
                 expected=f"revision {pinned} installed",
                 actual=f"snapd reports revision {revision}",
-                remedy=self._install_remedy(),
+                remedy=SNAPD_REMEDY,
             )
         logger.info("Installed %s revision %s on %s.", SNAP_NAME, revision, machine)
 
@@ -1272,35 +1246,6 @@ class Pihole:
                 actual=f"it could not be run: {err}",
                 remedy=f"check that the {SNAP_NAME} snap is installed on the machine",
             ) from err
-
-    # -- Diagnosis. ----------------------------------------------------
-
-    def _install_remedy(self) -> str:
-        """Name the remedy that fits the machine this failed on."""
-        return install_remedy(in_container=self._in_container())
-
-    def _in_container(self) -> bool:
-        """Report whether this unit runs inside a container.
-
-        Only ever sharpens a message: a detection failure must answer
-        "not a container" rather than fail the hook or misname the
-        remedy on a VM.
-        """
-        try:
-            completed = self._run(
-                [DETECT_VIRT_CMD, "--container"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError as err:
-            logger.debug("Could not run %s: %s", DETECT_VIRT_CMD, err)
-            return False
-        detected = completed.stdout.strip()
-        logger.debug(
-            "%s --container exited %s: %r", DETECT_VIRT_CMD, completed.returncode, detected
-        )
-        return completed.returncode == 0
 
     # -- pihole.toml. --------------------------------------------------
 

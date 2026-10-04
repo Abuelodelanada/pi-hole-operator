@@ -22,7 +22,7 @@ import pathlib
 
 import jubilant
 
-from tests.integration.conftest import APP_NAME, BASE, DEPLOY_TIMEOUT, VM_CONSTRAINTS
+from tests.integration.conftest import APP_NAME, BASE, DEPLOY_TIMEOUT
 
 RESOLVED_DROP_IN = "/etc/systemd/resolved.conf.d/pihole.conf"
 STOCK_WEBSERVER_PORT = "443os"
@@ -235,7 +235,7 @@ def test_an_unauthenticated_config_write_is_refused_from_another_host(
     # must not run from localhost: the whole point is that the hole was
     # remotely exploitable.
     address = unit_address(deployed)
-    deployed.add_machine(constraints=VM_CONSTRAINTS)
+    deployed.add_machine()
     deployed.wait(lambda status: len(status.machines) >= 2, timeout=DEPLOY_TIMEOUT)
     other = sorted(machine for machine in deployed.status().machines if machine != "0")[0]
 
@@ -284,7 +284,7 @@ def test_removing_the_application_leaves_the_host_with_working_dns(
     # `deploy --to` fails with `machine "N" not started`; and a
     # hand-allocated machine takes the *model's* default base, so a
     # 26.04 charm lands on 24.04 and fails with `base does not match`.
-    juju.deploy("ubuntu", "co-tenant", base=BASE, constraints=VM_CONSTRAINTS)
+    juju.deploy("ubuntu", "co-tenant", base=BASE)
     juju.wait(jubilant.all_active, timeout=DEPLOY_TIMEOUT)
     machine = juju.status().apps["co-tenant"].units["co-tenant/0"].machine
 

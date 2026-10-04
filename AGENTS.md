@@ -7,10 +7,10 @@ This is not a Kubernetes charm. There is no Pebble, no `lightkube`, no OCI image
 
 ## Where we are
 
-**Stages 1, 2, 3 and 5 are closed** — each with acceptance green on LXD
-and a clean `charm-reviewer` pass (Stage 3's: 2026-09-21, fifth pass).
-**Stage 7's acceptance is green on LXD; its `charm-reviewer` pass is
-clean** (fifth round, 2026-09-22). The charm
+**Stages 1, 2, 3, 5 and 7 are closed** — each with acceptance green on LXD
+and a clean `charm-reviewer` pass (Stage 3's: 2026-09-21, fifth pass;
+Stage 7's: 2026-09-22, fifth round, with the DHCP servable test green on
+LXD 2026-09-23). The charm
 installs the snap **pinned to `SNAP_REVISIONS` and held against
 auto-refresh** (ADR-0010 — the snap never updates itself), frees port 53, starts
 FTL, closes the snap's default NTP server on 123/udp, owns the admin password,
@@ -185,8 +185,12 @@ Present since Stage 5: `lib/charms/grafana_agent/` (vendored via
 `charmcraft fetch-libs`, never edited, never linted). The `COSAgentProvider`
 default rule directories (`src/grafana_dashboards/`,
 `src/prometheus_alert_rules/`, `src/loki_alert_rules/`) are empty by decision —
-rules are deferred (ADR-0008 §2.1) and metrics with them (§2.2), so they do not
-exist on disk until that changes.
+rules are deferred (ADR-0008 §2.1) and metrics with them (§2.2), so nothing
+lands in them until that changes. They exist on the working tree but are
+**deliberately untracked**: a placeholder file in an alert-rules dir breaks the
+vendored provider's empty-rules path (`DatabagModel` json-decodes the stray
+value and the publish dies in the library's own `except`), discovered 2026-10-04
+— see BACKLOG.
 
 ## Python conventions
 

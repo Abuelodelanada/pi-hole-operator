@@ -7,7 +7,7 @@ description: >-
   status collection, and the two-layer design that makes the charm testable.
   Load before importing charmlibs or writing an event handler.
 metadata:
-  verified: "2026-08-06"
+  verified: "2026-10-04"
 ---
 
 # Machine charm workload management
@@ -77,9 +77,13 @@ pihole.start(enable=True)
 `SnapCache()` is the mock point in tests of the workload module.
 
 For this snap specifically, `ensure()` is not enough — see the `pihole-snap`
-skill. The charm additionally needs `snap connect` for seven plugs, `snap set`
-for reachable config keys, a `pihole-FTL --config` fallback for the 66
-unreachable ones, and an explicit `start(enable=True)` because the snap ships
+skill. The charm additionally needs `snap connect` for five unconditional plugs
+(`system-observe`, `hardware-observe`, `mount-observe`, `time-control`,
+`process-control`) plus two DHCP-only plugs (`network-control`, `firewall-control`)
+that are retained after DHCP is disabled (ADR-0006 §2.9: a connected plug is
+passive and re-connecting on drift avoids a restart). Also `snap set` for
+reachable config keys, a `pihole-FTL --config` fallback for the 66 unreachable
+ones, and an explicit `start(enable=True)` because the snap ships
 `install-mode: disable`.
 
 Where `charmlibs.snap` has no API for something (`snap connect`, `snap set` with
@@ -103,29 +107,29 @@ drop-in, neither of which the snap can do under strict confinement.
 
 ## Reconciler skeleton
 
-There is no `pihole_config.py` in this repo and you should not create one. The
-pure core lives in `src/pihole_state.py`, and a pydantic model of the charm's
-config belongs there alongside the intent — it is parsed data, so it is core, not
-workload. `PiholeConfig` below is illustrative: Stage 1 has no config options
-yet, so add it when the first one lands.
+The charm's config is declared in `charmcraft.yaml`, modelled in
+`src/pihole_config.py` (pydantic, 306 lines, 11 options, ADR-0006), and consumed
+with `self.load_config(PiholeConfig, errors="blocked")`. The pure core lives in
+`src/pihole_state.py`; `pihole_config.py` is the bridge that validates and
+normalises the raw config into the `IntentFields` TypedDict the core consumes.
+The skeleton below is pedagogical — `src/charm.py` is the authority for the real
+reconciler.
 
 ```python
 import logging
 
 import ops
 
+import pihole_config
+import pihole_state
+import resolved
 from pihole import Pihole, PiholeError
-from pihole_state import PiholeConfig
 
 logger = logging.getLogger(__name__)
 
-PORTS = (
-    ops.Port("tcp", 53),   # DNS
-    ops.Port("udp", 53),   # DNS — the one everyone forgets
-    ops.Port("tcp", 80),   # admin UI + API
-    ops.Port("tcp", 443),  # admin UI over TLS
-    ops.Port("udp", 123),  # NTP server, on by default
-)
+# Ports are dynamic: the pure core answers which ports the intent serves,
+# and the charm converts them to ops.Port. NTP and DHCP only when enabled.
+# See pihole_state.open_ports() and ADR-0006 §2.8.
 
 
 class PiholeCharm(ops.CharmBase):
@@ -133,7 +137,8 @@ class PiholeCharm(ops.CharmBase):
 
     def __init__(self, framework: ops.Framework):
         super().__init__(framework)
-        self.pihole = Pihole()
+        self._pihole = Pihole()
+        self._reconcile_failure: ops.StatusBase | None = None
 
         # Status collection is registered first and only reports.
         framework.observe(self.on.collect_unit_status, self._on_collect_status)
@@ -148,6 +153,9 @@ class PiholeCharm(ops.CharmBase):
         framework.observe(self.on.snap_check_action, self._on_snap_check)
 
         # Everything else converges through one reconciler.
+        # NOTE: relation events of the library-owned cos-agent integration
+        # are the library's business; the charm observes none. The
+        # non-negotiable still stands for relations the charm itself owns.
         for event in (
             self.on.install,
             self.on.start,
@@ -156,9 +164,6 @@ class PiholeCharm(ops.CharmBase):
             self.on.update_status,
             self.on.leader_elected,
             self.on.secret_changed,
-            self.on.cos_agent_relation_joined,
-            self.on.cos_agent_relation_changed,
-            self.on.cos_agent_relation_broken,
         ):
             framework.observe(event, self._reconcile)
 
@@ -167,39 +172,74 @@ class PiholeCharm(ops.CharmBase):
 
         Every step must be safe to run twice and safe to never run.
         """
-        config = self.load_config(PiholeConfig, errors="blocked")
-        self.unit.set_ports(*PORTS)
-        self.pihole.free_port_53()
-        self.pihole.install(revision=config.snap_revision)
-        self.pihole.connect_plugs(dhcp=config.dhcp_enabled)
-        self.pihole.apply_config(config, bind_address=self._bind_address)
-        self.pihole.ensure_running()
-        if version := self.pihole.workload_version():
-            self.unit.set_workload_version(version)
+        config = self.load_config(pihole_config.PiholeConfig, errors="blocked")
+        try:
+            intent = pihole_state.PiholeIntent(...)
+            self._advertise_ports(intent)
+            state = pihole_state.fetch(self._pihole, intent.admin_password)
+            for outcome in pihole_state.compute(state, intent):
+                self._apply(outcome)
+            self._report_version(state)
+        except PiholeError as err:
+            self._reconcile_failure = ops.BlockedStatus(str(err))
 
-    @property
-    def _bind_address(self) -> str | None:
-        """The address FTL should bind to and advertise to clients."""
-        binding = self.model.get_binding("dns")
-        return str(binding.network.bind_address) if binding else None
+    def _apply(self, outcome: pihole_state.PiholeOutcome) -> None:
+        """Perform one decided outcome. Exhaustive match."""
+        match outcome:
+            case pihole_state.ReleasePort53():
+                resolved.disable_stub_listener()
+            case pihole_state.InstallSnap():
+                self._pihole.install()  # revision is policy, no arg (ADR-0010)
+            case pihole_state.HoldSnapRefresh():
+                self._pihole.hold_refresh()
+            case pihole_state.ConnectPlugs(plugs=plugs):
+                self._pihole.connect_plugs(plugs)
+            case pihole_state.SetNtpServer(active=active):
+                self._pihole.set_ntp_server(active=active)
+            case pihole_state.SetAdminPassword(password=password):
+                self._pihole.set_password(password)
+            case pihole_state.StartFtl():
+                self._pihole.start(enable=True)
+            case pihole_state.RestartFtl():
+                self._pihole.restart()
+            case pihole_state.AwaitApi(timeout=timeout):
+                self._pihole.await_api(timeout)
+            case pihole_state.SetFtlConfig(config=config, password=password):
+                self._pihole.apply_ftl_config(password=password, config=dict(config))
+            case pihole_state.WaitForDhcpBind(timeout=timeout):
+                self._pihole.wait_for_dhcp_bind(timeout)
+            case pihole_state.WriteGravityTimer(schedule=schedule):
+                self._pihole.write_gravity_timer(schedule)
+            case pihole_state.RemoveGravityTimer():
+                self._pihole.remove_gravity_timer()
+            case pihole_state.Noop():
+                logger.debug("converged: nothing to do.")
+            case _ as unreachable:
+                assert_never(unreachable)
+
+    def _advertise_ports(self, intent: pihole_state.PiholeIntent) -> None:
+        """Tell Juju which ports this intent serves."""
+        self.unit.set_ports(
+            *(ops.Port(proto, num) for proto, num in pihole_state.open_ports(intent))
+        )
+
+    def _report_version(self, state: pihole_state.PiholeState) -> None:
+        """Show the Pi-hole version, not the charm's, in the status."""
+        match state:
+            case pihole_state.SnapPresent(version=str() as version):
+                self.unit.set_workload_version(version)
+            case _:
+                pass
 
     def _on_collect_status(self, event: ops.CollectStatusEvent) -> None:
         """Report status. Must not mutate anything."""
-        if not self.pihole.installed:
-            event.add_status(ops.MaintenanceStatus("installing pihole snap"))
-            return
-        diagnosis = self.pihole.diagnose()  # wraps `pihole snap-check`
-        if diagnosis.port_conflict:
-            event.add_status(ops.BlockedStatus(diagnosis.message))
-            return
-        if not self.pihole.blocking_ready():  # `pihole api dns/blocking`
-            event.add_status(ops.MaintenanceStatus("waiting for gravity bootstrap"))
-            return
-        event.add_status(ops.ActiveStatus())
+        if self._reconcile_failure is not None:
+            event.add_status(self._reconcile_failure)
+        # ... pull statuses follow
 
     def _on_remove(self, _: ops.RemoveEvent) -> None:
         """Undo host changes the snap cannot undo itself."""
-        self.pihole.restore_port_53()
+        resolved.restore()
 
 
 if __name__ == "__main__":  # pragma: nocover
@@ -440,7 +480,7 @@ def __init__(self, framework: ops.Framework):
 def _reconcile(self, _: ops.EventBase) -> None:
     try:
         ...
-        self.pihole.apply_config(config, bind_address=self._bind_address)
+        self._pihole.apply_ftl_config(password=password, config=dict(config))
     except PiholeError as e:
         # A push status: collect_unit_status cannot re-derive this, because the
         # daemon is healthy and only one key silently failed to apply.
@@ -487,6 +527,12 @@ Pi-hole it adds little; it matters if peers are added later.
 `self.unit.set_ports(*ports)` is declarative and idempotent — it diffs against
 `opened_ports()` and closes what is no longer wanted. That makes it a correct
 reconcile step, unlike `open_port`/`close_port` which manage ports individually.
+
+**Ports are dynamic, not static.** The pure core answers which ports the intent
+serves (`pihole_state.open_ports(intent)`), and the charm converts them to
+`ops.Port`. DNS (53 tcp+udp) and web (80 tcp, 443 tcp) are always advertised;
+NTP (123 udp) and DHCP (67 udp) only when enabled. NTP is off by default
+(ADR-0006 §2.3, deliberate divergence from the snap).
 
 **`ops.TCPPort` and `ops.UDPPort` do not exist in `ops`.** They only exist in
 `ops.testing` (from `ops-scenario`). In production code the type is `ops.Port`:

@@ -20,7 +20,7 @@ them are **not** machine-checked — a green test run is not evidence of complia
 - [`uv`](https://docs.astral.sh/uv/) — no `pip`, no `poetry`.
 - `tox`
 - `charmcraft` (snap) for packing.
-- **Juju 3.6+ with an LXD machine cloud** for integration tests:
+- **Juju 3.6.17+ with an LXD machine cloud** (the first release able to deploy `ubuntu@26.04` — `charmcraft.yaml`'s `assumes` floor) for integration tests:
   ```sh
   sudo concierge prepare -p machine
   ```

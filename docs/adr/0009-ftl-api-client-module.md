@@ -2,6 +2,9 @@
 
 **Status:** Accepted
 **Date:** 2026-08-20
+**Amended:** 2026-10-04 — §5's sizes are the split-day record and have drifted
+exactly as its Negative predicted: `pihole.py` is 1282 lines and `Pihole` 45
+methods after Stages 3 and 7 landed on the snap-facing half.
 **Related:** [ADR-0002: Tech stack and repository architecture](0002-tech-stack-and-repo-architecture.md),
 [ADR-0003: Reconciler and functional core](0003-reconciler-and-functional-core.md),
 [ADR-0004: FTL configuration mechanism](0004-ftl-configuration-mechanism.md),
@@ -138,7 +141,9 @@ The `api` parameter is injected with a default so `FtlApi` can be faked in
 `is_transient`, `classify_blocking`, and the `PASSWORD_SETTLE_*` constants.
 
 **Stays in `pihole.py`:** everything snapd, `_read_toml`, `_ftl_config_value`,
-`_in_container`, `install_remedy`, `Runner`, `_subprocess_run`.
+`Runner`, `_subprocess_run`. (`_in_container` and `install_remedy` were removed
+2026-09-23: the container bootstrap-mount failure they diagnosed was fixed in the
+snapd snap — ADR-0002 §2.2.2, resolved.)
 
 **Unchanged:** `PiholeFacts`, `fetch`, `compute` and `charm.py` are not edited.
 

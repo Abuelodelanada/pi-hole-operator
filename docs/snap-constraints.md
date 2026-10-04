@@ -3,7 +3,7 @@
 **Snap:** `pihole-by-rajannpatel`
 **Source:** [`rajannpatel/snap-pi-hole@main`](https://github.com/rajannpatel/snap-pi-hole)
 **Wiki:** https://github.com/rajannpatel/snap-pi-hole/wiki
-**Last verified:** 2026-08-07
+**Last verified:** 2026-09-23 — each section carries its own verification date; that, not this line, is the authority
 
 Reference document. Every claim here was verified by reading the snap source or
 by running the snap — not inferred from documentation. Anything unverified is
@@ -45,15 +45,20 @@ Three supply-chain facts the charm cannot design around:
 2.76+ubuntu26.04.3) and **24.04** (snapd 2.76+ubuntu24.04.1). On 26.04 the host
 and the snap's `core26` base align natively.
 
-**Verified limitation — Juju-created LXD containers on 26.04.** Installing this
-snap fails there: snapd attempts a kernel squashfs mount of `snapd_*.snap` and
-fails with `wrong fs type, bad option, bad superblock`, because the container has no
-`/dev/loop*`. Note the scope: a plain `lxc launch ubuntu:26.04` **succeeds**,
-because it arrives with the `snapd` snap already seeded and mounted
-`fuse.snapfuse`. What breaks is the *bootstrap* mount of the `snapd` snap, which a
-Juju container must perform. Not a property of 26.04, and not of this snap. In a 26.04 LXD **VM**
-(`virt-type=virtual-machine`) everything works. This is snapd/26.04 ecosystem lag,
-not a defect in this snap — but it means **integration tests must use VMs**. See
+**Verified limitation — Juju-created LXD containers on 26.04 (resolved 2026-09-23).**
+Installing this snap used to fail there: snapd attempted a kernel squashfs mount
+of `snapd_*.snap` and failed with `wrong fs type, bad option, bad superblock`,
+because the container has no `/dev/loop*`. Note the scope: a plain
+`lxc launch ubuntu:26.04` **succeeds**, because it arrives with the `snapd` snap
+already seeded and mounted `fuse.snapfuse`. What broke was the *bootstrap* mount
+of the `snapd` snap, which a Juju container must perform. Not a property of 26.04,
+and not of this snap. **The defect was fixed in the snapd snap** (rev 27591 →
+27738, package version unchanged `2.76.3+ubuntu26.04`): the bootstrap mount now
+falls back to `fuse.snapfuse`, verified 2026-09-23 on a fresh container from the
+`juju/ubuntu@26.04/amd64` image (no `snapd` seeded, no `/dev/loop*`) — `snap
+install` succeeds, and this charm runs active in a Juju-created 26.04 container on
+the operator's LXD host. The integration suite runs in LXD **containers**
+(2026-09-23) — see
 [ADR-0002 §2.2.2](adr/0002-tech-stack-and-repo-architecture.md).
 
 **NOT VERIFIED:** whether `base: core26` resolves on Ubuntu 22.04 or older, or with

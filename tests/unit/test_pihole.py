@@ -56,14 +56,6 @@ from tests.unit.conftest import (
     write_pihole_toml,
 )
 
-MOUNT_FAILURE = 'Mount snap "snapd" (27591): wrong fs type, bad option, bad superblock'
-"""What snapd really says in a 26.04 LXD container.
-
-The container has no `/dev/loop*` and 26.04 snapd no longer falls back
-to its fuse mounter. See ADR-0002 section 2.2.2.
-"""
-
-
 # -- Facts. -----------------------------------------------------------
 
 
@@ -568,67 +560,15 @@ def test_install_retries_every_snap_error_not_just_snap_error(
 
 # -- Which remedy an install failure names. ----------------------------
 #
-# A container is the one install failure the charm can fully explain,
-# and ADR-0005 section 2.2 says Blocked exists for exactly that: a
-# situation where the charm can tell the human what to do. Pointing that
-# operator at `snap changes` sends them to read a squashfs mount failure
-# whose real answer is "you are in a container". Only the **remedy**
-# changes — snapd's own words still travel, because a container is not
-# the only reason an install fails.
+# Every install failure names the same remedy. The one failure the
+# charm could once fully explain — the snapd bootstrap mount inside a
+# Juju-created 26.04 container — was fixed in the snapd snap (rev
+# 27738), so there is no container-specific remedy left to name
+# (ADR-0002 section 2.2.2, resolved 2026-09-23).
 
 
-@pytest.mark.parametrize(
-    ("in_container", "expected"),
-    [(True, pihole.CONTAINER_REMEDY), (False, pihole.SNAPD_REMEDY)],
-    ids=["container", "vm-or-bare-metal"],
-)
-def test_the_install_remedy_is_a_pure_choice(in_container: bool, expected: str):
-    # GIVEN nothing but a fact about the machine
-    # WHEN the remedy is chosen
-    # THEN it is decided without executing anything, which is why the
-    # choice is a function and the detection is not
-    assert pihole.install_remedy(in_container=in_container) == expected
-
-
-def test_an_install_failure_in_a_container_names_the_constraint_to_redeploy_with(
-    snap_data: pathlib.Path,
-):
-    # GIVEN a 26.04 LXD container, where snapd can mount no snap at all
-    # — not even `snapd` itself — and the mount failure it really
-    # reports there (ADR-0002 section 2.2.2)
-    runner = FakeRunner(container="lxc")
-    workload = pihole.Pihole(
-        cache_factory=FakeCache(
-            FakeSnap(present=False), errors=99, error=snap.SnapError(MOUNT_FAILURE)
-        ),
-        run=runner,
-        snap_data=snap_data,
-        retry_wait=tenacity.wait_none(),
-    )
-
-    # WHEN the snap is installed
-    with pytest.raises(pihole.PiholeError) as exc_info:
-        workload.install()
-
-    # THEN the operator is given the one thing that fixes it, verbatim
-    assert pihole.CONTAINER_REMEDY in str(exc_info.value)
-    assert "--constraints virt-type=virtual-machine" in str(exc_info.value)
-
-    # AND the diagnosis is untouched: snapd's own words still travel,
-    # because they are the part that distinguishes this from the next
-    # install failure
-    assert MOUNT_FAILURE in str(exc_info.value)
-
-    # AND the question asked was about containers only, since a VM is
-    # virtualisation this charm is perfectly happy with
-    assert [pihole.DETECT_VIRT_CMD, "--container"] in runner.calls
-
-
-def test_an_install_failure_outside_a_container_keeps_the_snapd_remedy(
-    snap_data: pathlib.Path,
-):
-    # GIVEN a VM or bare metal, where `systemd-detect-virt --container`
-    # exits non-zero, and a store that is simply down
+def test_an_install_failure_names_the_snapd_remedy(snap_data: pathlib.Path):
+    # GIVEN a store that is simply down
     runner = FakeRunner()
     workload = pihole.Pihole(
         cache_factory=FakeCache(FakeSnap(present=False), errors=99),
@@ -641,20 +581,21 @@ def test_an_install_failure_outside_a_container_keeps_the_snapd_remedy(
     with pytest.raises(pihole.PiholeError) as exc_info:
         workload.install()
 
-    # THEN the remedy is the one that was always there, and the operator
-    # is not told to redeploy a machine that is already a VM
+    # THEN the remedy is the one that was always there, and the
+    # operator is not told to redeploy a machine that is not the
+    # problem
     assert pihole.SNAPD_REMEDY in str(exc_info.value)
     assert "virt-type" not in str(exc_info.value)
 
 
-def test_an_install_that_lands_nothing_in_a_container_names_the_constraint(
+def test_an_install_that_lands_nothing_names_the_snapd_remedy(
     snap_data: pathlib.Path,
 ):
-    # GIVEN a container, and a snapd that accepts the install and
-    # installs nothing — the read-back path rather than the raise
+    # GIVEN a snapd that accepts the install and installs nothing —
+    # the read-back path rather than the raise
     workload = pihole.Pihole(
         cache_factory=FakeCache(FakeSnap(present=False, honest=False)),
-        run=FakeRunner(container="lxc"),
+        run=FakeRunner(),
         snap_data=snap_data,
     )
 
@@ -664,36 +605,10 @@ def test_an_install_that_lands_nothing_in_a_container_names_the_constraint(
 
     # THEN both ways an install can fail name the same remedy
     assert "snapd reports revision" in str(exc_info.value)
-    assert pihole.CONTAINER_REMEDY in str(exc_info.value)
-
-
-def test_a_missing_systemd_detect_virt_is_never_the_reason_a_hook_fails(
-    snap_data: pathlib.Path,
-):
-    # GIVEN a machine without the detection binary at all, and a store
-    # that is down. A diagnostic that raises would turn a Blocked unit
-    # into a unit in error state — which needs `--force` to remove,
-    # which skips the handler that gives the host its resolver back.
-    workload = pihole.Pihole(
-        cache_factory=FakeCache(FakeSnap(present=False), errors=99),
-        run=FakeRunner(detect_virt_error=FileNotFoundError(2, "No such file or directory")),
-        snap_data=snap_data,
-        retry_wait=tenacity.wait_none(),
-    )
-
-    # WHEN the snap is installed
-    with pytest.raises(pihole.PiholeError) as exc_info:
-        workload.install()
-
-    # THEN the failure reported is the install's, with the remedy that
-    # applied before any of this existed — not the OSError from the
-    # helper
     assert pihole.SNAPD_REMEDY in str(exc_info.value)
-    assert "the snap store is having a moment" in str(exc_info.value)
-    assert isinstance(exc_info.value.__cause__, snap.Error)
 
 
-def test_a_successful_install_does_not_exec_the_diagnostic(
+def test_a_successful_install_runs_nothing(
     workload: pihole.Pihole,
     fake_snap: FakeSnap,
     fake_runner: FakeRunner,

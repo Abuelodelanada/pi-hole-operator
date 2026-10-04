@@ -6,7 +6,7 @@ v6 on Ubuntu machines — LXD, MAAS, or a public cloud — using the
 
 Not a Kubernetes charm: no Pebble, no OCI image.
 
-> **Status: Stages 1, 2, 3 and 5 closed.** The charm installs the snap **pinned to a revision the
+> **Status: Stages 1, 2, 3, 5 and 7 closed.** The charm installs the snap **pinned to a revision the
 > charm's release defines and held against auto-refresh** — the snap never
 > updates itself; updating it is a charm release (see
 > [ADR-0010](docs/adr/0010-snap-revision-is-charm-policy.md)). It frees port 53,
@@ -27,7 +27,7 @@ Not a Kubernetes charm: no Pebble, no OCI image.
 ## Deploy
 
 ```sh
-juju deploy ./pihole_amd64.charm --constraints virt-type=virtual-machine
+juju deploy ./pihole_amd64.charm
 ```
 
 ## Reading this charm as an example
@@ -56,7 +56,7 @@ short path. The first four fit comfortably on a few screens.
 | 4 | `_apply` in [`src/charm.py`](src/charm.py) | The imperative shell. Deliberately stupid: one `match`, one effect per branch, and `assert_never` so a new outcome fails `tox -e static` instead of being silently ignored. |
 | 5 | [`tests/unit/test_pihole_state.py`](tests/unit/test_pihole_state.py) | What the split buys: the decision logic is tested with **zero mocks**. Start at `test_the_bootstrap_order_is_the_correctness_condition`. |
 
-**On the size ratio.** The workload adapters are roughly three times the size of
+**On the size ratio.** The workload adapters are roughly twice the size of
 the pure core. That is the point, not a defect. This workload is hostile — `snap set` returns 0 on keys it silently
 drops, `pihole -a -p` prints usage and exits 0, FTL reports `active` long before
 it serves, its session tokens rotate on restart, and its password hash is salted
@@ -114,7 +114,7 @@ tox -e fmt
 tox -e lint,static,unit
 ```
 
-### Integration tests need LXD **VMs**, not containers
+### Integration tests run in LXD containers
 
 ```sh
 charmcraft pack
@@ -122,10 +122,9 @@ export CHARM_PATH=./pihole_amd64.charm
 tox -e integration
 ```
 
-The test fixtures pass `constraints="virt-type=virtual-machine"` and that is not
-optional. **snapd cannot mount snaps inside an `ubuntu@26.04` LXD container at
-all** — a container has no `/dev/loop*`, and unlike 24.04, snapd on 26.04 does
-not fall back to its fuse mounter. It attempts a kernel squashfs mount, fails
-with `wrong fs type, bad option, bad superblock`, and *no* snap installs, not
-even `snapd` itself. See
-[ADR-0002 §2.2.2](docs/adr/0002-tech-stack-and-repo-architecture.md).
+The fixtures deploy into LXD containers. The snapd bootstrap defect that once
+made snaps uninstallable in a Juju-created 26.04 container is fixed (snapd snap
+rev 27738; ADR-0002 §2.2.2, resolved 2026-09-23), and this charm runs active in
+a Juju-created 26.04 container. The DHCP servable test (port 67) is the piece
+the suite had never exercised in a container; it is gated behind
+`@pytest.mark.dhcp` and must be proven there.

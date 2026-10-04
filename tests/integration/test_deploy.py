@@ -8,7 +8,7 @@ import jubilant
 
 
 def test_deploys_active_with_no_relations(deployed: jubilant.Juju, app_name: str):
-    # GIVEN a freshly deployed single unit in an LXD VM
+    # GIVEN a freshly deployed single unit in an LXD container
     status = deployed.status()
 
     # WHEN its application status is read

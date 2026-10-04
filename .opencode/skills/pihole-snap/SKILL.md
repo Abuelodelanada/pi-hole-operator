@@ -8,9 +8,8 @@ description: >-
   to snap or pihole, because several of those commands return exit 0 without
   doing anything.
 metadata:
-  verified: "2026-08-06"
-  snap-revision: "1348 (amd64, latest/stable)"
-  method: "installed on Ubuntu 24.04 / snapd 2.76.1, squashfs inspected, runtime-verified"
+  verified: "2026-10-04"
+  method: "installed on Ubuntu 24.04 / snapd 2.76.1, squashfs inspected, runtime-verified; re-verified against revisions 1417/1415 on 2026-09-18"
 ---
 
 # The `pihole-by-rajannpatel` snap
@@ -45,6 +44,9 @@ Consequences for the charm:
 - **There is no version line to pin.** `--channel` buys you nothing beyond
   stable/edge. Reproducibility requires pinning `--revision`, which then never
   gets security updates automatically. Surface this trade-off explicitly.
+- **The charm pins store revisions per architecture** (ADR-0010):
+  `SNAP_REVISIONS = {"amd64": "1417", "arm64": "1415"}`. This skill records
+  snap *behaviour*, which revision pins do not change.
 - The snap is explicitly **unofficial**: *"The Pi-hole project maintainers do not
   yet support snap-based installations"*.
 - `base: core26` means snapd must be able to fetch `core26`. Verified on Ubuntu
@@ -275,6 +277,25 @@ Verified with `ss -tulpn`:
 | 67 udp | DHCP | only when `dhcp.active=true`. DHCPv6 (547/udp) is not enabled by this charm — it manages no `dhcp.ipv6` key. |
 | 4711 | **not used** | that was FTL v5's telnet API. v6 serves the API over HTTP on `webserver.port`. |
 
+## Content slot: `logs`
+
+The snap exposes a read-only `logs` content slot (PR #18, published in revisions
+1417/1415):
+
+```yaml
+slots:
+  logs:
+    interface: content
+    source:
+      read:
+        - $SNAP_COMMON/var/log/pihole
+```
+
+The charm uses it as `log_slots=["pihole-by-rajannpatel:logs"]` in
+`COSAgentProvider` so the `opentelemetry-collector` subordinate can tail the
+snap's log files and forward them to Loki. Full detail in
+`docs/snap-issue-logs-content-slot.md`.
+
 ## Paths
 
 ```
@@ -411,3 +432,26 @@ the `ftl.` prefix**. The configure hook only reads the `ftl` and `timer`
 namespaces (`configure:137,223`), so that command is accepted into snapd state
 and does nothing. Always use `ftl.webserver.port`.
 *(Verified by code inspection, not at runtime.)*
+
+## Additional constraints the code implements
+
+These are documented in full in `docs/snap-constraints.md`; the charm's code
+already handles them:
+
+- **§4.3 — Array values via API are JSON arrays, not CSV.** `dns.upstreams` sent
+  through `PATCH /api/config` must be a JSON array (`["1.1.1.1","9.9.9.9"]`),
+  not a comma-separated string.
+- **§7.2.1 — `pihole api` is GET-only.** The `pihole api <endpoint>` subcommand
+  only does GET; it cannot apply config. The charm uses the FTL HTTP API client
+  (`src/ftl_api.py`) for writes.
+- **§7.2.5 — `pihole setpassword` reports success ~1s before FTL reloads the
+  hash.** There is a settle window where a `401` is not a verdict. `ftl_api.py`
+  models this with a bounded retry loop.
+- **§7.2.6 — Once a password is set, readiness requires an authenticated
+  session.** The API readiness check must carry a valid session ID; anonymous
+  requests are rejected.
+- **§7.2.7 — `snap unset` does not revert to the factory default.** Unsetting a
+  key leaves the last-written value in `pihole.toml`; there is no "reset to
+  default" through snapd.
+- **§7.2.8 — A `cli_pw` session cannot modify config.** The local CLI password
+  grants read-only access. `SetFtlConfig` carries the admin password for writes.

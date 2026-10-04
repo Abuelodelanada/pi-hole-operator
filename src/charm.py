@@ -496,7 +496,7 @@ def _intent_from(
     call sites: `_reconcile` passes `_ensure_password()`, which mints
     on a leader; `_on_collect_status` passes `_read_password()`,
     because that handler must not mutate anything. See rule 7 and
-    ADR-0005 section 2.4.
+    ADR-0005 section 2.6.
 
     The status handler passes validated config: it needs the intent to
     offer the password to the API oracle and to re-derive the DHCP

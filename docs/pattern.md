@@ -86,7 +86,7 @@ all.
 The part that decides is small and easy to test, because a test only has to build
 values and check the values that come back. The part that touches the workload is
 kept thin and boring on purpose, because that is the part a test cannot check
-cheaply. In this charm the whole of it is `_apply`: 25 lines of `match`, one call
+cheaply. In this charm the whole of it is `_apply`: one exhaustive `match`, one call
 per branch, and no `if` anywhere.
 
 **This is also the only part that differs between a machine charm and a

@@ -294,14 +294,9 @@ class FakeCache:
 class FakeRunner:
     """A `subprocess.run` that records argv and can fail on demand.
 
-    It answers `systemd-detect-virt --container` the way the real
-    binary does, because the workload module runs it to sharpen an
-    install failure. The default is **not** a container, so a test only
-    says otherwise when that is the point of the test.
-
-    ``stdout_script`` is consulted for non-detect-virt commands: a
-    callable that receives the argv and returns stdout, defaulting to
-    the empty string so existing tests are unaffected.
+    ``stdout_script`` is consulted for commands: a callable that
+    receives the argv and returns stdout, defaulting to the empty
+    string so existing tests are unaffected.
     """
 
     def __init__(
@@ -309,14 +304,10 @@ class FakeRunner:
         returncode: int = 0,
         effect: Callable[[Sequence[str]], None] | None = None,
         *,
-        container: str | None = None,
-        detect_virt_error: OSError | None = None,
         stdout_script: Callable[[Sequence[str]], str] | None = None,
     ) -> None:
         self.returncode = returncode
         self.effect = effect
-        self.container = container
-        self.detect_virt_error = detect_virt_error
         self.stdout_script = stdout_script
         self.calls: list[list[str]] = []
 
@@ -330,8 +321,6 @@ class FakeRunner:
     ) -> subprocess.CompletedProcess[str]:
         """Record the call, apply any effect, report a result."""
         self.calls.append(list(args))
-        if args[0] == pihole.DETECT_VIRT_CMD:
-            return self._detect_virt(args)
         if self.effect is not None:
             self.effect(args)
         stdout = ""
@@ -348,24 +337,6 @@ class FakeRunner:
             args=list(args),
             returncode=self.returncode,
             stdout=stdout,
-            stderr="",
-        )
-
-    def _detect_virt(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        """Answer as `systemd-detect-virt --container` really does.
-
-        Exit 0 and the technology's name inside a container; exit 1 and
-        `none` on bare metal *and in a VM*, because `--container` asks
-        only about containers. Verified on 26.04:
-        `systemd-detect-virt --container` prints `none` and exits 1.
-        """
-        if self.detect_virt_error is not None:
-            raise self.detect_virt_error
-        detected = self.container or "none"
-        return subprocess.CompletedProcess(
-            args=list(args),
-            returncode=0 if self.container else 1,
-            stdout=f"{detected}\n",
             stderr="",
         )
 

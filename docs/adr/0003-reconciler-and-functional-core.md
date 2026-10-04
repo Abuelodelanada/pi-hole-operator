@@ -3,6 +3,12 @@
 **Status:** Accepted
 **Date:** 2026-08-07
 **Accepted:** 2026-08-08
+**Amended:** 2026-10-04 — §2.4's `ApplyFtlConfig` example records the pre-ADR-0004
+design; ADR-0004 §4 rejected the reachable/unreachable split in favour of one
+apply path over the HTTP API, and the shipped outcome is `SetFtlConfig`
+(BACKLOG carries the illustrative union as accepted debt). The field sketches
+also changed on arrival: `InstallSnap` lost its revision field (ADR-0010) and
+`WriteGravityTimer`'s key is `schedule`.
 **Related:** [ADR-0002: Tech Stack and Repository Architecture](0002-tech-stack-and-repo-architecture.md), [ADR-0004: FTL Configuration Mechanism](0004-ftl-configuration-mechanism.md), [ADR-0005: Status Semantics and Failure Handling](0005-status-semantics-and-failure-handling.md), [ADR-0009: Split the FTL API client out of `Pihole`](0009-ftl-api-client-module.md)
 
 ---

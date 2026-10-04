@@ -6,7 +6,7 @@ description: >-
   Covers Model(type='lxd'), the two-layer mocking strategy, and jubilant APIs
   that only exist for machine models. Load before writing any test file.
 metadata:
-  verified: "2026-08-06"
+  verified: "2026-10-04"
 ---
 
 # Testing a machine charm
@@ -34,19 +34,19 @@ def test_absent_snap_yields_install():
     state = SnapAbsent()
 
     # WHEN the outcome is computed
-    outcomes = compute(state, PiholeConfig(snap_revision=1348))
+    outcomes = compute(state, PiholeIntent())
 
-    # THEN the only action is to install it at the pinned revision
-    assert outcomes == (InstallSnap(revision=1348),)
+    # THEN the first action is to install the snap (revision is policy, ADR-0010)
+    assert outcomes[0] == InstallSnap()
 
 
 def test_unchanged_config_yields_noop():
     # GIVEN a running snap whose FTL config already matches intent
-    state = SnapPresent(revision=1348, ftl_running=True,
-                        ftl_config={"dns.upstreams": '["1.1.1.1"]'}, ...)
+    state = SnapPresent(revision="1417", ftl_enabled=True, ftl_active=True,
+                        upstream_dns=("1.1.1.1",), ...)
 
     # WHEN the outcome is computed with the same intent
-    outcomes = compute(state, PiholeConfig(upstream_dns=("1.1.1.1",)))
+    outcomes = compute(state, PiholeIntent(upstream_dns=("1.1.1.1",)))
 
     # THEN nothing happens — this is the "safe to run twice" proof
     assert outcomes == (Noop(),)
@@ -87,23 +87,49 @@ per instance on machines.
 ## Layer 1 — state transition tests
 
 ```python
-# tests/unit/conftest.py
+# tests/unit/conftest.py — the real file is the authority; this is a sketch.
 from unittest.mock import MagicMock
 
 import pytest
 from ops import testing
 
 import charm
+import pihole_state
 
 
 @pytest.fixture
 def mock_pihole(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
-    """Replace the whole workload module with a mock."""
+    """Replace the workload module's Pihole with a converged fake.
+
+    The facts are real values, so fetch and compute run for real and the
+    transition tests exercise actual decisions. See the real conftest.py
+    for the full set of return values.
+    """
     mock = MagicMock()
-    mock.installed = True
-    mock.blocking_ready.return_value = True
-    mock.diagnose.return_value = charm.Diagnosis(port_conflict=False, message="")
-    monkeypatch.setattr(charm, "Pihole", lambda *a, **kw: mock)
+    mock.installed_revision.return_value = pihole_state.SNAP_REVISIONS["amd64"]
+    mock.pinned_revision.return_value = pihole_state.SNAP_REVISIONS["amd64"]
+    mock.refresh_held.return_value = True
+    mock.workload_version.return_value = "6.4.3"
+    mock.ftl_status.return_value = pihole_state.ServiceStatus(enabled=True, active=True)
+    mock.api_facts.return_value = pihole_state.ApiFacts(
+        admin_password=pihole_state.PasswordAccepted(),
+        api_ready=True,
+    )
+    mock.port53_released.return_value = True
+    mock.port67_free.return_value = True
+    mock.ntp_server_active.return_value = False
+    mock.upstream_dns.return_value = None
+    mock.listening_mode.return_value = None
+    mock.blocking_enabled.return_value = True
+    mock.dnssec_enabled.return_value = False
+    mock.connected_plugs.return_value = frozenset(pihole_state.UNCONDITIONAL_PLUGS)
+    mock.gravity_schedule.return_value = None
+    mock.dhcp_active.return_value = False
+    mock.dhcp_pool.return_value = None
+    mock.machine_ipv4_addresses.return_value = frozenset()
+    mock.snap_check.return_value = pihole_state.SnapCheckOk()
+    # Patch via the module reference, not charm.Pihole:
+    monkeypatch.setattr(charm.pihole, "Pihole", lambda: mock)
     return mock
 
 
@@ -130,8 +156,8 @@ def test_config_changed_applies_upstreams(ctx, base_state, mock_pihole):
     state_out = ctx.run(ctx.on.config_changed(), state_in)
 
     # THEN the workload module receives them and the unit goes active
-    applied = mock_pihole.apply_config.call_args.args[0]
-    assert applied.upstream_dns == ["9.9.9.9", "149.112.112.112"]
+    applied = mock_pihole.apply_ftl_config.call_args.kwargs["config"]
+    assert applied["dns.upstreams"] == ["9.9.9.9", "149.112.112.112"]
     assert state_out.unit_status == testing.ActiveStatus()
 ```
 
@@ -204,15 +230,13 @@ with the replacement in the message. Actions go through `ctx.run` like everythin
 else:
 
 ```python
-def test_update_gravity_reports_entry_count(ctx, base_state, mock_pihole):
+def test_update_gravity_reports_completion(ctx, base_state, mock_pihole):
     # GIVEN a running unit
-    mock_pihole.update_gravity.return_value = 12345
-
     # WHEN the action runs
     ctx.run(ctx.on.action("update-gravity", params={"force": True}), base_state)
 
-    # THEN the entry count is returned to the operator
-    assert ctx.action_results == {"entries": 12345}
+    # THEN the result is reported to the operator
+    assert ctx.action_results == {"result": "gravity update completed"}
     assert "Updating gravity" in ctx.action_logs
 ```
 
@@ -248,10 +272,11 @@ Ports assert as `testing.TCPPort` / `testing.UDPPort`, which exist **only** in
 `ops.testing` (production code uses `ops.Port`):
 
 ```python
+# Default ports: DNS + web. NTP is off by default (ADR-0006 §2.3).
+# NTP (123/udp) and DHCP (67/udp) appear only when the intent enables them.
 assert state_out.opened_ports == {
     testing.TCPPort(53), testing.UDPPort(53),
     testing.TCPPort(80), testing.TCPPort(443),
-    testing.UDPPort(123),
 }
 ```
 

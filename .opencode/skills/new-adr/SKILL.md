@@ -187,7 +187,7 @@ review diffs.
 | Do not | Instead |
 |---|---|
 | Write an ADR for a decision with no alternative | It is a fact or an instruction — `snap-constraints.md` or the roadmap |
-| Copy the `## Status` / `## Decision` heading form from generic ADR templates | Use the bold metadata block above; it is what the existing eight use |
+| Copy the `## Status` / `## Decision` heading form from generic ADR templates | Use the bold metadata block above; it is what the existing ADRs use |
 | Number by date or by feature | Sequential integers, zero-padded to four |
 | Edit an Accepted ADR to reflect a new decision | Write a new ADR and mark the old one `Superseded by ADR-NNNN`. The history is the point |
 | Leave `Status: Proposed` on something already implemented | The status field is the only signal of what is settled; stale statuses make all of them worthless |

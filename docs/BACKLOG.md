@@ -16,10 +16,17 @@ listed in [roadmap.md](roadmap.md#open-spikes).
   devices, with no fallback to `snapfuse` — even though `/usr/bin/snapfuse` is
   present and snapd uses it happily for every *later* mount. A plain
   `lxc launch ubuntu:26.04` is unaffected because it ships the `snapd` snap
-  pre-seeded. Forces integration tests and manual deployments onto LXD VMs. **Worth
+  pre-seeded. Forced integration tests and manual deployments onto LXD VMs. **Worth
   reporting to snapd**; check whether it is already tracked first. Open question:
   why the fallback applies to later mounts but not the bootstrap one.
-  (ADR-0002 §2.2.2)
+  (ADR-0002 §2.2.2) — **RESOLVED 2026-09-23**: the defect was fixed in the snapd
+  snap (rev 27591 → 27738, package version unchanged `2.76.3+ubuntu26.04`); the
+  bootstrap mount now falls back to `fuse.snapfuse`. Verified on a fresh container
+  from the `juju/ubuntu@26.04/amd64` image (no `snapd` seeded, no `/dev/loop*`):
+  `snap install hello-world` succeeds. Nothing to report upstream — it was fixed
+  before we filed it. The integration suite now runs in LXD containers
+  (2026-09-23); the DHCP servable test (port 67) is the first thing to prove
+  there.
 - **Is `cos_agent` migrating to PyPI?** The library is Charmhub-hosted and
   Charmhub library hosting is being retired, but no PyPI replacement exists and no
   migration has been announced. Re-check the interface library index periodically
@@ -103,6 +110,18 @@ Ordered by estimated value — user impact against implementation risk.
 Items reviewers raised and stages shipped with, each with what would make it
 worth doing:
 
+- **The COS rule directories cannot carry placeholder files, so they are not
+  in git.** A `.gitkeep` in `src/prometheus_alert_rules/` or
+  `src/loki_alert_rules/` breaks the vendored `COSAgentProvider`: the
+  empty-rules path feeds a stray value through `DatabagModel`'s json-decoding
+  validators, the publish dies inside the library's own `except`, and the
+  `config` databag key never lands — `test_cos_agent_databag_publication`
+  catches it (discovered 2026-10-04; a file in `src/grafana_dashboards/` is
+  harmless, the wart is specific to the alert-rules dirs). The dirs therefore
+  exist empty on the working tree but are untracked, so a fresh clone does not
+  have them. **Trigger:** the first real `.rules` file lands (the dirs become
+  tracked then, with real content), or a `charmcraft fetch-libs` refresh brings
+  a vendored `cos_agent` that tolerates non-rule files in an empty rules dir.
 - **The read-back verifier in `pihole.py` is 54 lines with six near-identical
   `raise` blocks**, and re-parses `pihole.toml` once per key. **Trigger:** the
   next key whose comparison is not string/bool/array, or the first time someone

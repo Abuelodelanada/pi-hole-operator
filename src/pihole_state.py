@@ -329,7 +329,7 @@ class NoIntentYet:
 
     The only reason today is a follower waiting for the leader to mint
     the admin password: the charm cannot converge toward a password it
-    does not hold. See ADR-0007 section 1.1.
+    does not hold. See ADR-0007 section 4.1.
 
     A named case rather than `None` because it says *why* the absence
     exists at the point of use — `case NoIntentYet()` reads as the
@@ -382,7 +382,7 @@ class SetNtpServer:
     """Enable or disable the FTL NTP server on 123/udp.
 
     One outcome whose value carries the decision, rather than two
-    separate outcomes — see ADR-0006 section 2.3.
+    separate outcomes — see ADR-0003 section 2.4.
     """
 
     active: bool

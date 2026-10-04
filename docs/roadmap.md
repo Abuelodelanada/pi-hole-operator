@@ -1,7 +1,7 @@
 # Implementation roadmap
 
 **Status:** Accepted — each stage's acceptance block records its own state
-**Last updated:** 2026-09-07
+**Last updated:** 2026-09-23
 **Audience:** `charm-engineer`
 
 Staged delivery plan for the charm specified in
@@ -72,10 +72,17 @@ Proves the toolchain before any workload risk enters.
   is mandatory** — `ops.testing` defaults to `kubernetes`, and a machine charm
   tested with the default is in the wrong environment.
 - CI on **3.14 only** — the sole interpreter in the 26.04 archive.
-- **Integration tests must use LXD VMs**, not containers: snapd cannot mount snaps
-  in a 26.04 container (ADR-0002 §2.2.2). Put
-  `constraints="virt-type=virtual-machine"` in the `conftest.py` fixture so it
-  cannot be forgotten.
+- **Integration tests run in LXD containers** — the snapd bootstrap defect
+  cleared (ADR-0002 §2.2.2, resolved 2026-09-23) and the suite moved to
+  containers the same day. The DHCP servable test (port 67) — the piece the
+  suite had never exercised in a container — **passed in a container the same
+  day** (2026-09-23). **New container-specific finding:** the Stage 3 gate
+  `test_ftl_log_is_free_of_capability_warnings` **fails in a container** —
+  connecting `process-control` no longer silences the `CAP_SYS_NICE` warning
+  in `FTL.log` (verified on a fresh Juju-created container *and* on the
+  operator's production container, machine 7). The charm's runtime
+  capability guarantees therefore differ between VM and container; tracked in
+  BACKLOG.md.
 
 **Acceptance**
 
@@ -118,6 +125,8 @@ stage; everything after it is elaboration.
   later, once the snap began self-signing its certificate — ADR-0006 §2.8.)
 - **`snap set ftl.webserver.port="80o,[::]:80o"` before the first start.** Without
   it the webserver never binds and the API never appears (snap-constraints §5.1).
+  *Superseded 2026-09-05: the snap ships a working stock port and the charm no
+  longer manages this key (ADR-0006 §2.8). Kept here as the Stage 1 record.*
 - **The NTP server the snap opens by default on 123/udp is closed** —
   `ntp.ipv4.active` and `ntp.ipv6.active` set false, verified in `pihole.toml`.
   Third instance of the stage's own rule: a hole opened by the charm's act of
@@ -129,8 +138,9 @@ stage; everything after it is elaboration.
 - Readiness gated on the HTTP API (`GET /api/dns/blocking`), **never**
   `snap services` — and only *after* the port fix, or the gate can never pass.
 - **Mandatory ordering** in `compute`'s output sequence:
-  `install → free 53 → set webserver.port → close NTP → set password → start
-  → gate on API`.
+  `install → free 53 → close NTP → set password → start
+  → gate on API` (`webserver.port` sat between the first two until
+  ADR-0006 §2.8 removed it, 2026-09-05).
   Install precedes freeing port 53 so a store failure cannot leave the host without
   a resolver (ADR-0005 §2.9).
 
@@ -144,8 +154,9 @@ stage; everything after it is elaboration.
 - Workload: `ensure` called **and** `start(enable=True)` called — regression test
   for `install-mode: disable`.
 - Workload: resolved drop-in written on install, **deleted on remove**.
-- Pure: the outcome sequence puts `webserver.port`, the NTP closure and the
-  password **before** `StartFtl`. This is the whole stage's correctness condition
+- Pure: the outcome sequence puts the NTP closure and the
+  password **before** `StartFtl` (Stage 1 also asserted `webserver.port` here,
+  until ADR-0006 §2.8 removed it). This is the whole stage's correctness condition
   and it is a pure assertion on a tuple — no mocks.
 - Pure: an NTP server that does not match intent yields exactly
   `SetNtpServer(active=…)` plus its own readiness gate, because the configure hook
@@ -165,8 +176,8 @@ stage; everything after it is elaboration.
 - **Nothing listens on 123/udp** after convergence (`ss -ulpn`).
 - **An unauthenticated `PATCH /api/config` from another host is refused.** This is
   the §5.2 regression test and it must run from off-machine, not from localhost.
-- Deploy with `constraints="virt-type=virtual-machine"`: snaps cannot be installed
-  in a 26.04 LXD container at all (ADR-0002 §2.2.2).
+- Deploy into LXD containers — the snapd bootstrap defect cleared (ADR-0002
+  §2.2.2, resolved 2026-09-23), and the suite moved to containers the same day.
 - Verify real state with `juju exec --unit pihole/0 -- ...`. Use `--unit` (root,
   hook context), **not** `--machine` (runs as `ubuntu`, where `snap get` can fail
   on permissions).
@@ -507,6 +518,22 @@ Two design consequences for 7.b, from the same spike:
       precisely why the ordering lives in data.
 - [x] Integration tests gated behind a pytest marker: on LXD port 67 is normally
       taken and an ungated test will crash-loop the daemon.
+- [x] The servable DHCP test passes on LXD. —
+      `test_dhcp_enabled_servable_reaches_active` (2026-09-23): with a pool in
+      the unit's subnet, the charm converges to `Active` and `ss -lunp` names
+      `pihole-FTL` on `0.0.0.0:67` — the owner, not the port, is the evidence.
+      Answers F6. The enable is verified by a bounded bind wait
+      (`WaitForDhcpBind`, ADR-0006 §2.9), so the test also exercises the wait
+      live.
+- [x] `charm-reviewer` clean (2026-09-22, fifth pass over the slice that
+      closes this stage). Five passes, each finding what the previous one's
+      fixes left: a Blocked reason that named a dead-end remedy, gates that
+      fired on a snap that was never installed, a status handler that could
+      Block on a gate that self-clears, a truth table with two missing rows —
+      all fixed in this commit, and the fifth pass cleared the closure. The
+      bounded bind wait (SF2) landed after the fifth pass and was reviewed as
+      part of it; the user chose the wait over accepting the transient-Blocked
+      window as debt.
 
 ---
 
@@ -553,11 +580,14 @@ the `cos_agent` PyPI migration question.
 - Environment: `sudo concierge prepare -p machine`. `jubilant` +
   `pytest-jubilant` on LXD.
 - **Pack once by hand**, export `CHARM_PATH`, reuse. Never pack inside a test.
-- **Use LXD VMs, not containers.** Two independent reasons: snapd cannot mount
-  snaps in a 26.04 container at all (ADR-0002 §2.2.2), and the charm rewrites
-  `/etc/systemd/resolved.conf.d/` and binds port 53, which conflicts with a
-  container's own resolver anyway. `juju deploy ... --constraints
-  virt-type=virtual-machine`.
+- **Use LXD containers.** The snapd bootstrap defect that once made snaps
+  uninstallable in a 26.04 container (ADR-0002 §2.2.2) cleared 2026-09-23, and
+  the suite moved to containers the same day. The DHCP servable test (port 67)
+  — the piece the suite had never exercised in a container — **passed in a
+  container on 2026-09-23**. The container move did uncover a divergence the
+  VMs had hidden: with `process-control` connected, FTL still logs
+  `CAP_SYS_NICE` warnings in a container (verified on the operator's
+  production container, machine 7).
 - Gravity bootstrap is asynchronous and downloads a blocklist. Budget 900s and
   assert on `pihole api dns/blocking`, not on unit status alone.
 - **Do not test `juju expose`.** The LXD provider implements no firewaller, so

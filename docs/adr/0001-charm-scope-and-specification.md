@@ -3,6 +3,9 @@
 **Status:** Accepted
 **Date:** 2026-08-07
 **Accepted:** 2026-08-08
+**Amended:** 2026-10-04 — §2.1's escape-hatch row grows `rotate-admin-password`
+(ADR-0007 §4.4), and the DHCP row's verification condition has resolved:
+DHCP server mode is in scope and shipped (ADR-0006 §2.9, Stage 7).
 **Related:** [Snap constraints reference](../snap-constraints.md)
 
 ---
