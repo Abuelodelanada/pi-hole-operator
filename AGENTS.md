@@ -5,35 +5,37 @@ containers via the `pihole-by-rajannpatel` snap.
 
 This is not a Kubernetes charm. There is no Pebble, no `lightkube`, no OCI image.
 
+## Read this first
+
+1. [`docs/overview.md`](docs/overview.md) — the two-minute map: the pattern, and
+   what each file in `src/` is for.
+2. [`docs/pattern.md`](docs/pattern.md) — how the charm decides what to do,
+   taught with a small example that is not Pi-hole.
+3. The non-negotiables below — the contract that no gate fully checks for you.
+
+`docs/roadmap.md` says what is built and what is unstarted. And the precedence
+rule for everything in this repo: **where a skill and this file disagree, the
+skill is newer and wins — this file is then the thing to fix.**
+
 ## Where we are
 
-**Stages 1, 2, 3, 5 and 7 are closed** — each with acceptance green on LXD
-and a clean `charm-reviewer` pass (Stage 3's: 2026-09-21, fifth pass;
-Stage 7's: 2026-09-22, fifth round, with the DHCP servable test green on
-LXD 2026-09-23). The charm
-installs the snap **pinned to `SNAP_REVISIONS` and held against
-auto-refresh** (ADR-0010 — the snap never updates itself), frees port 53, starts
-FTL, closes the snap's default NTP server on 123/udp, owns the admin password,
-applies declarative config through `PATCH /api/config` with a read-back against
-`pihole.toml`, can serve DHCP from the FTL server (Stage 7.b, ADR-0006 §2.9),
-and restores the host resolver on removal. `docs/roadmap.md`
-defines the stages and is the source of truth — check it before treating a
-missing feature as a defect rather than as unstarted work.
+`docs/roadmap.md` is the source of truth for staged delivery — what is built,
+what is unstarted, and each stage's acceptance record. Check it before treating
+a missing feature as a defect rather than as unstarted work. In one line: the
+charm deploys Pi-hole end to end — snap pinned and held against auto-refresh
+(ADR-0010), port 53 freed and restored, admin password owned, declarative
+config through the FTL API with read-back, optional DHCP. `docs/overview.md`
+is the two-minute map of how.
 
-The public interface today: the actions (`get-admin-password`,
-`rotate-admin-password`, `snap-check`, `update-gravity`, `free-port-53`)
-and the config options (`upstream-dns`, `dns-listening-mode`,
-`blocking-enabled`, `dnssec-enabled`, `ntp-server-enabled`,
-`gravity-schedule`, `dhcp-enabled`, `dhcp-range-start`, `dhcp-range-end`,
-`dhcp-router`, `dhcp-netmask`) declared in `charmcraft.yaml` — this paragraph
-deliberately carries no counts; the YAML is the list. **One optional
-relation** (`cos-agent`, ADR-0008) and **no bindings** —
-`extra-bindings: dns` was withdrawn until something consumes it (BACKLOG). Each option
-is justified in [ADR-0006](docs/adr/0006-configuration-surface.md) §2.1 against
-rule 4's three alternatives; `snap-channel` and `snap-revision` were
-**removed** because the revision is charm policy, not deployment shape
-(ADR-0010). Adding the first `requires` is still a decision,
-not a detail.
+The public interface today — actions, config options, and the `cos-agent`
+relation (optional, ADR-0008) — is what `charmcraft.yaml` declares; that YAML
+is the list, and this file deliberately does not restate it. There are
+**no bindings**: `extra-bindings: dns` was withdrawn until something consumes
+it (BACKLOG). Each config option is justified in
+[ADR-0006](docs/adr/0006-configuration-surface.md) §2.1 against rule 4's
+alternatives; `snap-channel` and `snap-revision` were **removed** because the
+revision is charm policy, not deployment shape (ADR-0010). Adding a `requires`
+is still a decision, not a detail.
 
 ## Non-negotiables
 
@@ -137,9 +139,9 @@ of those four gates can see rules 1, 2, 4, 5, 6, 7 or 8. Run `flaplint` as well
 when the change touches a databag write, a file write, or a hash.
 
 `uv.lock` is committed. Dependencies go in `pyproject.toml`, never in
-`charmcraft.yaml`'s `charm-libs` — that key is only for Charmhub-hosted libraries,
-of which this charm needs exactly one (`grafana_agent.cos_agent`, because no PyPI
-replacement exists).
+`charmcraft.yaml`'s `charm-libs` — that key is only for Charmhub-hosted
+libraries; the one this charm uses, `grafana_agent.cos_agent`, has no PyPI
+replacement (ADR-0008 §2.4).
 
 ## Layout
 
@@ -155,7 +157,8 @@ docs/
   overview.md             # two-minute map: the pattern, and what each src/ file is for
   pattern.md              # how the charm decides what to do, taught with a small example
   adr/                    # numbered decision records. Load `new-adr` before adding one.
-  implementation/         # how an existing module works. One file per module, as it lands.
+  implementation/         # how an existing module works; one doc per module as
+                          # it lands — roadmap.md records which exist today
   roadmap.md              # staged delivery plan
   snap-constraints.md     # what the snap cannot do, and the workarounds
   BACKLOG.md
@@ -167,7 +170,9 @@ src/
   pihole_config.py        # pydantic config model + the IntentFields TypedDict
   resolved.py             # workload: systemd-resolved port 53 orchestration
 tests/
-  unit/                   # ops.testing, Model(type='lxd'), mocks src.pihole
+  unit/                   # ops.testing, Model(type='lxd'); charm tests mock
+                          # the workload modules, workload tests fake urlopen
+                          # and the filesystem
   integration/            # jubilant + pytest-jubilant on LXD
 ```
 
@@ -195,42 +200,34 @@ value and the publish dies in the library's own `except`), discovered 2026-10-04
 ## Python conventions
 
 Authority is [PEP 8](https://peps.python.org/pep-0008/) and
-[PEP 257](https://peps.python.org/pep-0257/), enforced by `ruff`. Details and the
-rule-family mapping live in the `python-style` skill.
+[PEP 257](https://peps.python.org/pep-0257/), enforced by `ruff`, typed by
+`pyright`. The rule-family mapping and the rationale for each setting live in
+the `python-style` skill; the `pyproject.toml` they configure is documented in
+`machine-charm-scaffold`.
 
 Machine-checked:
 
-- **PEP 8 with the 99-character exception**, which PEP 8 grants explicitly —
-  *provided comments and docstrings stay wrapped at 72*. That proviso is the
-  condition, not a suggestion: `E501` and `W505` are both enabled.
-- Type annotations everywhere; `pyright` runs `typeCheckingMode = "strict"` over
-  **both `src` and `tests`**, so a test helper needs the same annotations as
-  production code. They also let `flaplint` resolve cross-object calls, so they buy
-  correctness twice.
-- Ruff's `select` is `E W F I N UP B C4 SIM RUF ANN D PLC0415`. Two consequences
-  worth knowing before you write: **`ANN` makes annotations a lint error, and `D`
-  does the same for docstrings** — neither is merely a house preference. No
-  `from x import *` (`F403`/`F405`). No bare `except:` (`E722`).
-- Python **3.14**, which is what `ubuntu@26.04` ships — and the *only* interpreter
-  in that base's archive, so there is no fallback. The charm never runs on anything
-  else, so `requires-python = ">=3.14"`, `ruff target-version = "py314"` and
-  `pyright pythonVersion = "3.14"`. Do not write code that merely tolerates older
-  interpreters. See `docs/adr/0002-tech-stack-and-repo-architecture.md`. One
-  consequence bites silently: `ruff format` rewrites `except (A, B):` into PEP
-  758's unparenthesized form, which makes `flaplint` skip the module without
-  saying so. Give multi-type `except` clauses an `as err:` binding — see
-  `python-style`.
-- **Type suppressions are checked, and only one spelling works.** `[tool.pyright]`
-  sets `enableTypeIgnoreComments = false` and
-  `reportUnnecessaryTypeIgnoreComment = "error"`, neither of which `strict` gives
-  you. So `# type: ignore[...]` — mypy's spelling — suppresses nothing, and the one
-  honoured form, `# pyright: ignore[rule]`, fails the gate once it is no longer
-  needed. Before these settings the repo carried seven of the mypy form, four of
-  them unnecessary and all of them silently blanket-suppressing their whole line.
+- **PEP 8's 99-character exception, with its proviso.** Comments and docstrings
+  stay wrapped at 72 — `E501` and `W505` are both enabled, because the proviso
+  is the condition PEP 8 grants the exception on, not a suggestion.
+- **Annotations and docstrings everywhere.** `ANN` and `D` make both a lint
+  error, not a house preference. `pyright` runs `typeCheckingMode = "strict"`
+  over **both `src` and `tests`**, so a test helper needs the same annotations
+  as production code.
+- **Python 3.14, no fallback.** It is the *only* interpreter in the
+  `ubuntu@26.04` archive, so the charm never runs on anything else — do not
+  write code that merely tolerates older interpreters
+  ([ADR-0002](docs/adr/0002-tech-stack-and-repo-architecture.md)).
+- **Only one suppression spelling works.** `# pyright: ignore[rule]` is the
+  honoured form; mypy's `# type: ignore[...]` suppresses nothing, and a
+  suppression that goes stale fails the gate.
 - **Frozen dataclasses everywhere except exceptions.** `ops` assigns
   `exc.__traceback__` as the event context unwinds, so a frozen exception raises
-  `FrozenInstanceError` and buries the real failure. Each exception module carries
-  a guard test asserting its exceptions survive being raised.
+  `FrozenInstanceError` and buries the real failure. Each exception module
+  carries a guard test asserting its exceptions survive being raised.
+- **Multi-type `except` clauses get an `as err:` binding.** `ruff format`
+  rewrites them into PEP 758's unparenthesized form, which `flaplint`'s parser
+  cannot read — it then skips the whole module without saying so.
 
 Not machine-checked — the reviewer's job:
 
@@ -256,22 +253,27 @@ Not machine-checked — the reviewer's job:
   "fix" the code, and then as one sentence. A comment explains why *this line*, at
   the line, in two lines or fewer.
 - **`# databag-order: ignore` suppresses one `flaplint` finding on one line.** It
-  is legitimate only where the nondeterminism is the point and cannot flap: the two
-  uses in `src/charm.py` are on `_store_password`, where the value is a fresh random
-  token written exactly once. A suppression on a line that runs on every reconcile
-  is a defect being silenced — fix the ordering instead.
+  is legitimate only where the nondeterminism is the point and cannot flap — a
+  fresh random token written exactly once, as on `_store_password`. A suppression
+  on a line that runs on every reconcile is a defect being silenced — fix the
+  ordering instead.
 
 ## Ecosystem facts that bite (2026)
 
-- Charmhub-hosted charm libraries (`charmcraft fetch-lib`, `LIBPATCH`/`LIBAPI`)
-  are **being phased out** in favour of PyPI packages. Do not create new
-  `lib/charms/...` files for code this repo owns.
-- `charms.operator_libs_linux.*` is **deprecated**. Use `charmlibs-snap`,
+The rule in one line each; the verified, dated detail lives in the named skill:
+
+- Charmhub-hosted charm libraries are being phased out in favour of PyPI
+  packages. Never create `lib/charms/...` files for code this repo owns, and
+  keep `charm-libs:` for Charmhub-hosted libraries only. (`charm-relations`)
+- `charms.operator_libs_linux.*` is deprecated. Use `charmlibs-snap`,
   `charmlibs-systemd`, `charmlibs-apt` from PyPI: `from charmlibs import snap`.
+  (`machine-charm-workload`)
 - The COS machine subordinate is `opentelemetry-collector` (`grafana-agent` is
-  EOL). But the interface is still `cos_agent` and its library is still published
-  as `grafana_agent.cos_agent` — there is no `opentelemetry_collector` equivalent.
+  EOL), but the interface is still `cos_agent` and its library is still
+  `grafana_agent.cos_agent` — there is no `opentelemetry_collector` equivalent.
+  (`charm-cos-integration`)
 - `bases:` in `charmcraft.yaml` is deprecated. Use `base:` + `platforms:`.
+  (`machine-charm-scaffold`)
 
 ## Agents and skills in this repo
 
@@ -281,11 +283,17 @@ Research delegates to `explore` (this repo) and `general` (the upstream
 `references`), both on a cheaper model.
 
 **Load the relevant skill instead of guessing.** Their names and trigger
-conditions are already in your system prompt, so this file does not restate them.
-They carry verified, sourced, dated detail — so where a skill and this file
-disagree, the skill is newer and wins, and this file is the thing to fix.
+conditions are already in your system prompt, so this file does not restate
+them. They carry verified, sourced, dated detail — and the precedence rule in
+*Read this first* decides who wins when they disagree with this file.
 
 Decisions live in `docs/adr/`, numbered and dated. `src/charm.py` cites them by
 number in comments, so an ADR is not optional documentation — it is where the
 reason for a rule lives once the rule is no longer obvious. Load `new-adr`
 before adding or revising one.
+
+**Never put a count in prose.** "Nine options", "six facts", "165 of 166" — a
+count is correct for exactly as long as the next commit takes, and this repo
+has shipped wrong counts repeatedly for exactly that reason. Describe the
+shape and name where the list lives: the YAML, the ADR, the tree. The same
+instinct is why docs cite an ADR section instead of paraphrasing it.

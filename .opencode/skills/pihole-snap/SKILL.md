@@ -293,8 +293,8 @@ slots:
 
 The charm uses it as `log_slots=["pihole-by-rajannpatel:logs"]` in
 `COSAgentProvider` so the `opentelemetry-collector` subordinate can tail the
-snap's log files and forward them to Loki. Full detail in
-`docs/snap-issue-logs-content-slot.md`.
+snap's log files and forward them to Loki. Full detail in ADR-0008 §1.2
+(`docs/adr/0008-cos-integration.md`).
 
 ## Paths
 
