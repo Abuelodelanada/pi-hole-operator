@@ -87,8 +87,10 @@ you are writing a fourth line of prose, the content belongs in the ADR you are
 about to cite.
 
 **Tests are part of the change, not a follow-up.** `# GIVEN / # WHEN / # THEN`.
-Fixtures in `conftest.py`. Pure functions get plain pytest with no mocks; the
-charm gets `ops.testing` with `Model(type='lxd')` and `src.pihole` mocked whole.
+Fixtures in `conftest.py`. Pure functions get plain pytest with no mocks. The
+charm gets `ops.testing` with `Model(type='lxd')`, mocking the workload modules
+whole (`mock_pihole`, `mock_resolved`); workload modules get fakes at their own
+seam — `urlopen` and the filesystem — never `subprocess` patches.
 
 ## Your workflow
 
@@ -98,12 +100,19 @@ charm gets `ops.testing` with `Model(type='lxd')` and `src.pihole` mocked whole.
    snap's behaviour is counterintuitive enough that writing from intuition
    produces code that reports success and does nothing.
 3. **Write the code and its tests together.**
-4. **Run the gates**: `tox -e fmt`, `tox -e lint`, `tox -e static`, `tox -e unit`.
-   Fix what they flag. Do not report done with a failing gate.
-5. **Run `tox -e flaplint`** if you touched a databag write, a file write, or a
+4. **Prove every reconcile step converges.** Each step you add to `_reconcile`
+   or `_apply` answers *what breaks if this runs twice?* and *what breaks if it
+   never runs?* — both "nothing" — and the test that proves it: a converged
+   state yields `(Noop(),)`, a not-ready state yields `Maintenance`, not
+   `Active`.
+5. **Run the gates**: `tox -e fmt`, `tox -e lint`, `tox -e static`, `tox -e unit`.
+   Fix what they flag. Do not report done with a failing gate. After changing
+   `pyproject.toml`, run `tox -e lock` and commit the regenerated `uv.lock` —
+   every other env syncs `--locked` and will fail against a stale lock.
+6. **Run `tox -e flaplint`** if you touched a databag write, a file write, or a
    hash. It is advisory, but a finding in code you just wrote is almost always
    real.
-6. **Say what you did not do.** Untested paths, `NOT VERIFIED` assumptions you
+7. **Say what you did not do.** Untested paths, `NOT VERIFIED` assumptions you
    relied on, shortcuts taken. Silence here is how defects ship.
 
 ## What you refuse to do
@@ -115,10 +124,10 @@ charm gets `ops.testing` with `Model(type='lxd')` and `src.pihole` mocked whole.
   actually occurs.
 - Ignore `E501` or skip a docstring to make a gate pass. Fix the line.
 - Import `charmlibs.*`, `subprocess`, or write a file from `src/charm.py`.
-- Import `ops` from any workload module. There are three — `src/pihole.py`,
-  `src/resolved.py` and `src/ftl_api.py` (the FTL HTTP client, ADR-0009) — and the
-  rule is the same for all of them. `src/pihole_state.py` is stricter still: no
-  `ops`, no `charmlibs`, no workload import, reaching the workload only through the
+- Import `ops` from any workload module. Which modules are workload is decided
+  by the Layout tree in `AGENTS.md`, not by this list — the rule is the same for
+  all of them. `src/pihole_state.py` is stricter still: no `ops`, no
+  `charmlibs`, no workload import, reaching the workload only through the
   `PiholeFacts` protocol.
 - Freeze an exception class. Everywhere else in this repo a dataclass is frozen;
   exceptions are the one carve-out, because `ops` assigns `exc.__traceback__` as
@@ -130,6 +139,15 @@ charm gets `ops.testing` with `Model(type='lxd')` and `src.pihole` mocked whole.
   the abort, the hook proceeds on unvalidated config and the operator is told
   nothing. Call it bare.
 - Create `lib/charms/.../vN/*.py` for code this repo owns.
+- Edit anything under `lib/charms/grafana_agent/` — vendored via
+  `charmcraft fetch-libs`, never edited, never linted. A deprecation warning or
+  a lint finding there is upstream's to fix: re-fetch a newer `version`, or flag
+  it, never patch it.
+- Add placeholder files to `src/grafana_dashboards/`,
+  `src/prometheus_alert_rules/`, `src/loki_alert_rules/`. They are empty and
+  deliberately untracked by decision (ADR-0008 §2.1) — a placeholder breaks
+  the vendored provider's empty-rules path and the publish dies in the
+  library's own `except`. See BACKLOG.
 - Report a step complete based on a command's exit code when the skill says that
   exit code is unreliable.
 - Change a design decision unilaterally. If implementation reveals the design is
@@ -141,3 +159,8 @@ charm gets `ops.testing` with `Model(type='lxd')` and `src.pihole` mocked whole.
 Report what you built, what you verified, and what you are unsure about, in that
 order. When a skill says something is `NOT VERIFIED` and your code depends on it,
 name it explicitly rather than letting it pass as settled.
+
+**Default to under 150 words.** Per file, a line; per change, the shape. The
+breakdown — options, trade-offs, step-by-step — comes when asked for, not by
+default. "What you did not do" is the one section that never gets compressed for
+length: it is load-bearing.
