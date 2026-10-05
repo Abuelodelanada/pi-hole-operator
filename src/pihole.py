@@ -1,20 +1,6 @@
 """Every effect this charm has on the machine, and every read-back.
 
-Never imports `ops` (rule 2); collaborators are injected so a test
-double can reproduce the workload's own lying behaviour — see
-ADR-0003 section 2.7. An exit code is never evidence (rule 6): every
-mutation below reads back its own result, and no foreign exception
-leaves this module unconverted — see ADR-0005 section 2.9. The FTL
-HTTP client lives in `ftl_api.py`, composed below — see ADR-0009
-section 4.
-
-Stage 2 adds four new facts from pihole.toml, generalises the NTP
-server toggle, and adds config application via the HTTP API. See
-ADR-0004 section 5 and ADR-0006 section 2.1.
-
-Stage 3 adds plug management, the gravity timer drop-in, and a
-snap-check that returns its output alongside the exit code. See
-docs/roadmap.md Stage 3.
+See ADR-0003 §2.7, ADR-0005 §2.9, and ADR-0009 §4.
 """
 
 import contextlib
@@ -57,11 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 def _bind_probe(port: int) -> bool:
-    """Whether a UDP socket can bind ``0.0.0.0:port``.
-
-    The read for the DHCP port gate: a successful bind means nothing
-    holds the port. Total by contract — a fact never raises.
-    """
+    """Whether a UDP socket can bind ``0.0.0.0:port``."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             probe.bind(("0.0.0.0", port))
@@ -87,10 +69,9 @@ DNSSEC_KEY = "dns.dnssec"
 
 DHCP_ACTIVE_KEY = "dhcp.active"
 DHCP_POOL_KEYS: tuple[str, ...] = ("dhcp.start", "dhcp.end", "dhcp.router", "dhcp.netmask")
-"""The four DHCP pool keys, applied atomically before ``dhcp.active``.
+"""The four DHCP pool keys, applied atomically.
 
-Read back as a group: a partial pool is no pool. See snap-constraints
-§4.4.
+See snap-constraints §4.4.
 """
 
 INSTALL_ATTEMPTS = 3
@@ -98,13 +79,10 @@ INSTALL_WAIT = tenacity.wait_fixed(2) + tenacity.wait_random(0, 5)
 """Bounded, in-hook retry for a snap store that is genuinely flaky."""
 
 IP_CMD = "/usr/bin/ip"
-"""Absolute path for the same reason as `SS_CMD`: a hook's PATH is
-Juju's, and a missed `ip` would silently block DHCP with a misleading
-remedy."""
+"""Absolute path: a hook's PATH is Juju's, not the system's."""
 
 SS_CMD = "/usr/bin/ss"
-"""Absolute path for the same reason as `IP_CMD`: a hook's PATH is
-Juju's, and a missed `ss` would fail the DHCP bind wait."""
+"""Absolute path: a hook's PATH is Juju's, not the system's."""
 
 DHCP_BIND_PROCESS = "pihole-FTL"
 """The process name FTL runs under: launcher-ftl.sh `exec`s the
@@ -114,27 +92,15 @@ DHCP_BIND_POLL_INTERVAL = 2.0
 """Seconds between `ss -lunp` polls while waiting for the bind."""
 
 SNAPD_REMEDY = "check `snap changes` and `journalctl -u snapd` on the machine"
-"""Where to look when snapd failed for a reason we cannot name.
-
-Every install failure lands here. The one failure the charm could once
-fully explain — the snapd bootstrap mount inside a Juju-created 26.04
-container — was fixed in the snapd snap (rev 27738), so there is no
-container-specific remedy left to name. See ADR-0002 section 2.2.2.
-"""
+"""Where to look when snapd failed. See ADR-0002 §2.2.2."""
 
 
-# Not frozen: an exception that crosses an event-handler boundary gets
-# `exc.__traceback__` assigned by ops' `_event_context`, which raises
-# `FrozenInstanceError` on a frozen dataclass and replaces the real
-# error with a crash. Verified on a deployed unit.
+# Not frozen: ops assigns `exc.__traceback__` on handler exit,
+# which raises `FrozenInstanceError` on a frozen instance.
 @final
 @dataclass
 class PiholeError(Exception):
-    """A workload operation did not produce the state it claimed to.
-
-    The context lives inside the error so the status handler can build
-    an informative `BlockedStatus` without asking the machine again.
-    """
+    """A workload operation did not produce the state it claimed to."""
 
     operation: str
     expected: str
@@ -151,10 +117,8 @@ class PiholeError(Exception):
 def _converting_snapd_failure(operation: str, remedy: str) -> Generator[None]:
     """Turn a `charmlibs.snap` failure into one this charm owns.
 
-    The charm module cannot catch `snap.Error` itself without importing
-    `charmlibs`, which rule 2 forbids — so the conversion happens here,
-    where the remedy text is. See ADR-0005 section 2.9 and ADR-0003
-    section 2.6.
+    The charm module cannot catch `snap.Error` without importing
+    `charmlibs` (rule 2). See ADR-0005 §2.9.
     """
     try:
         yield
@@ -163,12 +127,7 @@ def _converting_snapd_failure(operation: str, remedy: str) -> Generator[None]:
 
 
 def _snapd_failure(operation: str, remedy: str, err: snap.Error) -> PiholeError:
-    """Describe a snapd refusal as an error this charm owns.
-
-    Separate from the context manager above: `install` needs the
-    same diagnosis but picks its remedy only after the attempt has
-    failed.
-    """
+    """Describe a snapd refusal as an error this charm owns."""
     return PiholeError(
         operation=operation,
         expected="snapd to carry the request out",
@@ -230,13 +189,10 @@ class Pihole:
         self._machine = machine
         self._api = api or FtlApi(snap_data=snap_data)
         self._probe_udp_port = probe_udp_port
-        # Injected together, like FtlApi's: every bounded wait here is
-        # a deadline plus a sleep, and a test that fakes one without
-        # the other measures wall-clock time by accident.
+        # Injected together: every bounded wait is a deadline plus a
+        # sleep, and faking one without the other measures wall time.
         self._monotonic = monotonic
         self._sleep = sleep
-
-    # -- Facts. Every one of these is safe to call at any time. --------
 
     def installed_revision(self) -> str | None:
         """Return the installed revision, or None if not installed."""
@@ -248,18 +204,13 @@ class Pihole:
     def pinned_revision(self) -> str | None:
         """Report the revision this charm pins for this machine.
 
-        None on an architecture `SNAP_REVISIONS` does not cover —
-        revisions are per-architecture, so there is no single number
-        that fits every machine (ADR-0010).
+        None on an architecture `SNAP_REVISIONS` does not cover. See
+        ADR-0010.
         """
         return revision_for(self._machine())
 
     def refresh_held(self) -> bool:
-        """Report whether snapd will not auto-refresh this snap.
-
-        False when it cannot be read: an unreadable hold is not a
-        held snap, and the correction is one idempotent command.
-        """
+        """Report whether snapd will not auto-refresh this snap."""
         pihole = self._snap()
         if pihole is None or not pihole.present:
             return False
@@ -271,11 +222,7 @@ class Pihole:
         return None if pihole is None else pihole.version
 
     def ftl_status(self) -> ServiceStatus:
-        """Report what snapd knows about the FTL daemon.
-
-        Never a readiness signal on its own: the daemon reports active
-        long before Pi-hole answers a query. See `api_ready`.
-        """
+        """Report what snapd knows about the FTL daemon."""
         pihole = self._snap()
         if pihole is None:
             return ServiceStatus(enabled=False, active=False)
@@ -287,9 +234,7 @@ class Pihole:
     def ntp_server_active(self) -> bool | None:
         """Report whether FTL's NTP server is enabled on 123/udp.
 
-        None when `pihole.toml` cannot answer — file missing,
-        unparseable, or the keys absent. The caller decides what
-        unknown means; the pure core treats it as open.
+        None when `pihole.toml` cannot answer.
         """
         states = [self._ftl_config_bool(key) for key in NTP_ACTIVE_KEYS]
         if any(state is None for state in states):
@@ -324,7 +269,6 @@ class Pihole:
         """Return the four DHCP pool keys as a ``DhcpPool``.
 
         None when any key is absent — a partial pool is no pool.
-        Total by contract: a fact never raises.
         """
         start = self._ftl_config_value(DHCP_POOL_KEYS[0])
         end = self._ftl_config_value(DHCP_POOL_KEYS[1])
@@ -337,11 +281,8 @@ class Pihole:
     def machine_ipv4_addresses(self) -> frozenset[str] | None:
         """Return the IPv4 addresses on non-loopback interfaces.
 
-        Runs ``ip -4 -o addr show`` and parses the output. None when
-        the command cannot be run or exits non-zero — the read failed,
-        which is not the same as "no addresses". An empty set means
-        the read succeeded and found none. Both make ``dhcp_unservable``
-        return True, but the Blocked message distinguishes them.
+        None when the command cannot be run. An empty set means the
+        read succeeded and found none.
         """
         try:
             completed = self._run(
@@ -382,13 +323,8 @@ class Pihole:
     def port67_free(self) -> bool:
         """Probe whether 67/udp is free for FTL's DHCP server.
 
-        FTL binds 67/udp when ``dhcp.active`` is true; if something
-        else holds the port, FTL crash-loops via ``restart-condition:
-        on-failure`` (snap-constraints §4.4). A bind probe is the
-        pre-flight gate for the enable — the key landing in
-        ``pihole.toml`` is not evidence the daemon can serve, so the
-        gate is what stops an enable into a conflict. Total by
-        contract: a fact never raises.
+        The pre-flight gate: enabling into an occupied port crash-loops
+        FTL (snap-constraints §4.4).
         """
         return self._probe_udp_port(67)
 
@@ -407,14 +343,10 @@ class Pihole:
     def snap_check(self) -> SnapCheckResult:
         """Run snap-check and return its semantic outcome.
 
-        Semantic codes: 0 healthy, 1 config error, 2 runtime error.
-        Does **not** detect a dead webserver. See snap-constraints
-        section 7.3.
+        See snap-constraints §7.3.
 
         Raises:
-            PiholeError: The diagnostic could not be run at all, which
-                is not one of its exit codes and must not be invented
-                as one.
+            PiholeError: The diagnostic could not be run at all.
         """
         completed = self._run_pihole(
             "snap-check",
@@ -440,11 +372,8 @@ class Pihole:
     def connected_plugs(self) -> frozenset[str]:
         """Return the set of snap plugs currently connected.
 
-        Parses ``snap connections`` output. An empty set when the
-        command cannot be run or exits non-zero — meaning no
-        diagnostic runs and the pure core treats every plug as
-        disconnected, which is the safe direction because connecting
-        is idempotent. Total by contract: a fact never raises.
+        An empty set when the command cannot be run — the safe
+        direction, since connecting is idempotent.
         """
         try:
             completed = self._run(
@@ -454,12 +383,8 @@ class Pihole:
                 text=True,
             )
         except OSError as err:
-            # Total by contract: a fact must never raise (the status
-            # handler calls it outside any try, and an action hook
-            # that raised would error the unit — the failure mode that
-            # costs the machine its DNS). The empty set is the safe
-            # direction; if snapd is truly broken, the apply path
-            # surfaces the real error when it tries to connect.
+            # Total by contract: a fact must never raise. The empty
+            # set is the safe direction.
             logger.warning("could not read connected plugs: %s", err)
             return frozenset()
 
@@ -468,13 +393,8 @@ class Pihole:
 
         connected: set[str] = set()
         for line in completed.stdout.splitlines():
-            # A connected row is (interface, snap:plug, slot, notes);
-            # a disconnected row is (interface, snap:plug, "-", "-") —
-            # the SAME four columns, so the Slot column is the only
-            # thing that distinguishes them. Verified against real
-            # output: the parser that counted columns instead counted
-            # every disconnected plug as connected, which silenced
-            # ConnectPlugs entirely.
+            # Connected and disconnected rows have the same columns;
+            # the Slot column (parts[2]) is the only discriminator.
             stripped = line.strip()
             if not stripped or stripped.startswith("Interface"):
                 continue
@@ -483,14 +403,8 @@ class Pihole:
                 connected.add(parts[1].split(":", 1)[1])
         return frozenset(connected)
 
-    # -- Effects. Each one verifies the state it was meant to produce. -
     def connect_plugs(self, plugs: Sequence[str]) -> None:
         """Connect the named snap plugs, and verify they are connected.
-
-        ``snap connect`` is idempotent — reconnecting a connected
-        plug is a no-op — so this is safe on every reconcile. Every
-        plug is read back via ``connected_plugs()``; an exit code is
-        never evidence (rule 6).
 
         Raises:
             PiholeError: A plug could not be connected or did not
@@ -529,10 +443,6 @@ class Pihole:
     def _validate_gravity_schedule(self, schedule: str) -> None:
         """Validate an OnCalendar expression with systemd-analyze.
 
-        Runs ``systemd-analyze calendar <schedule>`` — non-zero exit
-        means the expression is invalid, and the error names the
-        config option the operator must correct.
-
         Raises:
             PiholeError: The expression is invalid, or the command
                 could not be run.
@@ -567,10 +477,7 @@ class Pihole:
     def _drop_in_paths(self) -> str | None:
         """Return the DropInPaths of the gravity timer unit.
 
-        Uses ``systemctl show -p DropInPaths --value`` — the only
-        honest signal that our override is loaded, since the snap's
-        own randomized default arms the timer regardless and
-        TimersCalendar proves nothing about ours.
+        The only honest signal that our override is loaded.
 
         Raises:
             PiholeError: The systemctl command could not be run.
@@ -596,16 +503,9 @@ class Pihole:
     def gravity_schedule(self) -> str | None:
         """Return the schedule OUR drop-in imposes, or None if absent.
 
-        This is deliberately not the effective ``OnCalendar``: the snap
-        ships its own randomized default (observed ``Sun *-*-* 03:51``,
-        drawn from a 03:00-05:00 window), so the effective value is
-        never None — and a fact that reported it would make an
-        unmanaged intent plan a removal on every reconcile, forever.
-        The fact is "what did WE write"; the effective schedule is
-        what ``write_gravity_timer`` reads back after writing.
-
-        Total by contract: a fact never raises — the same reasoning
-        as ``connected_plugs``, stated inline at the ``OSError`` arm.
+        Deliberately not the effective ``OnCalendar``: the snap ships
+        its own randomized default, so the effective value is never
+        None.
         """
         drop_in = self._gravity_timer_drop_in
         try:
@@ -613,9 +513,7 @@ class Pihole:
         except FileNotFoundError:
             return None
         except OSError as err:
-            # Total by contract — same reasoning as connected_plugs:
-            # None is the safe direction (a set intent rewrites the
-            # unreadable drop-in on the next reconcile).
+            # Total by contract: None is the safe direction.
             logger.warning("could not read the gravity timer drop-in: %s", err)
             return None
         for line in content.splitlines():
@@ -627,16 +525,8 @@ class Pihole:
     def write_gravity_timer(self, schedule: str) -> None:
         """Write the host systemd drop-in overriding the gravity timer.
 
-        The expression is validated with ``systemd-analyze calendar``
-        before anything is written, so an invalid expression is caught
-        early with a message naming the config option. ``OnCalendar=``
-        is cleared before the new value is set because systemd drop-ins
-        append otherwise, which would leave both the old and new
-        schedules in effect. ``daemon_reload()`` is called afterwards
-        so systemd picks up the change. The drop-in is then verified
-        by reading ``systemctl show -p DropInPaths --value`` — the
-        only honest signal that our override is loaded, since the
-        snap's own randomized default arms the timer regardless.
+        ``OnCalendar=`` is cleared before setting because drop-ins
+        append. Verified via DropInPaths afterwards.
 
         Raises:
             PiholeError: The expression is invalid, the drop-in could
@@ -678,10 +568,8 @@ class Pihole:
                 remedy="check `systemctl status` on the machine",
             ) from err
 
-        # Read back that OUR drop-in is armed — DropInPaths is the
-        # discriminator that our override is loaded, not TimersCalendar
-        # (the snap's randomized default arms the timer regardless, so
-        # TimersCalendar proves nothing about ours).
+        # DropInPaths is the discriminator that our override is loaded;
+        # TimersCalendar proves nothing about ours.
         drop_in_paths = self._drop_in_paths()
         if drop_in_paths is None or str(drop_in) not in drop_in_paths:
             raise PiholeError(
@@ -702,10 +590,7 @@ class Pihole:
     def remove_gravity_timer(self) -> None:
         """Remove the host systemd drop-in, restoring the snap's timer.
 
-        Idempotent: safe to run when the drop-in does not exist.
-        ``daemon_reload()`` is called afterwards so systemd picks up
-        the change. The file-existence check is the honest verification
-        for a removal — the drop-in is either gone or it is not.
+        Idempotent. ``daemon_reload()`` is called afterwards.
 
         Raises:
             PiholeError: The drop-in could not be removed, systemd
@@ -746,18 +631,11 @@ class Pihole:
     def update_gravity(self, *, force: bool = False) -> None:
         """Run the full gravity update with ``pihole -g``.
 
-        When ``force`` is True, ``--force`` is passed so gravity.sh
-        deletes the list cache before downloading, which forces a
-        full re-download of all blocklists. Verified from upstream:
-        ``gravity.sh`` accepts ``-f``/``--force``, which does
-        ``rm "${listsCacheDir}/list.*"`` before downloading.
+        ``force`` passes ``--force`` for a full rebuild.
 
         Raises:
             PiholeError: The command could not be run, or ``pihole -g``
-                exited non-zero — its exit code and the tail of its
-                output travel inside the error, because the output is
-                what says *why* a download failed, and a raw
-                ``CalledProcessError`` stringifies without it.
+                exited non-zero.
         """
         args: list[str] = []
         if force:
@@ -765,9 +643,8 @@ class Pihole:
         try:
             self._run_pihole("-g", *args, check=True, operation="running `pihole -g`")
         except subprocess.CalledProcessError as err:
-            # Chained, unlike set_password: this argv carries no
-            # secret. The output can be hundreds of lines of per-list
-            # progress, so only its tail travels.
+            # Chained: this argv carries no secret. Only the tail
+            # travels — the output can be hundreds of lines.
             output = (err.stderr or err.stdout or "").strip()
             tail = "\n".join(output.splitlines()[-5:]) or "(no output)"
             raise PiholeError(
@@ -784,32 +661,16 @@ class Pihole:
     def _ensure_installed(self, revision: str) -> None:
         """Ask snapd for the snap at the pinned revision.
 
-        Separate from `install` so the retry wraps this one call, and
-        not the read-back that proves it worked.
-
         Raises:
-            snap.Error: snapd refused. `install` retries this and
-                converts what survives.
+            snap.Error: snapd refused. `install` retries this.
         """
         self._require_snap().ensure(snap.SnapState.Present, channel=None, revision=revision)
 
     def install(self) -> None:
         """Install the snap at the pinned revision, with retries.
 
-        Retries on ``snap.Error``, **not** ``snap.SnapError``. Verified
-        against charmlibs-snap 1.0.1: ``SnapError``, ``SnapAPIError``
-        and ``SnapNotFoundError`` are *siblings*, so retrying the first
-        would miss the store and lookup failures that are the flaky
-        ones. ``Error`` is also the only one of the four still present
-        on charmlibs main.
-
-        What survives the retries is converted, not re-raised — see
-        ADR-0005 section 2.9. The remedy is chosen after the failure
-        rather than before, so a healthy install never execs the
-        diagnostic. The revision is charm policy per ADR-0010, resolved
-        for this machine's architecture — and the read-back proves the
-        pin, because installing a revision does not by itself stop a
-        later refresh from moving it.
+        Retries on ``snap.Error``, not ``snap.SnapError`` (verified
+        against charmlibs-snap 1.0.1). See ADR-0005 §2.9 and ADR-0010.
 
         Raises:
             PiholeError: This charm's release pins no revision for this
@@ -820,9 +681,8 @@ class Pihole:
         machine = self._machine()
         pinned = revision_for(machine)
         if pinned is None:
-            # Refusing beats installing whatever the store offers: an
-            # unpinned snap would auto-refresh out from under the charm,
-            # which is the whole thing ADR-0010 prevents.
+            # Refusing beats installing whatever the store offers. See
+            # ADR-0010.
             raise PiholeError(
                 operation=f"installing the {SNAP_NAME} snap",
                 expected=f"a revision pinned for {machine}",
@@ -862,10 +722,7 @@ class Pihole:
     def hold_refresh(self) -> None:
         """Hold the snap against auto-refresh, and verify it took.
 
-        Per-snap and indefinite: snapd's timer can no longer move the
-        pinned revision. A manual refresh is still possible — the
-        revision drift check is the second line of defence. See
-        ADR-0010.
+        See ADR-0010.
 
         Raises:
             PiholeError: snapd refused the hold, or accepted it and
@@ -885,9 +742,6 @@ class Pihole:
 
     def start(self, *, enable: bool = True) -> None:
         """Start the FTL daemon, and enable it so it survives a reboot.
-
-        `enable` is keyword-only: a positional `start(False)` would
-        quietly leave Pi-hole disabled after a reboot.
 
         Raises:
             PiholeError: snapd refused the start, or accepted it and
@@ -915,8 +769,7 @@ class Pihole:
         """Restart the FTL daemon, and verify it is active afterwards.
 
         ``Snap.start`` on an active service is a no-op, so plug-drift
-        recovery needs a genuine restart — the capability warnings
-        clear only after one. See snap-constraints section 3.
+        recovery needs a genuine restart. See snap-constraints §3.
 
         Raises:
             PiholeError: snapd refused the restart, or accepted it and
@@ -943,14 +796,7 @@ class Pihole:
     def set_ntp_server(self, *, active: bool) -> None:
         """Set both `ftl.ntp.*.active` keys, and verify the TOML.
 
-        The snap starts an NTP server on 123/udp by default — attack
-        surface nothing asked for. Both keys are `snap set`-reachable,
-        and the configure hook restarts FTL only when a value actually
-        changed, so a converged machine is not bounced.
-
-        When `active` is True, both keys must be present and True.
-        When False, both must be present and False — absence or None
-        is not evidence the server is off (rule 6).
+        Both keys must be present and match the intended value.
 
         Raises:
             PiholeError: snapd refused the keys, or the TOML does not
@@ -963,10 +809,8 @@ class Pihole:
                 {f"ftl.{key}": active for key in NTP_ACTIVE_KEYS},
                 typed=True,
             )
-        # Strict read-back: both keys must be present and match the
-        # intended value. An absent or unreadable key is not evidence
-        # the write landed — FTL's default is true, so absence can
-        # mean the write never landed (rule 6).
+        # Both keys must be present and match. Absence is not evidence
+        # the write landed — FTL's default is true (rule 6).
         after = {key: self._ftl_config_bool(key) for key in NTP_ACTIVE_KEYS}
         not_proven = [key for key, state in after.items() if state is not active]
         if not_proven:
@@ -981,9 +825,8 @@ class Pihole:
     def set_password(self, password: str) -> None:
         """Apply the admin password with `pihole setpassword`.
 
-        The plaintext never reaches snapd state, which is why this is
-        not a `snap set`. It is verified by reading `pwhash` back: the
-        salt is random, so a genuine write always changes the hash.
+        Verified by reading `pwhash` back: the salt is random, so a
+        genuine write always changes the hash.
 
         Raises:
             PiholeError: The command could not be run, it failed, or
@@ -998,8 +841,7 @@ class Pihole:
                 operation="setting the admin password",
             )
         except subprocess.CalledProcessError as err:
-            # Deliberately unchained: CalledProcessError stringifies the
-            # whole argv, which would put the password in juju-log.
+            # Unchained: CalledProcessError stringifies the whole argv.
             raise PiholeError(
                 operation="setting the admin password",
                 expected="exit 0 from `pihole setpassword`",
@@ -1024,9 +866,7 @@ class Pihole:
         """Block until the HTTP API answers, or give up and say so.
 
         Raises:
-            PiholeError: The API never answered. With the daemon
-                active, that is not "still starting" — something a
-                human must look at has gone wrong.
+            PiholeError: The API never answered.
         """
         try:
             self._api.await_ready(timeout)
@@ -1044,12 +884,8 @@ class Pihole:
     def wait_for_dhcp_bind(self, timeout: float) -> None:
         """Block until FTL demonstrably holds 67/udp, or give up.
 
-        The DHCP enable PATCHes land in pihole.toml before FTL binds
-        the port, so the wait closes the window in which a status
-        collection would sample 67 free and Block on a gate that
-        self-clears. The evidence is the owner, not the port:
-        `ss -lunp` must name pihole-FTL on a 67/udp socket — a free
-        port is not proof FTL serves DHCP (rule 6).
+        The evidence is the owner: `ss -lunp` must name pihole-FTL on
+        a 67/udp socket (rule 6).
 
         Raises:
             PiholeError: FTL never bound the port within `timeout`.
@@ -1071,12 +907,7 @@ class Pihole:
             self._sleep(DHCP_BIND_POLL_INTERVAL)
 
     def _dhcp_bind_held(self) -> bool:
-        """Whether `ss -lunp` names pihole-FTL on a 67/udp socket.
-
-        Total by contract: a fact never raises. A failed read is "not
-        held" — the wait keeps polling and the timeout names the
-        failure.
-        """
+        """Whether `ss -lunp` names pihole-FTL on a 67/udp socket."""
         try:
             completed = self._run(
                 [SS_CMD, "-lunp"],
@@ -1104,13 +935,8 @@ class Pihole:
     def apply_ftl_config(self, password: str, config: Mapping[str, object]) -> None:
         """Apply FTL config keys via the HTTP API, and read back.
 
-        Delegates to `FtlApi.apply_config` — which authenticates with
-        the admin password, because a `cli_pw` session cannot modify
-        config — then reads every key back from `pihole.toml` to verify
-        it landed. FTL returns 200 for unknown keys and silently ignores
-        them, so the read-back is the only defence (rule 6, ADR-0004
-        section 5.4). No `ftl_api` exception leaves this module
-        unconverted.
+        FTL returns 200 for unknown keys, so the read-back is the only
+        defence (rule 6, ADR-0004 §5.4).
 
         Raises:
             PiholeError: A key was not applied, the API could not be
@@ -1194,8 +1020,6 @@ class Pihole:
             "Applied FTL config for %d keys and verified them in pihole.toml.", len(config)
         )
 
-    # -- Snap plumbing. -----------------------------------------------
-
     def _snap(self) -> snap.Snap | None:
         """Look the snap up, tolerating snapd not knowing about it."""
         try:
@@ -1207,9 +1031,8 @@ class Pihole:
     def _require_snap(self) -> snap.Snap:
         """Look the snap up, letting a snapd failure propagate.
 
-        Raises the raw `snap.Error`: `install`'s retry is keyed on
-        that type (ADR-0005 section 2.7). Every other caller must wrap
-        this in `_converting_snapd_failure`.
+        Raises the raw `snap.Error` for `install`'s retry. See
+        ADR-0005 §2.7.
         """
         return self._cache_factory()[SNAP_NAME]
 
@@ -1221,16 +1044,12 @@ class Pihole:
     ) -> subprocess.CompletedProcess[str]:
         """Run a `pihole` subcommand, naming a failure to run it at all.
 
-        Never includes argv in the message: `set_password` passes a
-        plaintext password through here, and `OSError` here means a
-        missing or half-installed snap.
+        Never includes argv in the message.
 
         Raises:
             PiholeError: The command could not be executed.
             subprocess.CalledProcessError: Propagates when `check` is
-                set. Every caller converts it itself — `set_password`
-                because the plaintext must not leak into a message,
-                `update_gravity` to carry the output to the operator.
+                set.
         """
         try:
             return self._run(
@@ -1247,15 +1066,10 @@ class Pihole:
                 remedy=f"check that the {SNAP_NAME} snap is installed on the machine",
             ) from err
 
-    # -- pihole.toml. --------------------------------------------------
-
     def _ftl_config_value(self, key: str) -> str | None:
         """Read one dotted key out of `pihole.toml`.
 
-        Returns None when the file, the table, or the key is absent —
-        the normal state before the daemon has ever run — and also when
-        the value is not a string, because Stage 1 reads only strings
-        and booleans.
+        Returns None when the file, table, or key is absent.
         """
         value = config_value(self._read_toml(), key)
         return value if isinstance(value, str) else None
@@ -1263,10 +1077,7 @@ class Pihole:
     def _ftl_config_bool(self, key: str) -> bool | None:
         """Read one dotted boolean key out of `pihole.toml`.
 
-        None when the file cannot answer — missing, unparseable, or
-        the key absent. Callers decide what unknown means; for the
-        NTP verification it is failure, because FTL's default is true
-        and absence is not evidence of a closed port.
+        None when the file cannot answer.
         """
         value = config_value(self._read_toml(), key)
         return value if isinstance(value, bool) else None

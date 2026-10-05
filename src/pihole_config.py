@@ -1,13 +1,6 @@
 """Pydantic model for the charm's config options and action params.
 
-Parsed by `ops` via `self.load_config(PiholeConfig, errors="blocked")`
-and `event.load_params(UpdateGravityParams, errors="fail")`.
-Imports pydantic, stdlib, and the pure core — no `ops` import, so it
-is testable without a harness. See ADR-0006 section 2.1.
-
-Stage 7.b adds DHCP server mode: five config options with cross-field
-validation that the pool is complete and valid when enabled. See
-ADR-0006 §2.9.
+See ADR-0006 §2.1 and §2.9.
 """
 
 import ipaddress
@@ -22,9 +15,7 @@ import pihole_state
 class ListeningMode(StrEnum):
     """The `dns.listeningMode` values this charm can honour.
 
-    Narrower than FTL's five: `SINGLE` and `BIND` need `dns.interface`,
-    which the charm does not manage. See ADR-0006 section 2.11 for why
-    that is a silent failure, and why widening later is safe.
+    Narrower than FTL's five. See ADR-0006 §2.11.
     """
 
     LOCAL = "LOCAL"
@@ -35,8 +26,8 @@ class ListeningMode(StrEnum):
 def _parse_upstream_csv(value: str) -> tuple[str, ...]:
     """Split a CSV string into a tuple of stripped, non-empty entries.
 
-    An empty string yields an empty tuple, which the charm maps to
-    None/unmanaged. See ADR-0006 section 2.4.
+    An empty string yields an empty tuple (unmanaged). See
+    ADR-0006 §2.4.
     """
     if not value.strip():
         return ()
@@ -46,9 +37,7 @@ def _parse_upstream_csv(value: str) -> tuple[str, ...]:
 class IntentFields(TypedDict):
     """The `PiholeIntent` fields a config value can set.
 
-    Mirrors `PiholeIntent` minus `admin_password`, which the charm owns
-    rather than the operator. Keeping it a `TypedDict` rather than a
-    plain dict is what lets pyright check the seam.
+    Mirrors `PiholeIntent` minus `admin_password`.
     """
 
     upstream_dns: tuple[str, ...] | None
@@ -64,9 +53,8 @@ class IntentFields(TypedDict):
 class PiholeConfig(pydantic.BaseModel):
     """Schema for the charm's config options.
 
-    Kebab-case Juju names map to snake_case automatically via ops.
-    Defaults match FTL's own — except `ntp-server-enabled`, which the
-    charm diverges to false (ADR-0006 section 2.3).
+    Defaults match FTL's own except `ntp-server-enabled`
+    (ADR-0006 §2.3).
     """
 
     model_config = pydantic.ConfigDict(frozen=True)
@@ -162,14 +150,9 @@ class PiholeConfig(pydantic.BaseModel):
     def _validate_dhcp_pool(self) -> PiholeConfig:
         """Validate the DHCP pool when enabled.
 
-        When ``dhcp_enabled`` is true, all four pool fields must be
-        non-empty, valid IPv4 addresses, with a dotted-quad contiguous
-        netmask, ``start <= end``, both in the same subnet, and the
-        router inside that subnet. DHCP also requires
-        ``dns-listening-mode=ALL``: FTL's default ``LOCAL`` binds
-        localhost only, so every lease would point at a resolver that
-        refuses the client — the silent-success shape ADR-0006 §2.11
-        calls the worst this charm has. See ADR-0006 §2.9.
+        Requires all four pool fields, valid IPv4, contiguous netmask,
+        ``start <= end``, same subnet, router inside it, and
+        ``dns-listening-mode=ALL``. See ADR-0006 §2.9.
         """
         if not self.dhcp_enabled:
             return self
@@ -266,12 +249,7 @@ class PiholeConfig(pydantic.BaseModel):
         """Return the kwargs for PiholeIntent, minus admin_password.
 
         Empty upstream_dns and None listening_mode are mapped to None
-        so the charm treats them as unmanaged.
-
-        The `TypedDict` return is what makes the config-to-intent seam
-        checkable: `PiholeIntent(admin_password=..., **fields)` is
-        verified key by key, so renaming a field on either side fails
-        `tox -e static` instead of every hook at runtime.
+        (unmanaged).
         """
         upstreams = _parse_upstream_csv(self.upstream_dns)
         return {

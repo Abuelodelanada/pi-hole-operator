@@ -1,10 +1,6 @@
 """Take port 53 away from systemd-resolved, and give it back.
 
-Strict confinement stops the snap from touching `/etc/systemd`, so
-this module is the only thing between `juju remove-application` and
-a machine with no DNS. See snap-constraints section 8.1.
-
-Like `pihole.py`, this module never imports `ops`.
+See snap-constraints §8.1.
 """
 
 import logging
@@ -29,17 +25,11 @@ type ServiceRestarter = Callable[[str], bool]
 """The shape of `systemd.service_restart`, injected for tests."""
 
 
-# Not frozen for the same reason as `pihole.PiholeError`: ops assigns
-# `exc.__traceback__` when an exception leaves a handler, and this one
-# is deliberately re-raised in the `remove` handler.
+# Not frozen: ops assigns `exc.__traceback__` on handler exit.
 @final
 @dataclass
 class ResolvedError(Exception):
-    """A change to systemd-resolved did not take effect.
-
-    Carries its own context so the status handler can build a message
-    that names a remedy without going back to the machine to ask.
-    """
+    """A change to systemd-resolved did not take effect."""
 
     operation: str
     expected: str
@@ -53,13 +43,7 @@ class ResolvedError(Exception):
 
 
 def is_port53_released(drop_in: Path = DROP_IN) -> bool:
-    """Report whether port 53 is free for Pi-hole.
-
-    The check is this charm's drop-in being in place, byte for byte —
-    disabling resolved's stub listener is *how* the port is freed. A
-    partial or hand-edited file counts as absent: the charm rewrites
-    it rather than guessing what somebody meant.
-    """
+    """Report whether port 53 is free for Pi-hole."""
     return _read_drop_in(drop_in) == DROP_IN_CONTENT
 
 
@@ -68,11 +52,6 @@ def disable_stub_listener(
     restart: ServiceRestarter = systemd.service_restart,
 ) -> None:
     """Free port 53 for Pi-hole, restarting resolved only when needed.
-
-    Safe to run twice: identical content means no write and no restart.
-    That matters more than it looks, because restarting
-    systemd-resolved drops name resolution for the whole machine for a
-    moment, and this runs on every reconcile.
 
     Raises:
         ResolvedError: The drop-in could not be written, did not land,
@@ -86,8 +65,6 @@ def disable_stub_listener(
         drop_in.parent.mkdir(parents=True, exist_ok=True)
         drop_in.write_text(DROP_IN_CONTENT, encoding="utf-8")
     except OSError as err:
-        # An uncaught OSError here is a DNS-loss path once the
-        # resolver is displaced. See ADR-0005 section 2.9.
         raise ResolvedError(
             operation=f"writing {drop_in}",
             expected="the charm's drop-in on disk",
@@ -111,14 +88,9 @@ def restore(
 ) -> None:
     """Give port 53 back to systemd-resolved.
 
-    Safe to run when the drop-in was never written, which is what makes
-    it safe to call from `remove` on a unit that never converged.
-
     Raises:
         ResolvedError: The drop-in could not be deleted, survived the
-            deletion, or resolved refused to restart. Every one of
-            those leaves the machine without a resolver, so none of
-            them may pass silently.
+            deletion, or resolved refused to restart.
     """
     if _read_drop_in(drop_in) is None:
         logger.debug("No resolved drop-in to remove; leaving %s alone.", SERVICE)
@@ -145,11 +117,7 @@ def restore(
 
 
 def _recovery_command(drop_in: Path) -> str:
-    """Spell out how to get this machine's DNS back by hand.
-
-    The last thing an operator reads when the charm could not do it
-    itself, so it is a command to paste rather than a description.
-    """
+    """Spell out how to get this machine's DNS back by hand."""
     return (
         f"run: sudo sh -c 'rm -f {drop_in} && systemctl restart {SERVICE}' "
         "to restore DNS on this machine"
@@ -163,8 +131,6 @@ def _restart(restart: ServiceRestarter) -> None:
     except (systemd.SystemdError, OSError) as err:
         # Both must be caught: `service_restart` converts only a
         # non-zero exit, so a bare exec failure raises `OSError` raw.
-        # `err` is logged, not embedded, because `SystemdError`
-        # stringifies systemctl's whole multi-line output.
         logger.exception("systemctl refused to restart %s: %s", SERVICE, err)
         raise ResolvedError(
             operation=f"restarting {SERVICE}",

@@ -1,19 +1,6 @@
 """Talk to FTL's HTTP API. Owns sessions, nothing else.
 
-Never imports `ops` or `charmlibs` (rule 2); collaborators are
-injected so a test double can reproduce the API's own behaviour.
-An exit code is never evidence (rule 6): every session is verified
-against the real API state. API sessions are scarce, capped at 16
-by FTL — see snap-constraints section 7.2.4.
-
-The path constants come from `pihole_state`, the one module both
-workload files may import without a cycle: `pihole.py` composes
-`FtlApi`, so importing it back here would close a loop. See ADR-0009
-section 4.
-
-Provides three session-level operations: readiness probing, password
-classification, and config application via PATCH /api/config. See
-ADR-0004 section 5.
+See ADR-0009 §4 for the module split and ADR-0004 §5 for the operations.
 """
 
 import http.client
@@ -56,38 +43,28 @@ HTTP_UNAUTHORIZED = 401
 """The only status that means a credential is wrong."""
 
 HTTP_TOO_MANY_REQUESTS = 429
-"""FTL has no free API session slots.
-
-Never a credential answer. See snap-constraints section 7.2.4.
-"""
+"""FTL has no free API session slots. See snap-constraints §7.2.4."""
 
 PASSWORD_SETTLE_WINDOW = 5.0
 """Seconds to keep asking `/api/auth` before believing a 401.
 
-`setpassword` reports success before FTL reloads the hash it just
-wrote, so an immediate 401 is not a verdict. See ADR-0007 section 4.3
-and snap-constraints section 7.2.5.
+See ADR-0007 §4.3 and snap-constraints §7.2.5.
 """
 
 PASSWORD_SETTLE_INTERVAL = 0.5
 """Seconds between attempts inside the settle window.
 
-A 401 issues no session, so up to eleven attempts here cannot exhaust
-FTL's 16-session budget. See snap-constraints section 7.2.4.
+A 401 issues no session, so this cannot exhaust FTL's 16-session
+budget. See snap-constraints §7.2.4.
 """
 
 
-# None of this module's exceptions may be a frozen dataclass: when one
-# crosses an event-handler boundary, ops' `_event_context` assigns
-# `exc.__traceback__`, and that assignment raises `FrozenInstanceError`
-# on a frozen instance — replacing the real error with a crash. Verified
-# against a deployed unit.
+# Not frozen: ops assigns `exc.__traceback__` on handler exit,
+# which raises `FrozenInstanceError` on a frozen instance.
 def _nested(mapping: Mapping[str, object]) -> dict[str, object]:
     """Convert flat dotted keys into the tree the PATCH body needs.
 
-    The API mirrors `pihole.toml`'s shape, not this charm's flat
-    vocabulary: `{"dns.upstreams": x}` must travel as
-    `{"dns": {"upstreams": x}}`. See ADR-0004 section 5.3.
+    See ADR-0004 §5.3.
     """
     tree: dict[str, object] = {}
     for key, value in sorted(mapping.items()):
@@ -98,8 +75,6 @@ def _nested(mapping: Mapping[str, object]) -> dict[str, object]:
             if not isinstance(child, dict):
                 child = {}
                 node[segment] = child
-            # A nested config table really is a str-keyed mapping;
-            # the cast tells pyright what isinstance cannot.
             node = cast("dict[str, object]", child)
         node[segments[-1]] = value
     return tree
@@ -108,11 +83,7 @@ def _nested(mapping: Mapping[str, object]) -> dict[str, object]:
 @final
 @dataclass
 class ApiUnavailableError(Exception):
-    """The FTL HTTP API could not be reached at all.
-
-    Distinct from a 401, which is an *answer*. Not reaching the API is
-    the normal state before the daemon has started.
-    """
+    """The FTL HTTP API could not be reached at all."""
 
     reason: str
 
@@ -126,10 +97,7 @@ class ApiUnavailableError(Exception):
 class ApiTimeoutError(Exception):
     """The HTTP API never answered within the wait window.
 
-    Raised by `await_ready` when its deadline passes. `Pihole`
-    converts this to `PiholeError` because the remedy (where to look
-    on the machine) lives with the snap, not the API. See ADR-0009
-    section 4.
+    Converted to `PiholeError` by the workload layer. See ADR-0009 §4.
     """
 
     timeout: float
@@ -144,8 +112,7 @@ class ApiTimeoutError(Exception):
 class ApiConfigError(Exception):
     """FTL reported a 400 on PATCH /api/config.
 
-    The `hint` field carries FTL's message verbatim — it is already
-    phrased for a human. See ADR-0004 section 5.4.
+    The `hint` field carries FTL's message verbatim. See ADR-0004 §5.4.
     """
 
     hint: str
@@ -160,9 +127,7 @@ class ApiConfigError(Exception):
 class ApiSession:
     """A session to present on the requests that follow.
 
-    `sid` is None when there is no credential to offer, or the one
-    offered was refused; asking anyway still matters, since
-    `/api/dns/blocking` needs no session while `pwhash` is empty.
+    `sid` is None when no credential was offered or it was refused.
     """
 
     sid: str | None = None
@@ -173,9 +138,7 @@ class ApiSession:
 class NoSession:
     """No session was issued, and none may be assumed.
 
-    Either the API is unreachable, or it answered 429 (no free
-    session slots) — neither says anything about a credential. See
-    snap-constraints section 7.2.4.
+    See snap-constraints §7.2.4.
     """
 
     reason: str
@@ -217,9 +180,7 @@ type BlockingProbe = BlockingAnswered | BlockingSilent | SessionRefused
 def classify_auth_status(status: int) -> AdminPasswordState:
     """Read what `POST /api/auth` said about a password.
 
-    Only 401 means the credential is wrong; 429 and anything else is
-    "could not verify" rather than a verdict, to avoid a false
-    `BlockedStatus`. See ADR-0007 section 4.3.
+    Only 401 means the credential is wrong. See ADR-0007 §4.3.
     """
     if status == HTTP_OK:
         return PasswordAccepted()
@@ -231,9 +192,7 @@ def classify_auth_status(status: int) -> AdminPasswordState:
 def is_transient(state: AdminPasswordState) -> bool:
     """Decide whether an answer could still change within the window.
 
-    Only a rejection can improve; a 429, an unreachable API, and an
-    empty `pwhash` are all settled already. Pure, so this is tested
-    without a clock. See ADR-0007 section 4.3.
+    Only a rejection can improve. See ADR-0007 §4.3.
     """
     match state:
         case PasswordRejected():
@@ -247,9 +206,7 @@ def is_transient(state: AdminPasswordState) -> bool:
 def classify_blocking(status: int, payload: Mapping[str, object]) -> BlockingProbe:
     """Read what `GET /api/dns/blocking` said about readiness.
 
-    A 200 alone is not evidence: FTL can answer 200 with a body that
-    is not JSON or lacks `blocking`, so the state must be in the
-    payload.
+    A 200 alone is not evidence: the state must be in the payload.
     """
     if status == HTTP_OK and "blocking" in payload:
         return BlockingAnswered()
@@ -278,11 +235,7 @@ class FtlApi:
     # -- Facts. -----------------------------------------------------
 
     def ready(self) -> bool:
-        """Report whether `GET /api/dns/blocking` is answered.
-
-        Opens and closes its own session; `await_ready` and `facts`
-        share one instead, since FTL only has 16.
-        """
+        """Report whether `GET /api/dns/blocking` is answered."""
         match self._open_cli_session():
             case NoSession(reason=reason):
                 logger.debug("The Pi-hole API is not answering yet: %s", reason)
@@ -299,12 +252,8 @@ class FtlApi:
     def password_state(self, password: str) -> AdminPasswordState:
         """Classify the admin password the charm holds.
 
-        `pwhash` is read first because while it is empty FTL accepts
-        *any* password, so the `/api/auth` oracle would answer 200 for
-        a credential nobody set. A refusal then gets
-        `PASSWORD_SETTLE_WINDOW` to change its mind, since FTL
-        validates against the old hash for about a second after a
-        write. See ADR-0007 section 4.3.
+        `pwhash` is read first: while empty, FTL accepts any password.
+        See ADR-0007 §4.3.
         """
         state, sid = self._classify_password_settled(password)
         self._logout(sid)
@@ -313,20 +262,8 @@ class FtlApi:
     def facts(self, password: str) -> ApiFacts:
         """Establish both API facts from a single session.
 
-        The oracle and the readiness probe each need an authenticated
-        request, and FTL has only 16 session slots — so the session
-        the oracle opens answers `GET /api/dns/blocking` too.
-
-        Where that session cannot serve, readiness falls back to a
-        `cli_pw` session of its own, so readiness is unproven rather
-        than false and a serving daemon is never reported silent on
-        the strength of a shared session.
-
-        The oracle settles here too, not only after a write: a hook
-        that applies a password and then reports status reads this
-        within the same second, and a 401 landing here would flap a
-        `BlockedStatus` accusing the operator of a security problem.
-        See ADR-0005 section 2.8.
+        The oracle settles here too, not only after a write. See
+        ADR-0005 §2.8.
         """
         state, sid = self._classify_password_settled(password)
         if sid is None:
@@ -349,9 +286,8 @@ class FtlApi:
     def await_ready(self, timeout: float) -> None:
         """Block until the HTTP API answers, or raise `ApiTimeoutError`.
 
-        Authenticates once and reuses the session across polls — a
-        per-poll login exhausts FTL's session budget. See ADR-0007
-        section 4.3.
+        Authenticates once and reuses the session across polls. See
+        ADR-0007 §4.3.
 
         Raises:
             ApiTimeoutError: The API never answered.
@@ -385,12 +321,8 @@ class FtlApi:
     def apply_config(self, password: str, mapping: Mapping[str, object]) -> None:
         """Apply FTL config keys in one PATCH, as an admin session.
 
-        Config modification needs the admin password: a `cli_pw`
-        session is read-only for config and is answered with 403
-        "The current CLI session is not allowed to modify Pi-hole
-        config settings" (verified on a deployed unit — snap-constraints
-        section 7.2.8). A 400 surfaces FTL's `hint` verbatim; any other
-        unexpected status raises `ApiUnavailableError`.
+        A `cli_pw` session is read-only for config (snap-constraints
+        §7.2.8).
 
         Raises:
             ApiConfigError: FTL returned 400 with a hint.
@@ -439,14 +371,10 @@ class FtlApi:
                 reason=f"PATCH /api/config returned unexpected HTTP {status}"
             )
 
-    # -- Private. ---------------------------------------------------
-
     def _open_cli_session(self) -> SessionOutcome:
         """Authenticate as the CLI, re-reading `cli_pw` every time.
 
-        `cli_pw` rotates on every FTL restart, so a cached value goes
-        stale (snap-constraints section 7.2.2). A missing file still
-        yields a session with no `sid`, valid while `pwhash` is empty.
+        `cli_pw` rotates on every FTL restart (snap-constraints §7.2.2).
         """
         password = self._read_cli_pw()
         if password is None:
@@ -456,9 +384,6 @@ class FtlApi:
         except ApiUnavailableError as err:
             return NoSession(reason=str(err))
         if status == HTTP_TOO_MANY_REQUESTS:
-            # A capacity answer. Asking the next endpoint without a slot
-            # would only produce another 429, so do not spend a request
-            # on it.
             return NoSession(reason="FTL has no free API session slots (HTTP 429)")
         if status != HTTP_OK:
             logger.debug("/api/auth refused the CLI password (HTTP %s).", status)
@@ -476,11 +401,7 @@ class FtlApi:
                 assert_never(unreachable)
 
     def _classify_password(self, password: str) -> tuple[AdminPasswordState, str | None]:
-        """Ask `/api/auth` about a password, keeping the session open.
-
-        Returns the session too (None if none was issued), so callers
-        such as `facts` can reuse it before logging out.
-        """
+        """Ask `/api/auth` about a password, keeping the session."""
         if not self._read_pwhash():
             return PasswordUnset(), None
         try:
@@ -495,28 +416,16 @@ class FtlApi:
     def _classify_password_settled(self, password: str) -> tuple[AdminPasswordState, str | None]:
         """Consult the oracle until it stops refusing, or time runs out.
 
-        `pihole setpassword` reports success about a second before FTL
-        validates against the hash it just wrote, so the first refusal
-        after a write is the workload's old answer rather than its
-        verdict. Source in snap-constraints section 7.2.5.
-
-        A 200 on the first attempt costs one request, so the healthy
-        path never waits; a 429, an unreachable API and an empty
-        `pwhash` return immediately, because the window cannot improve
-        them; and a 401 that lasts the whole window is still a
-        rejection, so a wrong password is not hidden by patience.
-
-        Returns the classification and the session the caller has to
-        give back, exactly as `_classify_password` does.
+        `setpassword` reports success before FTL reloads the hash
+        (snap-constraints §7.2.5). A 200 on the first attempt costs
+        one request, so the healthy path never waits.
         """
         deadline = self._monotonic() + PASSWORD_SETTLE_WINDOW
         while True:
             state, sid = self._classify_password(password)
             if not is_transient(state) or self._monotonic() >= deadline:
                 return state, sid
-            # A refusal issues no session, so this is normally a no-op
-            # — but holding one across a sleep would spend a slot on
-            # waiting, and there are 16 for the whole machine.
+            # A refusal issues no session; logout is a no-op here.
             self._logout(sid)
             logger.debug("The /api/auth oracle refused; giving FTL time to reload its hash.")
             self._sleep(PASSWORD_SETTLE_INTERVAL)
@@ -579,9 +488,6 @@ class FtlApi:
     ) -> tuple[int, Mapping[str, object]]:
         """Make one request, returning the status and the payload.
 
-        A 4xx is returned rather than raised — callers need to
-        distinguish "401" from "nothing listening".
-
         Raises:
             ApiUnavailableError: The API could not be reached.
         """
@@ -598,11 +504,8 @@ class FtlApi:
             with err:
                 return err.code, _decode(err.read())
         except (OSError, http.client.HTTPException) as err:
-            # URLError (and hence every socket/DNS failure) is an
-            # OSError, but `BadStatusLine` and `IncompleteRead` are
-            # not — FTL's webserver answers garbage, not silence, when
-            # unhappy. Keep `as err`: ruff format's unparenthesized
-            # `except` here makes flaplint skip the module.
+            # `as err` keeps the parentheses so flaplint can parse
+            # this module (ruff format would otherwise drop them).
             raise ApiUnavailableError(reason=f"{method} {url}: {err}") from err
 
 
