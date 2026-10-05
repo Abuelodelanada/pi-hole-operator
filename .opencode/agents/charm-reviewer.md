@@ -29,6 +29,10 @@ permission:
     'git status*': allow
     'git log*': allow
     'git show*': allow
+    # Read-only index queries — needed to audit the "deliberately untracked"
+    # rule-directories invariant against the actual index.
+    'git ls-files*': allow
+    'git check-ignore*': allow
     'tox -e lint*': allow
     'tox -e static*': allow
     'tox -e unit*': allow
@@ -64,6 +68,8 @@ summary of them and not a substitute:
   skeleton, and the `raise`-versus-`BlockedStatus` reasoning.
 - `charm-relations` — any `provides`/`requires`, `optional`, `limit`, or databag
   change.
+- `machine-charm-scaffold` — any `charmcraft.yaml` change: `additionalProperties`,
+  keys that do not apply to a machine charm, `base:`/`platforms:`.
 - `charm-testing` — any change under `tests/`.
 
 **A green `tox -e lint,static,unit` proves almost nothing about the
@@ -164,12 +170,11 @@ the `ops` definition is just an opinion. The triggers:
   `pathlib` writes, or touch `/var/snap`? All of that belongs in a workload
   module.
 - Do the workload modules import `ops` or reference charm config/relations
-  directly? They should take plain arguments and return plain values. **There are
-  three**, and the split is deliberate: `src/pihole.py` (snap, systemd, files),
-  `src/resolved.py` (systemd-resolved — never folded into `pihole.py`), and
-  `src/ftl_api.py` (the FTL HTTP client, ADR-0009). A finding here on `ftl_api.py`
-  is as blocking as one on `pihole.py`; it is the newest module and the easiest to
-  forget.
+  directly? They should take plain arguments and return plain values. Which
+  modules are workload is decided by the Layout tree in `AGENTS.md` — audit
+  every module it names, not just `src/pihole.py`: `src/resolved.py` is never
+  folded into `pihole.py`, and `src/ftl_api.py` (ADR-0009) is the newest and
+  the easiest to forget.
 - Does `src/pihole_state.py` import `ops`, `charmlibs`, or a workload module? It
   is the pure core and must import none of them — it reaches the workload only
   through the `PiholeFacts` protocol.
@@ -177,6 +182,11 @@ the `ops` definition is just an opinion. The triggers:
   pydantic model of the config options and needs neither: the charm calls
   `self.load_config(PiholeConfig)` and the model hands back an `IntentFields`
   `TypedDict`. An `import ops` there means the config seam has been inverted.
+- Any tracked or placeholder file in `src/grafana_dashboards/`,
+  `src/prometheus_alert_rules/`, `src/loki_alert_rules/`? They are empty and
+  deliberately untracked (ADR-0008 §2.1): a placeholder breaks the vendored
+  provider's empty-rules path and the publish dies in the library's own
+  `except`. See BACKLOG.
 
 **Verification discipline**
 - Every `snap set`, `snap connect`, `snap start`, and `pihole` invocation: is the
@@ -360,8 +370,10 @@ that touches `src/`, `charmcraft.yaml`, or `docs/` — do not wait to be asked.*
 - New behaviour without a test.
 - `ops.testing.State` without `Model(type='lxd')` — the default is `kubernetes`
   and will silently give you the wrong environment.
-- Patching `subprocess` or `charmlibs` in state-transition tests instead of
-  mocking `src.pihole`.
+- Patching `subprocess` or `charmlibs` in a test of `charm.py` instead of
+  mocking the workload modules whole (`mock_pihole`, `mock_resolved`); or
+  patching `subprocess` in a workload test instead of faking the workload's
+  own seam (`urlopen`, the filesystem).
 - Setup boilerplate duplicated across files instead of living in `conftest.py`.
 - Missing `# GIVEN / # WHEN / # THEN`.
 - `ctx.run_action(...)` — it does not exist. Actions go through
@@ -388,6 +400,10 @@ that touches `src/`, `charmcraft.yaml`, or `docs/` — do not wait to be asked.*
 ## Considered and fine
 <things that look wrong but aren't, so the caller doesn't re-litigate them>
 ```
+
+**One finding: one line of what, one of why, `file:line`.** The breakdown —
+options, trade-offs, step-by-step reasoning — comes when asked for, not by
+default.
 
 If you find nothing blocking, say so plainly. Do not invent findings to appear
 thorough, and do not soften a real defect to be agreeable.
