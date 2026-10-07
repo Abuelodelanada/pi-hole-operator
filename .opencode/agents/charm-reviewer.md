@@ -4,7 +4,7 @@ description: >-
   or opening a PR. Read-only: reports findings, never edits. Invoke after
   writing or changing anything under src/, tests/, or charmcraft.yaml.
 mode: subagent
-model: openrouter/anthropic/claude-opus-5
+model: openrouter/z-ai/glm-5.3
 temperature: 0.1
 color: '#3498DB'
 permission:
@@ -14,15 +14,11 @@ permission:
   # done on its behalf. Denying delegation is what makes `edit: deny`
   # and the bash allow-list below actually binding.
   task: deny
-  # These rules are APPENDED to the project rules in opencode.json, and
-  # the last matching rule wins. So every `allow` below is evaluated
-  # *after* the project's `git commit*` / `git push*` / `gh release*`
-  # denies, and would override one it overlapped. Keep the patterns
-  # narrow: broadening any of them to `git *` silently hands this agent
-  # back commit and push. Patterns match each parsed command, so a
-  # chained `git status && rm -rf x` is checked per command, not as one
-  # string — do not rely on that, but do not try to defend against it
-  # here either.
+  # Appended to the project rules; the last matching rule wins, so every
+  # `allow` below is evaluated after the project's git/gh denies and would
+  # override one it overlapped. Keep the patterns narrow — broadening one
+  # to `git *` hands this agent back commit and push. Patterns match each
+  # parsed command in a chain, not the whole string.
   bash:
     '*': deny
     'git diff*': allow
@@ -213,10 +209,9 @@ the `ops` definition is just an opinion. The triggers:
 - Manual `self.config[...]` parsing where `self.load_config(cls, errors="blocked")`
   would do? Same for `event.params` vs `event.load_params(cls)`.
 - **Is that `load_config` call wrapped in `try`/`except Exception`?** Blocking.
-  With `errors="blocked"` it sets `BlockedStatus` and raises `ops._main._Abort`,
-  which subclasses `Exception` — so a wrapper swallows it, the hook keeps running
-  with unvalidated config, and `_main` never reaches `_evaluate_status`, meaning
-  the operator is told nothing. The call must be bare.
+  It raises `ops._main._Abort` (an `Exception` subclass) to stop the hook; a
+  wrapper swallows the abort and the hook proceeds on unvalidated config,
+  telling the operator nothing. Call it bare.
 - `self.model.get_secret(...)` called positionally? It is keyword-only.
 - `get_content()` without `refresh=True` inside a `secret_changed` handler? Without
   the refresh, Juju never starts tracking the new revision.
@@ -232,17 +227,14 @@ the `ops` definition is just an opinion. The triggers:
 - Any function that performs an effect *and* returns a value describing what it
   decided? That is the defect `charm-functional-style` exists to prevent, and it
   is why a test needed a mock. Name the split.
-- **Any boolean parameter that gates whether a function has side effects?** This
-  is rule 7 inverted, and it is the easier half to miss: not "returns a flag *and*
-  acts", but "a flag decides *whether* it acts". The signature to look for is one
-  function called both ways — `f(generate=True)` from `_reconcile` and
-  `f(generate=False)` from `_on_collect_status` — where the name can no longer
-  answer "does this mutate?" and the guarantee lives in an argument. The fix is
-  two methods whose names carry the answer; `_read_password` (reads only) and
-  `_ensure_password` (may mint a secret) in `src/charm.py` are the worked
-  example, so do not flag those. Report it as Should fix normally, and
-  **Blocking when one of the callers is `_on_collect_status`** — that handler must
-  not mutate, and a correctly-passed bool is the only thing enforcing it.
+- **Any boolean parameter that gates whether a function has side effects?**
+  Rule 7 inverted: a flag decides *whether* it acts — one function called
+  both ways, `f(generate=True)` from `_reconcile` and `f(generate=False)`
+  from `_on_collect_status`, so the name cannot answer "does this
+  mutate?". Fix: two methods whose names carry the answer —
+  `_read_password` / `_ensure_password` in `src/charm.py` are the worked
+  example, do not flag those. Should fix normally; **Blocking when a caller
+  is `_on_collect_status`**, which must not mutate.
 - Any decision expressed as two or more booleans threaded through control flow
   that should be a union with an exhaustive `match`?
 - Any `match` over a `type X = A | B` union missing `case _ as unreachable:
@@ -256,13 +248,11 @@ the `ops` definition is just an opinion. The triggers:
   pass` in that position is the finding: it swallows a variant added later.
 - Any `dict`, `list`, or `set` in a function signature or a frozen dataclass
   field where `Mapping`, `Sequence`, or `FrozenSet` belongs?
-- **A frozen exception class.** This is the one place the frozen-dataclass habit
-  this section otherwise demands is a runtime bug: `ops`' `_event_context` assigns
-  `exc.__traceback__` on the way out, so a frozen exception dies with
-  `FrozenInstanceError` and buries the real failure. Every exception in this repo
-  is a plain (unfrozen) class, and each module carries a guard test asserting it
-  can take a traceback. Flag a frozen exception as Blocking, and flag a new
-  exception module that ships without its guard test.
+- **A frozen exception class.** The one carve-out from the frozen-dataclass
+  habit: `ops` assigns `exc.__traceback__` as the context unwinds, so a frozen
+  one dies with `FrozenInstanceError` and buries the real failure. Plain
+  class, plus its guard test. Blocking — and flag a new exception module
+  that ships without the guard test.
 - Any mutation of a value that was passed in? Prefer a modified copy.
 
 **Composition over inheritance**
