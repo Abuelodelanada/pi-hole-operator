@@ -6,7 +6,7 @@ description: >-
   Covers Model(type='lxd'), the two-layer mocking strategy, and jubilant APIs
   that only exist for machine models. Load before writing any test file.
 metadata:
-  verified: "2026-10-04"
+  verified: "2026-10-07"
 ---
 
 # Testing a machine charm
@@ -16,8 +16,8 @@ Three layers, mirroring the source design. Do not mix them.
 | Layer | Tool | What you mock |
 |---|---|---|
 | Pure decision (`compute`, config mapping) | plain `pytest` | **nothing** |
-| State transition (`charm.py`) | `ops.testing` `Context` + `State` | `src.pihole` — the whole module |
-| Workload (`pihole.py`) | plain `pytest` | `snap.SnapCache`, `subprocess.run`, filesystem |
+| State transition (`charm.py`) | `ops.testing` `Context` + `State` | the workload modules — `src.pihole`, `src.resolved` — whole |
+| Workload (`pihole.py`) | plain `pytest` | the constructor seams — `cache_factory`, `run`, `api` — and the filesystem |
 | Integration | `jubilant` + `pytest-jubilant` on LXD | nothing |
 
 ## Layer 0 — pure functions need no test infrastructure
@@ -81,8 +81,10 @@ only exists inside `Container.execs`. `ops.testing` offers **no** mocking of
 apt/snap/systemd/subprocess. That is not a gap to work around — it is why the
 two-layer design exists.
 
-Also machine-specific: `Storage.index` is always 1 on Kubernetes, but increments
-per instance on machines.
+Also machine-specific per the ops.testing docstring: `Storage.index` — always 1
+on Kubernetes, incrementing per instance on machines. The implementation behind
+it is a plain global counter that honours neither, so do not rely on exact
+index values in tests.
 
 ## Layer 1 — state transition tests
 
@@ -179,46 +181,48 @@ Test both directions of the non-negotiable: **what breaks if it runs twice**
 
 ## Layer 2 — workload module tests
 
-Patch what `pihole.py` actually calls. Official pattern:
+Fake what `pihole.py` actually calls, at the seams its constructor provides.
+Official pattern:
 
 ```python
-def test_install_uses_snap_cache(monkeypatch: pytest.MonkeyPatch):
-    # GIVEN a fake snap cache
+def test_install_uses_snap_cache():
+    # GIVEN a fake snap cache injected at the constructor seam
     fake_snap = MagicMock()
-    monkeypatch.setattr(
-        "pihole.snap.SnapCache",
-        lambda: {"pihole-by-rajannpatel": fake_snap},
+    workload = pihole.Pihole(
+        cache_factory=lambda: {"pihole-by-rajannpatel": fake_snap}
     )
 
-    # WHEN the workload is installed
-    pihole.Pihole().install(revision=None)
+    # WHEN the workload is installed (revision is policy, ADR-0010 — no arg)
+    workload.install()
 
-    # THEN the snap is ensured and explicitly started, because the snap ships
-    # install-mode: disable
+    # THEN the pinned revision is ensured through the cache
     fake_snap.ensure.assert_called_once()
-    fake_snap.start.assert_called_once_with(enable=True)
 ```
 
 ```python
-def test_set_ftl_key_raises_when_value_does_not_land(monkeypatch):
-    # GIVEN a snap that accepts the set but drops the value (the dnssec bug)
-    monkeypatch.setattr("pihole.subprocess.run", lambda *a, **kw: _ok())
-    monkeypatch.setattr(pihole.Pihole, "_read_toml_key", lambda self, k: "false")
+def test_apply_config_raises_when_value_does_not_land(monkeypatch):
+    # GIVEN an API that answers 200 but never writes the key — FTL
+    # ignores unknown keys with HTTP 200
+    workload = pihole.Pihole(api=MagicMock())
+    monkeypatch.setattr(pihole.Pihole, "_read_toml", lambda self: {})
 
-    # WHEN a key is set
-    # THEN the charm refuses to believe the exit code
-    with pytest.raises(pihole.PiholeError, match="reads back as"):
-        pihole.Pihole().set_ftl_key("dns.dnssec", "true")
+    # WHEN config is applied
+    # THEN the charm refuses to believe the 200
+    with pytest.raises(pihole.PiholeError, match="pihole.toml"):
+        workload.apply_ftl_config(password="pw", config={"dns.dnssec": True})
 ```
 
-That second test is not paranoia — it encodes a real, verified defect. Every
-snap interaction in `pihole.py` deserves one like it.
+That second test is not paranoia — it encodes a real, verified lie: FTL's 200
+for unknown keys. Every workload interaction in `pihole.py` deserves one like
+it.
 
 Also worth covering at this layer:
 
-- `_is_snapd_safe_key` against snapd's regex, with `dns.upstreams` (reachable)
-  and `dns.listeningMode` (not).
-- DHCP key ordering: pool before `active`.
+- The explicit `start(enable=True)` — the snap ships `install-mode: disable`,
+  so installing alone never leaves it running.
+- The API error translations — `ApiUnavailableError` and `ApiConfigError`
+  each becoming a `PiholeError` that names a remedy.
+- DHCP key ordering: pool before `active` on first enable.
 - systemd-resolved drop-in written on install and removed on `remove`.
 - v6 command syntax — assert the code never emits `pihole -a -p` or
   `pihole restartdns`.
@@ -339,7 +343,7 @@ def charm_path() -> pathlib.Path:
 def test_deploy_reaches_active(juju: jubilant.Juju, charm_path):
     # GIVEN a fresh machine model
     # WHEN the charm is deployed
-    juju.deploy(charm_path, "pihole", base="ubuntu@24.04")
+    juju.deploy(charm_path, "pihole", base="ubuntu@26.04")
 
     # THEN it converges without any relations
     juju.wait(jubilant.all_active, timeout=900)

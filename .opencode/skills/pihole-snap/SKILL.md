@@ -129,9 +129,9 @@ Idempotency verified by PID: setting the same value twice does not restart.
 Safe to apply on every `config-changed`.
 
 `snap get` returns `has no configuration` until the daemon has started once;
-`bin/config-sync` then syncs all 166 `pihole.toml` keys into snapd state.
+`bin/config-sync` then syncs every `pihole.toml` key into snapd state.
 
-### Trap 1: 66 of 166 FTL keys are unreachable
+### Trap 1: many FTL keys are unreachable via `snap set`
 
 snapd validates option names with
 `^(?:[a-z0-9]+-?)*[a-z](?:-?[a-z0-9])*$`
@@ -177,11 +177,12 @@ Reachable keys that cover the essentials:
 `webserver.api.password`, `webserver.api.pwhash`, `webserver.tls.cert`,
 `webserver.session.timeout`, `ntp.*`, `misc.privacylevel`, `files.log.*`
 
-**Design consequence.** The charm must be a hybrid: `snap set` for reachable
-keys, and a fallback that invokes `pihole-FTL --config <key> <value>` directly
-(via `snap run --shell`) plus a manual `snap restart` for the rest. The fallback
-desynchronises snapd state from `pihole.toml`, which is unavoidable — document it
-rather than hiding it.
+**Design consequence.** `snap set` cannot be the charm's config mechanism — not
+even with a fallback: the unreachable set includes `dns.listeningMode`, the
+primary use case. The charm applies configuration through the FTL HTTP API
+instead (`PATCH /api/config`, ADR-0004/0009), which never passes through snapd's
+option-name validation and lands the whole config object atomically. The regex
+fact above stays load-bearing for anything that does shell out to `snap set`.
 
 ### Trap 2: `ftl.dns.dnssec` is a silent no-op
 
@@ -419,9 +420,10 @@ responding, and optionally on `gravity.db` exceeding a sane size.
 2. `snap install pihole-by-rajannpatel`.
 3. `snap connect` the manual plugs that apply.
 4. `snap alias`, or commit to the fully qualified command name.
-5. Apply config: `snap set ftl.*` for reachable keys, `pihole-FTL --config` for
-   the rest. (Nothing is *required* before the first start any more: the
-   webserver self-signs and serves from boot — PR #15.)
+5. Apply config through the FTL HTTP API (`PATCH /api/config`) with read-back —
+   not `snap set`, which cannot reach the camelCase keys (Trap 1). (Nothing is
+   *required* before the first start any more: the webserver self-signs and
+   serves from boot — PR #15.)
 6. `snap start --enable pihole-by-rajannpatel.pihole-ftl`.
 7. Poll readiness via the HTTP API, not via systemd.
 

@@ -125,18 +125,16 @@ These need human attention because they are judgement, not pattern:
 ## PEP 257 docstrings
 
 ```python
-def set_ftl_key(self, key: str, value: str) -> None:
-    """Set an FTL config key and verify it took effect.
-
-    snapd rejects option names containing camelCase or underscores, so keys
-    that fail its regex are applied through `pihole-FTL --config` instead.
+def apply_ftl_config(self, password: str, config: Mapping[str, object]) -> None:
+    """Apply FTL config keys via the HTTP API, and read back.
 
     Args:
-        key: Dotted FTL key, without the `ftl.` prefix.
-        value: Value to write, already serialised.
+        password: Admin password for the API session.
+        config: Dotted FTL keys to values, already serialised.
 
     Raises:
-        PiholeError: The value did not appear in pihole.toml after the write.
+        PiholeError: A key was not applied, the API could not be
+            reached, or it reported a 400 with a hint.
     """
 ```
 
@@ -197,7 +195,7 @@ uvx --python 3.12 --from git+https://github.com/michaeldmitry/flaplint@v1.1.0 \
 ```
 
 Both pins matter. Without `@v1.1.0` the build comes from mutable `main`. Without
-`--python 3.12`, `uv` may pick an interpreter outside the project's tested
+`--python 3.12`, `uv` may pick an interpreter outside flaplint's tested
 matrix (3.10–3.13) — and flaplint parses your source with the *running*
 interpreter's `ast`, so its own Python version is load-bearing.
 

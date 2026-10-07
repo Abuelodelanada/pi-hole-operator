@@ -16,6 +16,11 @@ Reference implementation: `canonical/operator` →
 `examples/machine-tinyproxy/`, available as the `ops` reference. Read it before
 inventing structure.
 
+Everything quoted below — `charmcraft.yaml`, `pyproject.toml`, `tox.ini`, the
+layout tree — is a **dated snapshot** (see the frontmatter) that shows the shape.
+The live files are the authority: read them before editing, and never restore
+anything from these blocks.
+
 ## `charmcraft.yaml`
 
 `bases:` is **deprecated**. Use `base:` plus `platforms:`.

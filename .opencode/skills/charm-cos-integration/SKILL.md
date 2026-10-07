@@ -154,6 +154,10 @@ the directory: `FTL.log`, `pihole.log`, `webserver.log`, `gravity-init.log`,
 Prometheus format. The library injects Juju topology labels
 (`juju_model`, `juju_application`, `juju_unit`); do not add them yourself.
 
+The example below shows the *shape* only: this charm's rules directories are
+empty by decision, because metrics are deferred (ADR-0008 §2.2) and there is no
+scrape target for a Pi-hole job yet — an alert written now would never fire.
+
 ```yaml
 groups:
   - name: pihole_dns

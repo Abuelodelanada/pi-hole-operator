@@ -7,7 +7,7 @@ description: >-
   Load before writing a function that both decides something and performs an
   effect.
 metadata:
-  verified: "2026-08-07"
+  verified: "2026-10-07"
   source: "canonical/fp-edge-canonical (workshop material, see caveats)"
 ---
 
@@ -87,12 +87,15 @@ class SnapAbsent:
 class SnapPresent:
     """The snap is installed. Every field is a fact read from the machine."""
 
-    revision: int
-    ftl_running: bool
-    ftl_config: Mapping[str, str]
-    gravity_db_bytes: int
-    connected_plugs: FrozenSet[str]
-    resolved_stub_disabled: bool
+    revision: str
+    refresh_held: bool
+    ftl_enabled: bool
+    ftl_active: bool
+    admin_password: AdminPasswordState
+    api_ready: bool
+    connected_plugs: frozenset[str]
+    # … the full set of facts lives in src/pihole_state.py — read the
+    # file, do not copy from here.
 
 
 type PiholeState = SnapAbsent | SnapPresent
@@ -116,7 +119,7 @@ through control flow, name every thing the charm can decide to do:
 @final
 @dataclass(frozen=True)
 class InstallSnap:
-    revision: int | None
+    """Revision is charm policy, not per-decision state (ADR-0010)."""
 
 
 @final
@@ -199,9 +202,9 @@ cannot accidentally ignore**:
 
 ```python
 class PiholeActions(Protocol):
-    def install(self, revision: int | None) -> None: ...
+    def install(self) -> None: ...
     def connect_plug(self, plug: str) -> None: ...
-    def set_ftl_key(self, key: str, value: str) -> None: ...
+    def apply_ftl_config(self, password: str, config: Mapping[str, object]) -> None: ...
     def restart_ftl(self) -> None: ...
 ```
 
@@ -213,20 +216,28 @@ def reload_config(self) -> Result[ReloadError, None]:
     return Ok(None) if reloaded is True else Err(ReloadError())
 ```
 
-Translated: `set_ftl_key` runs `snap set`, **reads the value back from
-`pihole.toml`**, and raises `PiholeError` if it did not land. Non-negotiable #6
-expressed as a signature.
+Translated: `apply_ftl_config` PATCHes the FTL API, **reads every key back
+from `pihole.toml`**, and raises `PiholeError` if a value did not land — FTL
+returns 200 even for keys it ignores. Non-negotiable #6 expressed as a
+signature.
 
 ## Pattern 6 — Errors are data that carry context
 
 ```python
 @final
-@dataclass(frozen=True)
+@dataclass
 class SnapSetError(Exception):
     key: str
     expected: str
     actual: str
 ```
+
+Note the missing `frozen=True` — not an oversight. Exceptions are the one
+carve-out from the frozen-dataclass habit: `ops` assigns `exc.__traceback__` as
+the event context unwinds, and a frozen exception dies with
+`FrozenInstanceError`, burying the real failure. Plain `@dataclass`, plus the
+guard test each exception module in this repo carries asserting it survives
+being raised.
 
 Subclassing `Exception` keeps `logger.error(..., exc_info=err)` and
 `ExceptionGroup` working. Carrying the context inside the error means the status

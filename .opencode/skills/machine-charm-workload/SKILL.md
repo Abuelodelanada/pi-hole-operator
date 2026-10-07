@@ -7,7 +7,7 @@ description: >-
   status collection, and the two-layer design that makes the charm testable.
   Load before importing charmlibs or writing an event handler.
 metadata:
-  verified: "2026-10-04"
+  verified: "2026-10-07"
 ---
 
 # Machine charm workload management
@@ -81,13 +81,13 @@ skill. The charm additionally needs `snap connect` for five unconditional plugs
 (`system-observe`, `hardware-observe`, `mount-observe`, `time-control`,
 `process-control`) plus two DHCP-only plugs (`network-control`, `firewall-control`)
 that are retained after DHCP is disabled (ADR-0006 §2.9: a connected plug is
-passive and re-connecting on drift avoids a restart). Also `snap set` for
-reachable config keys, a `pihole-FTL --config` fallback for the 66 unreachable
-ones, and an explicit `start(enable=True)` because the snap ships
-`install-mode: disable`.
+passive and re-connecting on drift avoids a restart). Config goes through the
+FTL HTTP API with read-back — `snap set` cannot reach the camelCase keys at all
+(`pihole-snap` Trap 1) — and an explicit `start(enable=True)` because the snap
+ships `install-mode: disable`.
 
-Where `charmlibs.snap` has no API for something (`snap connect`, `snap set` with
-dotted keys, `snap run --shell`), shell out from `pihole.py` with
+Where `charmlibs.snap` has no API for something (`snap connect`,
+`snap run --shell`), shell out from `pihole.py` with
 `subprocess.run(..., check=True, capture_output=True, text=True)` — and then
 **verify by reading real state**, because this snap returns 0 on operations it
 silently drops.
@@ -107,8 +107,8 @@ drop-in, neither of which the snap can do under strict confinement.
 
 ## Reconciler skeleton
 
-The charm's config is declared in `charmcraft.yaml`, modelled in
-`src/pihole_config.py` (pydantic, 306 lines, 11 options, ADR-0006), and consumed
+The charm's config is declared in `charmcraft.yaml` (the option list lives
+there), modelled in `src/pihole_config.py` (pydantic, ADR-0006), and consumed
 with `self.load_config(PiholeConfig, errors="blocked")`. The pure core lives in
 `src/pihole_state.py`; `pihole_config.py` is the bridge that validates and
 normalises the raw config into the `IntentFields` TypedDict the core consumes.
@@ -190,28 +190,11 @@ class PiholeCharm(ops.CharmBase):
                 resolved.disable_stub_listener()
             case pihole_state.InstallSnap():
                 self._pihole.install()  # revision is policy, no arg (ADR-0010)
-            case pihole_state.HoldSnapRefresh():
-                self._pihole.hold_refresh()
-            case pihole_state.ConnectPlugs(plugs=plugs):
-                self._pihole.connect_plugs(plugs)
-            case pihole_state.SetNtpServer(active=active):
-                self._pihole.set_ntp_server(active=active)
-            case pihole_state.SetAdminPassword(password=password):
-                self._pihole.set_password(password)
-            case pihole_state.StartFtl():
-                self._pihole.start(enable=True)
-            case pihole_state.RestartFtl():
-                self._pihole.restart()
-            case pihole_state.AwaitApi(timeout=timeout):
-                self._pihole.await_api(timeout)
+            # … one arm per outcome variant. The union lives in
+            # src/pihole_state.py; pyright fails the build if an arm is
+            # missing — read the file, do not copy the list from here.
             case pihole_state.SetFtlConfig(config=config, password=password):
                 self._pihole.apply_ftl_config(password=password, config=dict(config))
-            case pihole_state.WaitForDhcpBind(timeout=timeout):
-                self._pihole.wait_for_dhcp_bind(timeout)
-            case pihole_state.WriteGravityTimer(schedule=schedule):
-                self._pihole.write_gravity_timer(schedule)
-            case pihole_state.RemoveGravityTimer():
-                self._pihole.remove_gravity_timer()
             case pihole_state.Noop():
                 logger.debug("converged: nothing to do.")
             case _ as unreachable:
@@ -392,14 +375,16 @@ For this charm that means the snap store, which is genuinely flaky:
     # snap.Error, NOT snap.SnapError. Verified against charmlibs-snap 1.0.1:
     # SnapError, SnapAPIError and SnapNotFoundError all inherit directly from
     # Error and none subclasses another, so retrying SnapError alone misses the
-    # store and lookup failures that are the flaky ones. The Snap* names are
-    # also legacy aliases, already removed on charmlibs main.
+    # store and lookup failures that are the flaky ones. On charmlibs-snap 2.x
+    # (main today) the Snap* names are gone and the hierarchy is a chain
+    # (Error → APIError → _NotFoundError → …); retrying on the root Error is
+    # correct under both shapes.
     retry=tenacity.retry_if_exception_type(snap.Error),
     wait=tenacity.wait_fixed(2) + tenacity.wait_random(0, 5),
     stop=tenacity.stop_after_attempt(3),
     reraise=True,
 )
-def install(self, revision: int | None) -> None: ...
+def install(self) -> None: ...
 ```
 
 ### The decision table for this charm
@@ -449,7 +434,7 @@ Tony Meyer names the resulting race precisely: a check *looks* pullable, *"but t
 introduces a race where your main handler failed and your collect status handler
 succeeded."*
 
-**This charm has that race.** Consider: `_reconcile` calls `set_ftl_key`, the
+**This charm has that race.** Consider: `_reconcile` calls `apply_ftl_config`, the
 read-back verification fails, and it raises `PiholeError`. Meanwhile
 `_on_collect_status` independently runs `pihole snap-check` and `pihole api
 dns/blocking` — both of which may well succeed, because the daemon is fine and only
@@ -661,29 +646,28 @@ the end of the hook.
 
 ## Verification pattern
 
-Because the snap lies about success, every apply gets a read-back:
+Because the workload lies about success — `snap set` returns 0 on keys it
+silently drops, and FTL's API returns 200 for keys it does not know — every
+apply gets a read-back:
 
 ```python
-def set_ftl_key(self, key: str, value: str) -> None:
-    """Set an FTL config key and verify it landed.
+def apply_ftl_config(self, password: str, config: Mapping[str, object]) -> None:
+    """Apply FTL config keys via the HTTP API, and read back.
 
     Raises:
-        PiholeError: if the value did not take effect.
+        PiholeError: A key was not applied, the API could not be
+            reached, or it reported a 400 with a hint.
     """
-    if _is_snapd_safe_key(key):
-        subprocess.run(
-            ["snap", "set", SNAP_NAME, f"ftl.{key}={value}"],
-            check=True, capture_output=True, text=True,
-        )
-    else:
-        # snapd rejects camelCase/underscore option names; bypass it.
-        self._ftl_config(key, value)
-        self.restart()
-
-    actual = self._read_toml_key(key)
-    if actual != value:
-        raise PiholeError(f"{key}: set to {value!r} but reads back as {actual!r}")
+    self._api.apply_config(password, config)   # PATCH /api/config
+    for key in config:
+        actual = config_value(self._read_toml(), key)
+        if actual is None or actual != config[key]:
+            # FTL returns 200 even for keys it ignores — the read-back
+            # is the only defence (rule 6, ADR-0004 §5.4).
+            raise PiholeError(...)
 ```
 
-`_is_snapd_safe_key` implements snapd's own regex,
-`^(?:[a-z0-9]+-?)*[a-z](?:-?[a-z0-9])*$`, applied per dotted segment.
+The sketch shows the shape; `src/pihole.py` is the authority. The load-bearing
+move is the last one: whatever the command reported, the value must appear in
+`pihole.toml` before the step counts as done. The snapd option-name regex that
+made `snap set` unusable for the camelCase keys is `pihole-snap` Trap 1.
