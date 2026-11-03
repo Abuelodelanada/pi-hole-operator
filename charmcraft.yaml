@@ -1,6 +1,6 @@
 # This file configures Charmcraft.
 # See https://documentation.ubuntu.com/charmcraft/stable/reference/files/charmcraft-yaml-file/
-name: pihole
+name: pi-hole
 type: charm
 title: Pi-hole
 summary: Network-wide DNS sinkhole and ad blocker for Ubuntu machines.
@@ -136,6 +136,11 @@ parts:
     source: .
     build-snaps:
       - astral-uv
+  other-files:
+    plugin: dump
+    source: .
+    stage:
+      - icon.svg
 
 config:
   options:
