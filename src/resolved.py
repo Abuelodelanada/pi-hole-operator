@@ -42,9 +42,14 @@ class ResolvedError(Exception):
         return f"{detail}; {self.remedy}" if self.remedy else detail
 
 
+def drop_in_releases_port53(content: str | None) -> bool:
+    """Whether the drop-in is exactly the charm's remediation."""
+    return content == DROP_IN_CONTENT
+
+
 def is_port53_released(drop_in: Path = DROP_IN) -> bool:
     """Report whether port 53 is free for Pi-hole."""
-    return _read_drop_in(drop_in) == DROP_IN_CONTENT
+    return drop_in_releases_port53(_read_drop_in(drop_in))
 
 
 def disable_stub_listener(
@@ -57,7 +62,7 @@ def disable_stub_listener(
         ResolvedError: The drop-in could not be written, did not land,
             or resolved refused to restart.
     """
-    if _read_drop_in(drop_in) == DROP_IN_CONTENT:
+    if drop_in_releases_port53(_read_drop_in(drop_in)):
         logger.debug("The resolved drop-in is already in place; not restarting %s.", SERVICE)
         return
 
@@ -71,7 +76,7 @@ def disable_stub_listener(
             actual=f"the write failed: {err}",
             remedy=f"check the permissions and free space on {drop_in.parent}",
         ) from err
-    if _read_drop_in(drop_in) != DROP_IN_CONTENT:
+    if not drop_in_releases_port53(_read_drop_in(drop_in)):
         raise ResolvedError(
             operation=f"writing {drop_in}",
             expected="the charm's drop-in on disk",

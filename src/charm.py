@@ -42,7 +42,7 @@ class PiholeCharm(ops.CharmBase):
 
         # Push-status channel: lives for one hook, not cross-hook
         # state. See ADR-0005 section 2.4.
-        self._reconcile_failure: ops.StatusBase | None = None
+        self._reconcile_failure: pihole_state.Blocked | None = None
 
         self._cos_agent = COSAgentProvider(
             self,
@@ -111,7 +111,7 @@ class PiholeCharm(ops.CharmBase):
             # A push status: the daemon may be healthy while one
             # operation silently failed. See ADR-0005 §2.4.
             logger.error("reconcile failed: %s", err)
-            self._reconcile_failure = ops.BlockedStatus(str(err))
+            self._reconcile_failure = pihole_state.Blocked(str(err))
 
     def _apply(self, outcome: pihole_state.PiholeOutcome) -> None:
         """Perform one decided outcome.
@@ -174,50 +174,29 @@ class PiholeCharm(ops.CharmBase):
     def _on_collect_status(self, event: ops.CollectStatusEvent) -> None:
         """Report the unit's status.
 
-        Must not mutate. Pull gates (DHCP unservable, port) are read
-        before the pushed failure — first-added wins the tie. See
-        ADR-0005 §2.4 and ADR-0006 §2.9.
+        Must not mutate. The decision is pure; this only fetches,
+        converts, and adds. See ADR-0005 §2.4 and ADR-0006 §2.9.
         """
         config = self.load_config(pihole_config.PiholeConfig, errors="blocked")
-        # Establish the snap's presence first — snap-check cannot run
-        # without it, and an absent snap is Maintenance, not Blocked.
         match _intent_from(self._read_password(), config):
             case pihole_state.NoIntentYet():
-                # No intent yet, so no pull gate can fire — the pushed
-                # failure is the only truth available.
-                if self._reconcile_failure is not None:
-                    event.add_status(self._reconcile_failure)
-                    return
-                event.add_status(ops.MaintenanceStatus("generating the admin password"))
-                return
+                report = pihole_state.status_without_intent(self._reconcile_failure)
             case pihole_state.PiholeIntent() as intent:
-                status, state = _machine_status(self._pihole, intent.admin_password)
+                state = pihole_state.fetch(self._pihole, intent.admin_password)
+                report = pihole_state.status_plan(state, intent, self._reconcile_failure)
             case _ as unreachable:
                 assert_never(unreachable)
 
-        # Re-derived here, not pushed from _reconcile: actions run
-        # this handler without a reconcile. See ADR-0005 §2.5.
-        if isinstance(state, pihole_state.SnapPresent):
-            if pihole_state.dhcp_unservable(state, intent):
-                event.add_status(
-                    ops.BlockedStatus(pihole_state.dhcp_unservable_reason(state, intent))
-                )
-            # Enabling DHCP into an occupied 67/udp crash-loops FTL
-            # (snap-constraints §4.4). First-added wins the tie.
-            if pihole_state.dhcp_port_blocked(state, intent):
-                event.add_status(ops.BlockedStatus(pihole_state.dhcp_port_blocked_reason(state)))
+        for status in report.statuses:
+            event.add_status(_to_ops(status))
 
-        # Read after the pull gates: first-added wins the tie.
-        # See ADR-0005 §2.4.
-        if self._reconcile_failure is not None:
-            event.add_status(self._reconcile_failure)
-            return
-
-        # Added BEFORE snap-check: first-added wins the tie, so a
-        # charm-authored Blocked must not lose to a diagnostic banner.
-        event.add_status(status)
-        if isinstance(status, ops.MaintenanceStatus):
-            return
+        match report:
+            case pihole_state.Report():
+                return
+            case pihole_state.ReportThenDiagnose():
+                pass
+            case _ as unreachable:
+                assert_never(unreachable)
 
         # snap-check exit codes: 0 healthy, 1 config error, 2 runtime
         # error. See snap-constraints §7.3.
@@ -226,26 +205,9 @@ class PiholeCharm(ops.CharmBase):
         except pihole.PiholeError as err:
             event.add_status(ops.BlockedStatus(str(err)))
             return
-        match result:
-            case pihole_state.SnapCheckOk():
-                pass
-            case pihole_state.SnapCheckConfigError(output=output):
-                # The first line is always a banner; failures live in
-                # [FAIL] lines further down.
-                fails = [ln for ln in output.splitlines() if "[FAIL]" in ln]
-                detail = " | ".join(fails) if fails else "snap-check exit 1"
-                event.add_status(
-                    ops.BlockedStatus(f"{detail}; run the snap-check action for the full output")
-                )
-            case pihole_state.SnapCheckRuntimeError(output=output):
-                event.add_status(
-                    ops.BlockedStatus(
-                        f"port conflict detected by snap-check: {output}; "
-                        "run the free-port-53 action"
-                    )
-                )
-            case _ as unreachable:
-                assert_never(unreachable)
+        diagnostic = pihole_state.snap_check_status(result)
+        if diagnostic is not None:
+            event.add_status(_to_ops(diagnostic))
 
     def _on_remove(self, _: ops.RemoveEvent) -> None:
         """Return the machine to a usable state before the unit goes.
@@ -289,7 +251,7 @@ class PiholeCharm(ops.CharmBase):
             event.fail(f"the password was not rotated: {err}")
             return
 
-        problem = _password_problem(self._pihole.admin_password_state(password))
+        problem = pihole_state.password_problem(self._pihole.admin_password_state(password))
         if problem is not None:
             event.fail(f"the new password was written but not confirmed: {problem}")
             return
@@ -415,62 +377,15 @@ def _intent_from(
     return pihole_state.PiholeIntent(admin_password=password, **config.intent_fields())
 
 
-def _machine_status(
-    facts: pihole_state.PiholeFacts,
-    admin_password: str,
-) -> tuple[ops.StatusBase, pihole_state.PiholeState]:
-    """Read the machine once and map what it finds onto one status.
-
-    Returns the state alongside the status so the caller can re-derive
-    the DHCP gates.
-    """
-    match pihole_state.fetch(facts, admin_password):
-        case pihole_state.SnapAbsent() as absent:
-            return (
-                ops.MaintenanceStatus(f"installing the {pihole.SNAP_NAME} snap"),
-                absent,
-            )
-        case pihole_state.SnapPresent() as state:
-            return _installed_status(state), state
-        case _ as unreachable:
-            assert_never(unreachable)
-
-
-def _installed_status(state: pihole_state.SnapPresent) -> ops.StatusBase:
-    """Map an installed machine's facts onto one status.
-
-    `Blocked` is reserved for what a human can act on. See ADR-0005
-    §2.8.
-    """
-    problem = _password_problem(state.admin_password)
-    if problem is not None and state.ftl_active:
-        return ops.BlockedStatus(problem)
-    if not (state.ftl_enabled and state.ftl_active):
-        return ops.MaintenanceStatus("starting the Pi-hole FTL daemon")
-    if not state.api_ready:
-        return ops.BlockedStatus(
-            "FTL is running but its HTTP API on port 80 is not answering; "
-            "check the webserver lines in FTL.log on the machine"
-        )
-    return ops.ActiveStatus()
-
-
-def _password_problem(password: pihole_state.AdminPasswordState) -> str | None:
-    """Name what is wrong with the admin password, if anything."""
-    match password:
-        case pihole_state.PasswordUnset():
-            return (
-                "no admin password is set, so the Pi-hole config API accepts "
-                "unauthenticated writes from the network; run the "
-                "rotate-admin-password action"
-            )
-        case pihole_state.PasswordRejected():
-            return (
-                "Pi-hole rejects the password this charm holds; run the "
-                "rotate-admin-password action"
-            )
-        case pihole_state.PasswordAccepted() | pihole_state.PasswordUnverified():
-            return None
+def _to_ops(status: pihole_state.UnitStatus) -> ops.StatusBase:
+    """Convert a core status value into the ops status it reports."""
+    match status:
+        case pihole_state.Active(message=message):
+            return ops.ActiveStatus(message)
+        case pihole_state.Maintenance(message=message):
+            return ops.MaintenanceStatus(message)
+        case pihole_state.Blocked(message=message):
+            return ops.BlockedStatus(message)
         case _ as unreachable:
             assert_never(unreachable)
 

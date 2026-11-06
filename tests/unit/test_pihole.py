@@ -2798,3 +2798,419 @@ def test_snap_check_unexpected_exit_code(
     # semantic code
     with pytest.raises(pihole.PiholeError, match="unexpected exit code"):
         workload.snap_check()
+
+
+# -- Pure decisions. ---------------------------------------------------
+#
+# Each function below interprets data the machine produced. These tests
+# pass plain values and compare with `==`; no fake, mock or monkeypatch
+# is involved, which is the point of extracting them.
+
+
+def test_service_status_of_a_missing_service_is_stopped():
+    # GIVEN snapd reports no service record
+    # WHEN it is read
+    # THEN the service is neither enabled nor active
+    assert pihole.service_status(None) == ServiceStatus(enabled=False, active=False)
+
+
+def test_service_status_reports_enabled_and_active_separately():
+    # GIVEN a service that is enabled but not running
+    # WHEN it is read
+    # THEN both facts survive independently
+    assert pihole.service_status({"enabled": True, "active": False}) == ServiceStatus(
+        enabled=True, active=False
+    )
+
+
+def test_ntp_server_active_is_none_when_any_key_is_unreadable():
+    # GIVEN one readable key and one that is not
+    # WHEN the two are combined
+    # THEN the answer is unknown rather than half-true
+    assert pihole.ntp_server_active([True, None]) is None
+
+
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [([False, False], False), ([False, True], True), ([True, True], True)],
+    ids=["both-off", "one-on", "both-on"],
+)
+def test_ntp_server_active_is_on_when_either_key_is_on(states: list[bool | None], expected: bool):
+    # GIVEN two readable NTP keys
+    # WHEN they are combined
+    # THEN either one being on means the server is on
+    assert pihole.ntp_server_active(states) is expected
+
+
+def test_upstream_dns_returns_a_tuple_for_a_list():
+    # GIVEN a parsed TOML list
+    # WHEN it is read as upstreams
+    # THEN it is a tuple of strings
+    assert pihole.upstream_dns(["1.1.1.1", "9.9.9.9"]) == ("1.1.1.1", "9.9.9.9")
+
+
+def test_upstream_dns_is_none_for_a_non_list():
+    # GIVEN a parsed TOML scalar where a list belongs
+    # WHEN it is read as upstreams
+    # THEN it is unreadable
+    assert pihole.upstream_dns("1.1.1.1") is None
+
+
+def test_as_string_accepts_only_strings():
+    # GIVEN a string and a non-string
+    # WHEN each is read as a string
+    # THEN only the string survives
+    assert pihole.as_string("ALL") == "ALL"
+    assert pihole.as_string(1) is None
+
+
+def test_as_bool_accepts_only_booleans():
+    # GIVEN a boolean and a string that looks like one
+    # WHEN each is read as a boolean
+    # THEN only the real boolean survives
+    assert pihole.as_bool(True) is True
+    assert pihole.as_bool("true") is None
+
+
+def test_dhcp_pool_from_requires_all_four_keys():
+    # GIVEN a pool with one key missing
+    # WHEN it is built
+    # THEN a partial pool is no pool
+    assert pihole.dhcp_pool_from("10.0.0.10", "10.0.0.50", "10.0.0.1", None) is None
+
+
+def test_dhcp_pool_from_builds_a_complete_pool():
+    # GIVEN all four keys
+    # WHEN the pool is built
+    # THEN it carries each value
+    assert pihole.dhcp_pool_from(
+        "10.0.0.10", "10.0.0.50", "10.0.0.1", "255.255.255.0"
+    ) == pihole_state.DhcpPool(
+        start="10.0.0.10",
+        end="10.0.0.50",
+        router="10.0.0.1",
+        netmask="255.255.255.0",
+    )
+
+
+def test_ipv4_addresses_keeps_only_global_scope_addresses():
+    # GIVEN ip output with loopback, link-scope and global addresses
+    output = (
+        "1: lo    inet 127.0.0.1/8 scope host lo\\       "
+        "valid_lft forever preferred_lft forever\n"
+        "2: eth0    inet 169.254.9.9/16 brd 169.254.255.255 scope link eth0\\       "
+        "valid_lft forever preferred_lft forever\n"
+        "3: eth1    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth1\\       "
+        "valid_lft forever preferred_lft forever\n"
+    )
+
+    # WHEN it is parsed
+    # THEN only the global address is servable
+    assert pihole.ipv4_addresses(0, output) == frozenset({"10.0.0.5"})
+
+
+def test_ipv4_addresses_is_none_on_a_nonzero_exit():
+    # GIVEN a failed ip command
+    # WHEN its output is parsed
+    # THEN the read failed, which is not "no addresses"
+    assert pihole.ipv4_addresses(1, "3: eth1 inet 10.0.0.5/24 scope global eth1\n") is None
+
+
+def test_ipv4_addresses_skips_a_line_without_a_scope_token():
+    # GIVEN a line with enough columns but no scope token
+    output = "5: eth3    inet 10.1.1.1/24 brd 10.1.1.255 eth3\\       valid_lft forever\n"
+
+    # WHEN it is parsed
+    # THEN the line is skipped rather than crashing
+    assert pihole.ipv4_addresses(0, output) == frozenset()
+
+
+def test_ipv4_addresses_skips_a_short_line():
+    # GIVEN a line with too few columns
+    # WHEN it is parsed
+    # THEN it is skipped rather than indexed
+    assert pihole.ipv4_addresses(0, "1: lo inet\n") == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected"),
+    [
+        (0, SnapCheckOk()),
+        (1, SnapCheckConfigError(output="a problem")),
+        (2, SnapCheckRuntimeError(output="a problem")),
+        (3, pihole.SnapCheckUnexpected(returncode=3)),
+    ],
+    ids=["ok", "config", "runtime", "unexpected"],
+)
+def test_classify_snap_check_maps_each_exit_code(returncode: int, expected: object):
+    # GIVEN one of the exit codes snap-check can produce
+    # WHEN it is classified
+    # THEN the semantic outcome carries the code and output
+    assert pihole.classify_snap_check(returncode, "a problem") == expected
+
+
+def test_parse_connected_plugs_keeps_only_connected_plugs_of_this_snap():
+    # GIVEN snap connections output with a disconnected row and a
+    # foreign snap's row
+    output = (
+        "Interface        Plug                            Slot              Notes\n"
+        "network-control  pihole-by-rajannpatel:network-control  :network-control  manual\n"
+        "time-control     pihole-by-rajannpatel:time-control     -                 -\n"
+        "system-observe   other-snap:system-observe             :system-observe   manual\n"
+    )
+
+    # WHEN it is parsed
+    # THEN only this snap's connected plug survives
+    assert pihole.parse_connected_plugs(0, output) == frozenset({"network-control"})
+
+
+def test_parse_connected_plugs_is_empty_on_a_nonzero_exit():
+    # GIVEN a failed snap connections command
+    # WHEN its output is parsed
+    # THEN the safe direction is an empty set
+    assert pihole.parse_connected_plugs(1, "anything") == frozenset()
+
+
+def test_parse_connected_plugs_skips_blank_and_short_lines():
+    # GIVEN output with blank lines and a row too short to read
+    output = "\n  \nInterface Plug Slot\nshort\n"
+
+    # WHEN it is parsed
+    # THEN nothing is invented from the malformed rows
+    assert pihole.parse_connected_plugs(0, output) == frozenset()
+
+
+def test_missing_plugs_preserves_the_requested_order():
+    # GIVEN three requested plugs and one already connected
+    # WHEN the missing ones are computed
+    # THEN the result keeps the request order
+    assert pihole.missing_plugs(["a", "b", "c"], frozenset({"b"})) == ("a", "c")
+
+
+def test_gravity_schedule_error_is_none_when_the_schedule_is_valid():
+    # GIVEN systemd-analyze exited 0
+    # WHEN the result is read
+    # THEN there is no error
+    assert pihole.gravity_schedule_error(0, "", "") is None
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "expected"),
+    [
+        ("", "stderr wins", "stderr wins"),
+        ("stdout wins", "", "stdout wins"),
+        ("", "", "(no output)"),
+    ],
+    ids=["stderr", "stdout", "empty"],
+)
+def test_gravity_schedule_error_prefers_stderr_then_stdout(
+    stdout: str, stderr: str, expected: str
+):
+    # GIVEN a failed systemd-analyze with output in one of the streams
+    # WHEN the error is read
+    # THEN the most specific available line is returned
+    assert pihole.gravity_schedule_error(1, stdout, stderr) == expected
+
+
+def test_drop_in_paths_is_none_on_a_nonzero_exit():
+    # GIVEN systemctl show failed
+    # WHEN its output is read
+    # THEN the unit could not be read
+    assert pihole.drop_in_paths(1, "/etc/systemd/system/x.conf") is None
+
+
+def test_drop_in_paths_strips_and_treats_empty_as_none():
+    # GIVEN a successful systemctl show
+    # WHEN its output is read
+    # THEN whitespace is stripped and an empty answer is None
+    assert pihole.drop_in_paths(0, "  /etc/systemd/system/x.conf\n") == (
+        "/etc/systemd/system/x.conf"
+    )
+    assert pihole.drop_in_paths(0, "  \n") is None
+
+
+def test_parse_gravity_schedule_returns_the_first_non_empty_oncalendar():
+    # GIVEN a drop-in that clears OnCalendar before setting it
+    content = "[Timer]\nOnCalendar=\nOnCalendar=Sun *-*-* 04:00\n"
+
+    # WHEN it is parsed
+    # THEN the set value is returned, not the clearing line
+    assert pihole.parse_gravity_schedule(content) == "Sun *-*-* 04:00"
+
+
+def test_parse_gravity_schedule_is_none_without_an_oncalendar():
+    # GIVEN a drop-in with no OnCalendar
+    # WHEN it is parsed
+    # THEN there is no schedule
+    assert pihole.parse_gravity_schedule("[Timer]\nSomeOtherKey=1\n") is None
+
+
+def test_output_tail_prefers_stderr_and_keeps_the_last_five_lines():
+    # GIVEN a failure with more than five lines on stderr
+    stderr = "\n".join(f"line {number}" for number in range(1, 8))
+
+    # WHEN the tail is read
+    # THEN only the last five lines survive
+    assert pihole.output_tail("stdout", stderr) == "\n".join(
+        f"line {number}" for number in range(3, 8)
+    )
+
+
+def test_output_tail_falls_back_to_stdout_and_then_a_placeholder():
+    # GIVEN a failure with output only on stdout, and one with none
+    # WHEN each tail is read
+    # THEN stdout is used, and an empty failure says so
+    assert pihole.output_tail("stdout", None) == "stdout"
+    assert pihole.output_tail(None, None) == "(no output)"
+
+
+def test_unproven_keys_lists_keys_that_do_not_match_the_intent():
+    # GIVEN a read-back where one key is wrong and one is unreadable
+    after = {"ntp.ipv4.active": True, "ntp.ipv6.active": None}
+
+    # WHEN the unproven keys are computed for "off"
+    # THEN both are named, in the mapping's order
+    assert pihole.unproven_keys(after, False) == ("ntp.ipv4.active", "ntp.ipv6.active")
+
+
+def test_password_hash_problem_names_an_empty_hash():
+    # GIVEN a write that left pwhash empty
+    # WHEN the result is read
+    # THEN the empty hash is the problem
+    assert pihole.password_hash_problem("old", "") == "pwhash is still empty"
+
+
+def test_password_hash_problem_names_an_unchanged_hash():
+    # GIVEN a write that left the old hash in place
+    # WHEN the result is read
+    # THEN the unchanged hash is the problem
+    assert pihole.password_hash_problem("old", "old") == "the hash did not change"
+
+
+def test_password_hash_problem_is_none_for_a_fresh_hash():
+    # GIVEN a write that produced a new hash
+    # WHEN the result is read
+    # THEN there is no problem
+    assert pihole.password_hash_problem("old", "new") is None
+
+
+def test_dhcp_bind_held_accepts_a_67_socket_owned_by_ftl():
+    # GIVEN ss output naming pihole-FTL on 0.0.0.0:67
+    # WHEN it is read
+    # THEN FTL holds the port
+    assert pihole.dhcp_bind_held(0, _ss_output(_bound_row())) is True
+
+
+def test_dhcp_bind_held_rejects_a_6700_socket():
+    # GIVEN ss output naming pihole-FTL on 6700/udp
+    # WHEN it is read
+    # THEN a substring match would be wrong, and the port is not held
+    output = _ss_output(
+        "UNCONN  0       0       0.0.0.0:6700         0.0.0.0:*          "
+        'users:(("pihole-FTL",pid=1234,fd=5))\n'
+    )
+    assert pihole.dhcp_bind_held(0, output) is False
+
+
+def test_dhcp_bind_held_rejects_a_foreign_owner():
+    # GIVEN ss output with 67/udp held by dnsmasq
+    # WHEN it is read
+    # THEN the port is taken, but not by FTL
+    output = _ss_output(
+        "UNCONN  0       0       0.0.0.0:67          0.0.0.0:*          "
+        'users:(("dnsmasq",pid=4321,fd=7))\n'
+    )
+    assert pihole.dhcp_bind_held(0, output) is False
+
+
+def test_dhcp_bind_held_is_false_on_a_nonzero_exit():
+    # GIVEN a failed ss command
+    # WHEN its output is read
+    # THEN the port is not proven held
+    assert pihole.dhcp_bind_held(1, _ss_output(_bound_row())) is False
+
+
+def test_dhcp_bind_held_skips_malformed_lines():
+    # GIVEN a truncated row before the real one
+    # WHEN it is read
+    # THEN the malformed row is skipped
+    assert pihole.dhcp_bind_held(0, _ss_output("UNCONN  0       0\n", _bound_row())) is True
+
+
+def test_config_mismatch_is_none_when_the_value_landed():
+    # GIVEN a boolean, a tuple and a scalar that all landed
+    # WHEN each is compared
+    # THEN none is a mismatch
+    assert pihole.config_mismatch("dns.blocking.active", True, True) is None
+    assert pihole.config_mismatch("dns.upstreams", ("1.1.1.1",), ["1.1.1.1"]) is None
+    assert pihole.config_mismatch("dns.listeningMode", "ALL", "ALL") is None
+
+
+def test_config_mismatch_names_an_absent_key():
+    # GIVEN a key FTL silently ignored
+    # WHEN it is compared
+    # THEN the mismatch says the key is absent
+    assert pihole.config_mismatch("dns.typoKey", "value", None) == pihole.ConfigMismatch(
+        expected="dns.typoKey = 'value' in pihole.toml",
+        actual="dns.typoKey is absent from pihole.toml",
+        remedy="FTL ignores unknown keys with HTTP 200; check the key name",
+    )
+
+
+def test_config_mismatch_rejects_a_bool_that_landed_as_a_string():
+    # GIVEN a boolean expected but a string in the TOML
+    # WHEN it is compared
+    # THEN the type mismatch is a failure
+    assert pihole.config_mismatch("dns.blocking.active", True, "yes") == pihole.ConfigMismatch(
+        expected="dns.blocking.active = True",
+        actual="dns.blocking.active = yes",
+        remedy="the API returned 200 but the value did not land in pihole.toml",
+    )
+
+
+def test_config_mismatch_rejects_a_bool_that_did_not_change():
+    # GIVEN a boolean that kept the old value
+    # WHEN it is compared
+    # THEN the value mismatch is a failure
+    assert pihole.config_mismatch("dns.blocking.active", True, False) == pihole.ConfigMismatch(
+        expected="dns.blocking.active = True",
+        actual="dns.blocking.active = False",
+        remedy="the API returned 200 but the value did not land in pihole.toml",
+    )
+
+
+def test_config_mismatch_rejects_a_tuple_that_landed_as_a_string():
+    # GIVEN a tuple expected but a bare string in the TOML
+    # WHEN it is compared
+    # THEN the shape mismatch is a failure
+    assert pihole.config_mismatch(
+        "dns.upstreams", ("1.1.1.1",), "1.1.1.1"
+    ) == pihole.ConfigMismatch(
+        expected="dns.upstreams = ('1.1.1.1',)",
+        actual="dns.upstreams = '1.1.1.1'",
+        remedy="the API returned 200 but the value did not land in pihole.toml",
+    )
+
+
+def test_config_mismatch_rejects_a_tuple_that_differs():
+    # GIVEN a tuple expected but a different list in the TOML
+    # WHEN it is compared
+    # THEN the value mismatch is a failure
+    assert pihole.config_mismatch(
+        "dns.upstreams", ("1.1.1.1",), ["8.8.8.8"]
+    ) == pihole.ConfigMismatch(
+        expected="dns.upstreams = ('1.1.1.1',)",
+        actual="dns.upstreams = ['8.8.8.8']",
+        remedy="the API returned 200 but the value did not land in pihole.toml",
+    )
+
+
+def test_config_mismatch_compares_scalars_as_strings():
+    # GIVEN a scalar that differs from the expected value
+    # WHEN it is compared
+    # THEN the string forms decide, as the read-back always did
+    assert pihole.config_mismatch("dns.listeningMode", "ALL", "LOCAL") == pihole.ConfigMismatch(
+        expected="dns.listeningMode = 'ALL'",
+        actual="dns.listeningMode = 'LOCAL'",
+        remedy="the API returned 200 but the value did not land in pihole.toml",
+    )

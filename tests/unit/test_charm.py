@@ -1522,10 +1522,9 @@ def test_port_gate_blocked_outranks_maintenance(
 ):
     """A firing gate is Blocked even while FTL is down.
 
-    `_installed_status` reports Maintenance while FTL is down; the
-    gate's Blocked is added after, and ops resolves blocked >
-    maintenance — so the port conflict is not hidden behind a
-    transient "starting".
+    The machine status is Maintenance while FTL is down; the gate's
+    Blocked is added after, and ops resolves blocked > maintenance — so
+    the port conflict is not hidden behind a transient "starting".
     """
     # GIVEN DHCP enabled with a servable pool, 67/udp held, and FTL
     # down (so the machine status alone would be Maintenance)

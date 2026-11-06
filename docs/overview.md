@@ -39,7 +39,7 @@ tested without a single mock**. And every step answers both questions with
 ```
 charm.py          ← the imperative shell: ops, and nothing else
 pihole_config.py  ← the operator's vocabulary (pydantic)
-pihole_state.py   ← the PURE CORE: intent, state, outcomes, fetch, compute
+pihole_state.py   ← the PURE CORE: intent, state, outcomes, status, fetch, compute
 pihole.py         ← the workload: snapd, commands, pihole.toml
 ftl_api.py        ← the workload: FTL's HTTP API client
 resolved.py       ← the environment: systemd-resolved and port 53
@@ -60,9 +60,12 @@ imports `ops`.**
 **[`pihole_state.py`](../src/pihole_state.py)** — The functional core. It imports
 nothing that touches the machine: no `ops`, no `subprocess`, no `charmlibs`. It
 holds `PiholeIntent`, the `PiholeState` and `PiholeOutcome` unions, `fetch` and
-`compute`. It reaches the workload only through the `PiholeFacts` protocol, and
-**that inverted import is the heart of the pattern**: it is what makes reading
-`compute` tell you everything the charm does, and testing it need no mocks.
+`compute`. It also decides **which status to report** — the `UnitStatus` values,
+`status_plan`, `status_without_intent`, and `snap_check_status` — so the charm
+only converts those values to `ops` statuses and adds them. It reaches the
+workload only through the `PiholeFacts` protocol, and **that inverted import is
+the heart of the pattern**: it is what makes reading `compute` tell you
+everything the charm does, and testing it need no mocks.
 
 **[`pihole.py`](../src/pihole.py)** — Every effect on the machine, and every
 read-back. Never imports `ops`. Its rule: **an exit code is not evidence** — the

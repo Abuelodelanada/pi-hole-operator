@@ -31,7 +31,7 @@ document has shipped stale counts three times.
 
 ## Design
 
-Five sections, each behind a `# --` divider in the file.
+The module is organised in sections, each behind a `# --` divider in the file.
 
 ### Observed facts
 
@@ -81,6 +81,21 @@ document deliberately does not copy it, because a copy rots at the next
 outcome. What matters is the shape: each variant is a value, not an
 action, and `charm.py`'s `_apply` is the only thing that turns one into
 an effect.
+
+### The status decisions
+
+`UnitStatus` is the core's own status vocabulary — `Active`, `Maintenance`,
+`Blocked` — so the decision does not import `ops`. `status_without_intent`
+handles `NoIntentYet`; `status_plan` handles `PiholeIntent` and returns either
+`Report` or `ReportThenDiagnose`. The union is the decision about whether
+snap-check still has to run, rather than a boolean beside the statuses.
+
+The order of the returned tuple is behaviour: ops resolves equal-priority
+statuses by first-added, so the DHCP gates precede the pushed failure, and a
+pushed failure stops the plan before any machine status. `snap_check_status`
+maps a `SnapCheckResult` onto a `Blocked` or `None`, and `password_problem`
+names the actionable password states. `charm.py` only converts each value with
+`_to_ops` and adds it.
 
 ### The effect boundary and the two functions
 

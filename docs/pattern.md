@@ -72,7 +72,7 @@ by `systemd-resolved`, so `src/resolved.py` writes a drop-in and restarts that
 service. It never touches Pi-hole at all.
 
 The deciding half does not know the difference, and that is the point. The fact
-arrives as a plain `stub_listener_disabled: bool` on the state. `compute` returns a
+arrives as a plain `port53_released: bool` on the state. `compute` returns a
 `ReleasePort53()` outcome when it is `False`. Only `_apply` knows that this means a
 systemd drop-in and not a snap command. Naming an outcome after *what* it achieves,
 rather than *how*, is what keeps that knowledge out of the core.
@@ -86,12 +86,14 @@ all.
 The part that decides is small and easy to test, because a test only has to build
 values and check the values that come back. The part that touches the workload is
 kept thin and boring on purpose, because that is the part a test cannot check
-cheaply. In this charm the whole of it is `_apply`: one exhaustive `match`, one call
-per branch, and no `if` anywhere.
+cheaply. In this charm it is the workload modules (`src/pihole.py`,
+`src/ftl_api.py`, `src/resolved.py`), which make the calls, and `_apply` in
+`src/charm.py`, which dispatches to them: one exhaustive `match`, one call per
+branch, and no `if` anywhere.
 
-**This is also the only part that differs between a machine charm and a
-Kubernetes charm.** The two halves are the same shape in both, and the deciding
-half is identical:
+**Only the outer half changes between a machine charm and a Kubernetes charm.**
+Both kinds of charm still have a `fetch` and an `_apply`; what changes is the
+calls underneath them. The deciding half is identical in both:
 
 | | A machine charm | A Kubernetes charm |
 |---|---|---|
@@ -102,9 +104,12 @@ half is identical:
 | Check it is running | read real state and verify | `container.get_service`, plus verify |
 
 This charm is a machine charm, so the examples below use a snap. If you are
-writing for Kubernetes, replace those calls with Pebble ones and change nothing
-else. `Intent`, `State`, `Outcome`, `fetch` and `compute` do not know or care
-which kind of charm they are in, because they never touch the workload at all.
+writing for Kubernetes, replace those calls with Pebble ones; the deciding half
+needs no change. (The charm around it does: `charmcraft.yaml` declares containers
+and resources, and the workload starts on `pebble-ready`.) `Intent`, `State`,
+`Outcome` and `compute` do not know or care which kind of charm they are in,
+because they never touch the workload at all. `fetch` does not either: it reads
+through the `PiholeFacts` protocol, so only the class that implements it changes.
 That portability is a direct result of the split, not an extra feature.
 
 Three kinds of value cross the line between the two parts:
