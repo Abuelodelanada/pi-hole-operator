@@ -166,7 +166,7 @@ src/
   charm.py                # PiholeCharm: observe -> _reconcile -> collect_unit_status
   pihole.py               # workload: snap install/start, config apply, readiness
   ftl_api.py              # workload: FTL HTTP API client (ADR-0009)
-  pihole_state.py         # functional core: intent, state, outcome ADT, fetch/compute
+  pihole_state.py         # functional core: intent, state, outcome ADT, status, fetch/compute
   pihole_config.py        # pydantic config model + the IntentFields TypedDict
   resolved.py             # workload: systemd-resolved port 53 orchestration
 tests/
@@ -177,9 +177,12 @@ tests/
 ```
 
 `src/pihole_state.py` is the pure core: it holds `PiholeIntent`, the `PiholeState`
-and `PiholeOutcome` unions, `fetch`, and `compute`. It imports neither `ops` nor
-anything that touches the machine — it reaches the workload only through the
-`PiholeFacts` protocol, which is what keeps that import out. See rule 2.
+and `PiholeOutcome` unions, `fetch`, and `compute`. It also decides which status
+to report — the `UnitStatus` values, `status_plan`, `status_without_intent`, and
+`snap_check_status` — so `charm.py` only converts and adds them. It imports
+neither `ops` nor anything that touches the machine — it reaches the workload
+only through the `PiholeFacts` protocol, which is what keeps that import out.
+See rule 2.
 
 **`src/` is on `PYTHONPATH`, so imports are flat.** `tox.ini` sets
 `PYTHONPATH={tox_root}/lib:{tox_root}/src`, which is what Juju's charm venv also

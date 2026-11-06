@@ -1071,3 +1071,80 @@ def test_keys_sharing_a_prefix_share_a_table_in_the_body(
     # THEN the body nests them under one `dns` table, mirroring the
     # file the API writes — not two parallel trees
     assert fake.requests[1].body == {"config": {"dns": {"dnssec": True, "listeningMode": "ALL"}}}
+
+
+# -- Pure decisions for the write path. --------------------------------
+
+
+def test_classify_patch_accepts_a_200():
+    # GIVEN a PATCH that returned 200
+    # WHEN it is classified
+    # THEN the write is accepted
+    assert ftl_api.classify_patch(200, {}) == ftl_api.PatchAccepted()
+
+
+def test_classify_patch_reads_a_string_hint():
+    # GIVEN a 400 carrying FTL's hint
+    # WHEN it is classified
+    # THEN the hint travels verbatim
+    assert ftl_api.classify_patch(400, {"hint": "dns.listeningMode: invalid"}) == (
+        ftl_api.PatchRejected(hint="dns.listeningMode: invalid")
+    )
+
+
+def test_classify_patch_falls_back_for_a_non_string_hint():
+    # GIVEN a 400 whose hint is not a string
+    # WHEN it is classified
+    # THEN the generic message stands in
+    assert ftl_api.classify_patch(400, {"hint": 123}) == ftl_api.PatchRejected(
+        hint="FTL rejected the config (HTTP 400)"
+    )
+
+
+def test_classify_patch_reports_an_unexpected_status():
+    # GIVEN a PATCH that returned neither 200 nor 400
+    # WHEN it is classified
+    # THEN the status is carried for the caller to name
+    assert ftl_api.classify_patch(500, {}) == ftl_api.PatchUnexpected(status=500)
+
+
+def test_classify_cli_session_reports_an_exhausted_pool():
+    # GIVEN a 429 from /api/auth
+    # WHEN it is classified
+    # THEN no session may be assumed
+    assert ftl_api.classify_cli_session(429, None) == ftl_api.NoSession(
+        reason="FTL has no free API session slots (HTTP 429)"
+    )
+
+
+def test_classify_cli_session_keeps_the_sid():
+    # GIVEN a 200 that issued a session
+    # WHEN it is classified
+    # THEN the session carries the sid
+    assert ftl_api.classify_cli_session(200, SID) == ftl_api.ApiSession(sid=SID)
+
+
+def test_classify_cli_session_keeps_no_sid_on_a_refusal():
+    # GIVEN a 401 that issued no session
+    # WHEN it is classified
+    # THEN the session is anonymous rather than invented
+    assert ftl_api.classify_cli_session(401, None) == ftl_api.ApiSession(sid=None)
+
+
+def test_session_id_reads_a_string_sid():
+    # GIVEN an /api/auth payload with a session object
+    # WHEN the sid is read
+    # THEN it is returned
+    assert ftl_api.session_id({"session": {"sid": SID}}) == SID
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"session": "not-a-table"}, {"session": {"sid": 1}}],
+    ids=["no-session", "wrong-shape", "non-string-sid"],
+)
+def test_session_id_is_none_without_a_string_sid(payload: dict[str, object]):
+    # GIVEN a payload that does not carry a string sid
+    # WHEN the sid is read
+    # THEN there is no session id
+    assert ftl_api.session_id(payload) is None

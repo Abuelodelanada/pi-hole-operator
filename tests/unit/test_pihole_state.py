@@ -13,15 +13,19 @@ import pytest
 
 from pihole_state import (
     API_READY_TIMEOUT,
+    SNAP_NAME,
     SNAP_REVISIONS,
     UNCONDITIONAL_PLUGS,
+    Active,
     AdminPasswordState,
     ApiFacts,
     AwaitApi,
+    Blocked,
     ConnectPlugs,
     DhcpPool,
     HoldSnapRefresh,
     InstallSnap,
+    Maintenance,
     Noop,
     PasswordAccepted,
     PasswordRejected,
@@ -31,12 +35,17 @@ from pihole_state import (
     PiholeOutcome,
     ReleasePort53,
     RemoveGravityTimer,
+    Report,
+    ReportThenDiagnose,
     RestartFtl,
     ServiceStatus,
     SetAdminPassword,
     SetFtlConfig,
     SetNtpServer,
     SnapAbsent,
+    SnapCheckConfigError,
+    SnapCheckOk,
+    SnapCheckRuntimeError,
     SnapPresent,
     StartFtl,
     WaitForDhcpBind,
@@ -49,8 +58,12 @@ from pihole_state import (
     fetch,
     in_pool_subnet,
     open_ports,
+    password_problem,
     plugs_for,
     revision_for,
+    snap_check_status,
+    status_plan,
+    status_without_intent,
 )
 
 PASSWORD = "a-generated-password"
@@ -1450,3 +1463,187 @@ def test_dhcp_port_blocked_reason_names_the_unbound_daemon():
     # THEN it names the unbound daemon, not a port conflict
     assert "not holding 67/udp" in reason
     assert "snap logs pihole" in reason
+
+
+# -- Status decisions. -------------------------------------------------
+
+
+def test_no_intent_without_a_failure_waits_for_the_password():
+    # GIVEN no intent and no pushed failure
+    # WHEN the status is decided
+    report = status_without_intent(None)
+
+    # THEN the unit is Maintenance, and no diagnostic runs
+    assert report == Report(statuses=(Maintenance("generating the admin password"),))
+
+
+def test_no_intent_reports_the_pushed_failure():
+    # GIVEN no intent and a pushed failure
+    failure = Blocked("the secret still holds something else")
+
+    # WHEN the status is decided
+    report = status_without_intent(failure)
+
+    # THEN the failure is the only status
+    assert report == Report(statuses=(failure,))
+
+
+def test_dhcp_gates_come_before_the_pushed_failure():
+    # GIVEN DHCP enabled with both gates firing and a pushed failure
+    state = converged(
+        dhcp_active=False,
+        dhcp_pool=None,
+        port67_free=False,
+        machine_ipv4_addresses=frozenset({"10.0.0.1"}),
+    )
+    failure = Blocked("pushed failure")
+
+    # WHEN the status is decided
+    report = status_plan(state, DHCP_INTENT, failure)
+
+    # THEN both gates precede the failure, in gate order
+    assert report == Report(
+        statuses=(
+            Blocked(dhcp_unservable_reason(state, DHCP_INTENT)),
+            Blocked(dhcp_port_blocked_reason(state)),
+            failure,
+        )
+    )
+
+
+def test_a_pushed_failure_stops_the_plan():
+    # GIVEN a converged machine and a pushed failure
+    failure = Blocked("pushed failure")
+
+    # WHEN the status is decided
+    report = status_plan(converged(), INTENT, failure)
+
+    # THEN no machine status follows, and no diagnostic runs
+    assert report == Report(statuses=(failure,))
+
+
+def test_an_absent_snap_is_maintenance_without_a_diagnostic():
+    # GIVEN a machine with no snap
+    # WHEN the status is decided
+    report = status_plan(SnapAbsent(), INTENT, None)
+
+    # THEN it is installing Maintenance, and snap-check is not run
+    assert report == Report(statuses=(Maintenance(f"installing the {SNAP_NAME} snap"),))
+
+
+def test_a_password_problem_while_ftl_is_active_blocks_then_diagnoses():
+    # GIVEN a serving daemon with an empty pwhash
+    state = converged(admin_password=PasswordUnset())
+    problem = password_problem(PasswordUnset())
+    assert problem is not None
+
+    # WHEN the status is decided
+    report = status_plan(state, INTENT, None)
+
+    # THEN the password problem is Blocked, and snap-check still runs
+    assert report == ReportThenDiagnose(statuses=(Blocked(problem),))
+
+
+def test_a_stopped_daemon_is_maintenance_without_a_diagnostic():
+    # GIVEN an installed machine whose daemon is down
+    state = converged(ftl_enabled=False, ftl_active=False, api_ready=False)
+
+    # WHEN the status is decided
+    report = status_plan(state, INTENT, None)
+
+    # THEN it is starting Maintenance, and snap-check is not run
+    assert report == Report(statuses=(Maintenance("starting the Pi-hole FTL daemon"),))
+
+
+def test_a_running_daemon_without_an_api_blocks_then_diagnoses():
+    # GIVEN a daemon that is active while its API is not answering
+    state = converged(api_ready=False)
+
+    # WHEN the status is decided
+    report = status_plan(state, INTENT, None)
+
+    # THEN it is Blocked, and snap-check still runs
+    assert report == ReportThenDiagnose(
+        statuses=(
+            Blocked(
+                "FTL is running but its HTTP API on port 80 is not answering; "
+                "check the webserver lines in FTL.log on the machine"
+            ),
+        )
+    )
+
+
+def test_a_converged_machine_is_active_then_diagnoses():
+    # GIVEN a converged machine
+    # WHEN the status is decided
+    report = status_plan(converged(), INTENT, None)
+
+    # THEN it is Active, and snap-check runs
+    assert report == ReportThenDiagnose(statuses=(Active(),))
+
+
+def test_snap_check_ok_adds_nothing():
+    # GIVEN snap-check exit 0
+    # WHEN it is mapped
+    # THEN there is no status to add
+    assert snap_check_status(SnapCheckOk()) is None
+
+
+def test_snap_check_config_error_names_the_fail_lines():
+    # GIVEN snap-check exit 1 with a banner and a [FAIL] line
+    result = SnapCheckConfigError(
+        output="Pi-hole System Diagnostics\n\n[FAIL] network-bind (Disconnected)\n"
+    )
+
+    # WHEN it is mapped
+    # THEN the [FAIL] line is the message, never the banner
+    assert snap_check_status(result) == Blocked(
+        "[FAIL] network-bind (Disconnected); run the snap-check action for the full output"
+    )
+
+
+def test_snap_check_config_error_without_fail_lines_names_the_exit_code():
+    # GIVEN snap-check exit 1 with no [FAIL] line
+    result = SnapCheckConfigError(output="Pi-hole System Diagnostics\n")
+
+    # WHEN it is mapped
+    # THEN the message falls back to the exit code
+    assert snap_check_status(result) == Blocked(
+        "snap-check exit 1; run the snap-check action for the full output"
+    )
+
+
+def test_snap_check_runtime_error_names_the_free_port_action():
+    # GIVEN snap-check exit 2
+    result = SnapCheckRuntimeError(output="port 53 conflict")
+
+    # WHEN it is mapped
+    # THEN the message names the remedy and carries the output
+    assert snap_check_status(result) == Blocked(
+        "port conflict detected by snap-check: port 53 conflict; run the free-port-53 action"
+    )
+
+
+@pytest.mark.parametrize(
+    ("password", "expected"),
+    [
+        (PasswordUnset(), "no admin password is set"),
+        (PasswordRejected(), "Pi-hole rejects the password"),
+        (PasswordAccepted(), None),
+        (PasswordUnverified(), None),
+    ],
+    ids=["unset", "rejected", "accepted", "unverified"],
+)
+def test_password_problem_names_only_the_actionable_cases(
+    password: AdminPasswordState, expected: str | None
+):
+    # GIVEN a measured password state
+    # WHEN the problem is named
+    problem = password_problem(password)
+
+    # THEN only the actionable cases produce a message
+    if expected is None:
+        assert problem is None
+    else:
+        assert problem is not None
+        assert expected in problem

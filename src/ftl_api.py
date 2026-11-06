@@ -216,6 +216,59 @@ def classify_blocking(status: int, payload: Mapping[str, object]) -> BlockingPro
 
 
 @final
+@dataclass(frozen=True)
+class PatchAccepted:
+    """PATCH /api/config returned 200."""
+
+
+@final
+@dataclass(frozen=True)
+class PatchRejected:
+    """PATCH /api/config returned 400 with a hint."""
+
+    hint: str
+
+
+@final
+@dataclass(frozen=True)
+class PatchUnexpected:
+    """PATCH /api/config returned an unexpected status."""
+
+    status: int
+
+
+type PatchOutcome = PatchAccepted | PatchRejected | PatchUnexpected
+
+
+def classify_patch(status: int, payload: Mapping[str, object]) -> PatchOutcome:
+    """Read what PATCH /api/config said about the write."""
+    if status == 400:
+        hint = payload.get("hint")
+        return PatchRejected(
+            hint=str(hint) if isinstance(hint, str) else "FTL rejected the config (HTTP 400)"
+        )
+    if status != HTTP_OK:
+        return PatchUnexpected(status=status)
+    return PatchAccepted()
+
+
+def classify_cli_session(status: int, sid: str | None) -> SessionOutcome:
+    """Read what POST /api/auth said about the CLI password."""
+    if status == HTTP_TOO_MANY_REQUESTS:
+        return NoSession(reason="FTL has no free API session slots (HTTP 429)")
+    return ApiSession(sid=sid)
+
+
+def session_id(payload: Mapping[str, object]) -> str | None:
+    """Read the session id out of an /api/auth payload, if any."""
+    session = payload.get("session")
+    if not isinstance(session, dict):
+        return None
+    sid = cast("Mapping[str, object]", session).get("sid")
+    return sid if isinstance(sid, str) else None
+
+
+@final
 class FtlApi:
     """Talk to FTL's HTTP API. Owns sessions, nothing else."""
 
@@ -361,15 +414,17 @@ class FtlApi:
             raise ApiUnavailableError(
                 reason=f"PATCH /api/config could not be reached: {err}"
             ) from err
-        if status == 400:
-            hint = payload.get("hint")
-            raise ApiConfigError(
-                hint=str(hint) if isinstance(hint, str) else "FTL rejected the config (HTTP 400)"
-            )
-        if status != HTTP_OK:
-            raise ApiUnavailableError(
-                reason=f"PATCH /api/config returned unexpected HTTP {status}"
-            )
+        match classify_patch(status, payload):
+            case PatchRejected(hint=hint):
+                raise ApiConfigError(hint=hint)
+            case PatchUnexpected(status=unexpected):
+                raise ApiUnavailableError(
+                    reason=f"PATCH /api/config returned unexpected HTTP {unexpected}"
+                )
+            case PatchAccepted():
+                return
+            case _ as unreachable:
+                assert_never(unreachable)
 
     def _open_cli_session(self) -> SessionOutcome:
         """Authenticate as the CLI, re-reading `cli_pw` every time.
@@ -383,11 +438,9 @@ class FtlApi:
             status, sid = self._authenticate(password)
         except ApiUnavailableError as err:
             return NoSession(reason=str(err))
-        if status == HTTP_TOO_MANY_REQUESTS:
-            return NoSession(reason="FTL has no free API session slots (HTTP 429)")
-        if status != HTTP_OK:
+        if status != HTTP_OK and status != HTTP_TOO_MANY_REQUESTS:
             logger.debug("/api/auth refused the CLI password (HTTP %s).", status)
-        return ApiSession(sid=sid)
+        return classify_cli_session(status, sid)
 
     def _try_open_cli_session(self) -> ApiSession | None:
         """Open a CLI session, or None to leave the caller waiting."""
@@ -463,11 +516,7 @@ class FtlApi:
     def _authenticate(self, password: str) -> tuple[int, str | None]:
         """Post a password to `/api/auth`, returning status and sid."""
         status, payload = self._api_request("POST", "auth", body={"password": password})
-        session = payload.get("session")
-        if not isinstance(session, dict):
-            return status, None
-        sid = cast("Mapping[str, object]", session).get("sid")
-        return status, sid if isinstance(sid, str) else None
+        return status, session_id(payload)
 
     def _logout(self, sid: str | None) -> None:
         """Drop a session. Best effort: sessions are finite."""

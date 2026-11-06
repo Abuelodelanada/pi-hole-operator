@@ -296,3 +296,20 @@ def test_resolved_error_survives_the_traceback_assignment():
     err.__traceback__ = err.__traceback__
 
     # THEN the assignment does not raise — the exception is not frozen
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (None, False),
+        ("", False),
+        ("[Resolve]\nDNSStubListener=yes\n", False),
+        (EXPECTED_CONTENT, True),
+    ],
+    ids=["absent", "empty", "foreign", "ours"],
+)
+def test_drop_in_releases_port53_only_for_the_exact_content(content: str | None, expected: bool):
+    # GIVEN a drop-in in one of the states it can be in
+    # WHEN its content is read
+    # THEN only the exact remediation counts as released
+    assert resolved.drop_in_releases_port53(content) is expected

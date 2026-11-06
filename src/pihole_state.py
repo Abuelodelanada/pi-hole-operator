@@ -259,6 +259,53 @@ type DeclaredIntent = NoIntentYet | PiholeIntent
 
 @final
 @dataclass(frozen=True)
+class Active:
+    """The workload is doing its job right now."""
+
+    message: str = ""
+
+
+@final
+@dataclass(frozen=True)
+class Maintenance:
+    """This unit is busy, and the condition clears on its own."""
+
+    message: str
+
+
+@final
+@dataclass(frozen=True)
+class Blocked:
+    """A human can act, and the message names the remedy."""
+
+    message: str
+
+
+type UnitStatus = Active | Maintenance | Blocked
+"""The statuses this charm reports, without importing `ops`."""
+
+
+@final
+@dataclass(frozen=True)
+class Report:
+    """Report these statuses, and run no further diagnostic."""
+
+    statuses: tuple[UnitStatus, ...]
+
+
+@final
+@dataclass(frozen=True)
+class ReportThenDiagnose:
+    """Report these statuses, then run snap-check for a diagnostic."""
+
+    statuses: tuple[UnitStatus, ...]
+
+
+type StatusReport = Report | ReportThenDiagnose
+
+
+@final
+@dataclass(frozen=True)
 class ReleasePort53:
     """Take port 53 away from systemd-resolved."""
 
@@ -836,3 +883,121 @@ def open_ports(intent: PiholeIntent) -> tuple[tuple[PortProtocol, int], ...]:
     if intent.dhcp_enabled:
         ports += DHCP_PORTS
     return ports
+
+
+# -- Status decisions. -------------------------------------------------
+
+
+def status_without_intent(failure: Blocked | None) -> Report:
+    """Decide the status when nothing can be declared yet.
+
+    The pushed failure is the only truth available. See ADR-0005 §2.4.
+    """
+    if failure is not None:
+        return Report(statuses=(failure,))
+    return Report(statuses=(Maintenance("generating the admin password"),))
+
+
+def status_plan(
+    state: PiholeState,
+    intent: PiholeIntent,
+    failure: Blocked | None,
+) -> StatusReport:
+    """Decide which statuses to report, in the order they are added.
+
+    Pull gates come before the pushed failure, and a failure stops the
+    plan. See ADR-0005 §2.4 and ADR-0006 §2.9.
+    """
+    statuses: list[UnitStatus] = []
+    match state:
+        case SnapPresent():
+            if dhcp_unservable(state, intent):
+                statuses.append(Blocked(dhcp_unservable_reason(state, intent)))
+            if dhcp_port_blocked(state, intent):
+                statuses.append(Blocked(dhcp_port_blocked_reason(state)))
+        case SnapAbsent():
+            pass
+        case _ as unreachable:
+            assert_never(unreachable)
+
+    if failure is not None:
+        statuses.append(failure)
+        return Report(statuses=tuple(statuses))
+
+    machine = _machine_status(state)
+    statuses.append(machine)
+    if isinstance(machine, Maintenance):
+        return Report(statuses=tuple(statuses))
+    return ReportThenDiagnose(statuses=tuple(statuses))
+
+
+def snap_check_status(result: SnapCheckResult) -> Blocked | None:
+    """Map a snap-check result onto a Blocked status, or None.
+
+    See snap-constraints §7.3.
+    """
+    match result:
+        case SnapCheckOk():
+            return None
+        case SnapCheckConfigError(output=output):
+            # The first line is always a banner; failures live in
+            # [FAIL] lines further down.
+            fails = [ln for ln in output.splitlines() if "[FAIL]" in ln]
+            detail = " | ".join(fails) if fails else "snap-check exit 1"
+            return Blocked(f"{detail}; run the snap-check action for the full output")
+        case SnapCheckRuntimeError(output=output):
+            return Blocked(
+                f"port conflict detected by snap-check: {output}; run the free-port-53 action"
+            )
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+def password_problem(password: AdminPasswordState) -> str | None:
+    """Name what is wrong with the admin password, if anything."""
+    match password:
+        case PasswordUnset():
+            return (
+                "no admin password is set, so the Pi-hole config API accepts "
+                "unauthenticated writes from the network; run the "
+                "rotate-admin-password action"
+            )
+        case PasswordRejected():
+            return (
+                "Pi-hole rejects the password this charm holds; run the "
+                "rotate-admin-password action"
+            )
+        case PasswordAccepted() | PasswordUnverified():
+            return None
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+def _machine_status(state: PiholeState) -> UnitStatus:
+    """Map the machine's state onto one status."""
+    match state:
+        case SnapAbsent():
+            return Maintenance(f"installing the {SNAP_NAME} snap")
+        case SnapPresent():
+            return _installed_status(state)
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+def _installed_status(state: SnapPresent) -> UnitStatus:
+    """Map an installed machine's facts onto one status.
+
+    `Blocked` is reserved for what a human can act on. See ADR-0005
+    §2.8.
+    """
+    problem = password_problem(state.admin_password)
+    if problem is not None and state.ftl_active:
+        return Blocked(problem)
+    if not (state.ftl_enabled and state.ftl_active):
+        return Maintenance("starting the Pi-hole FTL daemon")
+    if not state.api_ready:
+        return Blocked(
+            "FTL is running but its HTTP API on port 80 is not answering; "
+            "check the webserver lines in FTL.log on the machine"
+        )
+    return Active()

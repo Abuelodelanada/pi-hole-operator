@@ -13,7 +13,7 @@ import tomllib
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast, final
+from typing import Protocol, assert_never, cast, final
 
 import tenacity
 from charmlibs import snap, systemd
@@ -136,6 +136,231 @@ def _snapd_failure(operation: str, remedy: str, err: snap.Error) -> PiholeError:
     )
 
 
+# -- Pure decisions. ---------------------------------------------------
+#
+# Each function here interprets data the machine produced. The method
+# that owns the effect calls one and acts on the value; none of these
+# touches the machine, so each is tested with `==` and no fake.
+
+
+@final
+@dataclass(frozen=True)
+class SnapCheckUnexpected:
+    """snap-check exited with a code this charm does not know."""
+
+    returncode: int
+
+
+type SnapCheckOutcome = SnapCheckResult | SnapCheckUnexpected
+"""What `pihole snap-check` said, including a code we do not know."""
+
+
+@final
+@dataclass(frozen=True)
+class ConfigMismatch:
+    """A read-back that does not prove the value landed."""
+
+    expected: str
+    actual: str
+    remedy: str
+
+
+def service_status(service: Mapping[str, object] | None) -> ServiceStatus:
+    """Read snapd's service record, treating absence as stopped."""
+    if service is None:
+        return ServiceStatus(enabled=False, active=False)
+    return ServiceStatus(
+        enabled=cast("bool", service["enabled"]),
+        active=cast("bool", service["active"]),
+    )
+
+
+def ntp_server_active(states: Sequence[bool | None]) -> bool | None:
+    """Combine the two NTP keys, or None if either is unreadable."""
+    if any(state is None for state in states):
+        return None
+    return any(state for state in states)
+
+
+def upstream_dns(value: object) -> tuple[str, ...] | None:
+    """Read `dns.upstreams` as a tuple, or None if it is not a list."""
+    if isinstance(value, list):
+        return tuple(str(item) for item in cast("list[object]", value))
+    return None
+
+
+def as_string(value: object) -> str | None:
+    """Return the value if it is a string, else None."""
+    return value if isinstance(value, str) else None
+
+
+def as_bool(value: object) -> bool | None:
+    """Return the value if it is a boolean, else None."""
+    return value if isinstance(value, bool) else None
+
+
+def dhcp_pool_from(
+    start: str | None,
+    end: str | None,
+    router: str | None,
+    netmask: str | None,
+) -> DhcpPool | None:
+    """Build the pool only when all four keys are present."""
+    if start is None or end is None or router is None or netmask is None:
+        return None
+    return DhcpPool(start=start, end=end, router=router, netmask=netmask)
+
+
+def ipv4_addresses(returncode: int, output: str) -> frozenset[str] | None:
+    """Parse `ip -4 -o addr show`, keeping global-scope addresses."""
+    if returncode != 0:
+        return None
+    addresses: set[str] = set()
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) >= 6 and parts[2] == "inet":
+            # The scope token's column varies (`brd` is optional), so
+            # find it rather than assume a position. Only global-scope
+            # addresses are servable: host-scope is loopback-like, and
+            # link-scope (169.254/16) is not routable to DHCP clients.
+            try:
+                scope_idx = parts.index("scope")
+            except ValueError:
+                continue
+            if scope_idx + 1 < len(parts) and parts[scope_idx + 1] == "global":
+                addresses.add(parts[3].split("/", 1)[0])
+    return frozenset(addresses)
+
+
+def classify_snap_check(returncode: int, output: str) -> SnapCheckOutcome:
+    """Map snap-check's exit code to its semantic outcome."""
+    match returncode:
+        case 0:
+            return SnapCheckOk()
+        case 1:
+            return SnapCheckConfigError(output=output)
+        case 2:
+            return SnapCheckRuntimeError(output=output)
+        case _:
+            return SnapCheckUnexpected(returncode=returncode)
+
+
+def parse_connected_plugs(returncode: int, output: str) -> frozenset[str]:
+    """Parse `snap connections` for this snap's connected plugs."""
+    if returncode != 0:
+        return frozenset()
+    connected: set[str] = set()
+    for line in output.splitlines():
+        # Connected and disconnected rows have the same columns; the
+        # Slot column (parts[2]) is the only discriminator.
+        stripped = line.strip()
+        if not stripped or stripped.startswith("Interface"):
+            continue
+        parts = stripped.split()
+        if len(parts) >= 3 and parts[1].startswith(f"{SNAP_NAME}:") and parts[2] != "-":
+            connected.add(parts[1].split(":", 1)[1])
+    return frozenset(connected)
+
+
+def missing_plugs(requested: Sequence[str], connected: frozenset[str]) -> tuple[str, ...]:
+    """Return the requested plugs absent from ``connected``."""
+    return tuple(plug for plug in requested if plug not in connected)
+
+
+def gravity_schedule_error(returncode: int, stdout: str, stderr: str) -> str | None:
+    """Return the validation error, or None if valid."""
+    if returncode == 0:
+        return None
+    return stderr.strip() or stdout.strip() or "(no output)"
+
+
+def drop_in_paths(returncode: int, stdout: str) -> str | None:
+    """Read `systemctl show -p DropInPaths --value`, or None."""
+    if returncode != 0:
+        return None
+    return stdout.strip() or None
+
+
+def parse_gravity_schedule(content: str) -> str | None:
+    """Return the first non-empty OnCalendar in a drop-in, or None."""
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("OnCalendar=") and stripped != "OnCalendar=":
+            return stripped.removeprefix("OnCalendar=")
+    return None
+
+
+def output_tail(stdout: str | None, stderr: str | None) -> str:
+    """Return the last five lines of a failed command's output."""
+    output = (stderr or stdout or "").strip()
+    return "\n".join(output.splitlines()[-5:]) or "(no output)"
+
+
+def unproven_keys(after: Mapping[str, bool | None], active: bool) -> tuple[str, ...]:
+    """Return the keys whose read-back does not match ``active``."""
+    return tuple(key for key, state in after.items() if state is not active)
+
+
+def password_hash_problem(before: str, after: str) -> str | None:
+    """Describe a password write that did not change the hash."""
+    if not after:
+        return "pwhash is still empty"
+    if after == before:
+        return "the hash did not change"
+    return None
+
+
+def dhcp_bind_held(returncode: int, output: str) -> bool:
+    """Whether `ss -lunp` names pihole-FTL on a 67/udp socket."""
+    if returncode != 0:
+        return False
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        # The local address column ends in :67 for the DHCP listener; a
+        # bare substring check would match :6700.
+        if not parts[3].endswith(":67"):
+            continue
+        if DHCP_BIND_PROCESS in line:
+            return True
+    return False
+
+
+def config_mismatch(key: str, expected: object, actual: object) -> ConfigMismatch | None:
+    """Describe a read-back that does not prove ``expected`` landed."""
+    if actual is None:
+        # The key is absent: FTL silently ignored an unknown key.
+        return ConfigMismatch(
+            expected=f"{key} = {expected!r} in pihole.toml",
+            actual=f"{key} is absent from pihole.toml",
+            remedy="FTL ignores unknown keys with HTTP 200; check the key name",
+        )
+    if isinstance(expected, bool):
+        if not isinstance(actual, bool) or actual != expected:
+            return ConfigMismatch(
+                expected=f"{key} = {expected}",
+                actual=f"{key} = {actual}",
+                remedy="the API returned 200 but the value did not land in pihole.toml",
+            )
+        return None
+    if isinstance(expected, tuple):
+        if isinstance(actual, list) and expected == tuple(cast("list[object]", actual)):
+            return None
+        return ConfigMismatch(
+            expected=f"{key} = {expected!r}",
+            actual=f"{key} = {actual!r}",
+            remedy="the API returned 200 but the value did not land in pihole.toml",
+        )
+    if str(actual) != str(expected):
+        return ConfigMismatch(
+            expected=f"{key} = {expected!r}",
+            actual=f"{key} = {actual!r}",
+            remedy="the API returned 200 but the value did not land in pihole.toml",
+        )
+    return None
+
+
 class Runner(Protocol):
     """The `subprocess.run` shape this module needs."""
 
@@ -225,11 +450,8 @@ class Pihole:
         """Report what snapd knows about the FTL daemon."""
         pihole = self._snap()
         if pihole is None:
-            return ServiceStatus(enabled=False, active=False)
-        service = pihole.services.get(FTL_SERVICE)
-        if service is None:
-            return ServiceStatus(enabled=False, active=False)
-        return ServiceStatus(enabled=service["enabled"], active=service["active"])
+            return service_status(None)
+        return service_status(pihole.services.get(FTL_SERVICE))
 
     def ntp_server_active(self) -> bool | None:
         """Report whether FTL's NTP server is enabled on 123/udp.
@@ -237,16 +459,11 @@ class Pihole:
         None when `pihole.toml` cannot answer.
         """
         states = [self._ftl_config_bool(key) for key in NTP_ACTIVE_KEYS]
-        if any(state is None for state in states):
-            return None
-        return any(state for state in states)
+        return ntp_server_active(states)
 
     def upstream_dns(self) -> tuple[str, ...] | None:
         """Return `dns.upstreams` as a tuple, or None if unreadable."""
-        value = config_value(self._read_toml(), UPSTREAM_DNS_KEY)
-        if isinstance(value, list):
-            return tuple(str(item) for item in cast("list[object]", value))
-        return None
+        return upstream_dns(config_value(self._read_toml(), UPSTREAM_DNS_KEY))
 
     def listening_mode(self) -> str | None:
         """Return `dns.listeningMode`, or None if unreadable."""
@@ -270,13 +487,12 @@ class Pihole:
 
         None when any key is absent — a partial pool is no pool.
         """
-        start = self._ftl_config_value(DHCP_POOL_KEYS[0])
-        end = self._ftl_config_value(DHCP_POOL_KEYS[1])
-        router = self._ftl_config_value(DHCP_POOL_KEYS[2])
-        netmask = self._ftl_config_value(DHCP_POOL_KEYS[3])
-        if start is None or end is None or router is None or netmask is None:
-            return None
-        return DhcpPool(start=start, end=end, router=router, netmask=netmask)
+        return dhcp_pool_from(
+            self._ftl_config_value(DHCP_POOL_KEYS[0]),
+            self._ftl_config_value(DHCP_POOL_KEYS[1]),
+            self._ftl_config_value(DHCP_POOL_KEYS[2]),
+            self._ftl_config_value(DHCP_POOL_KEYS[3]),
+        )
 
     def machine_ipv4_addresses(self) -> frozenset[str] | None:
         """Return the IPv4 addresses on non-loopback interfaces.
@@ -297,24 +513,7 @@ class Pihole:
 
         if completed.returncode != 0:
             logger.warning("could not read machine IPv4 addresses: %s", completed.stderr.strip())
-            return None
-
-        addresses: set[str] = set()
-        for line in completed.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 6 and parts[2] == "inet":
-                # The scope token's column varies (`brd` is optional),
-                # so find it rather than assume a position. Only
-                # global-scope addresses are servable: host-scope is
-                # loopback-like, and link-scope (169.254/16) is not
-                # routable to DHCP clients.
-                try:
-                    scope_idx = parts.index("scope")
-                except ValueError:
-                    continue
-                if scope_idx + 1 < len(parts) and parts[scope_idx + 1] == "global":
-                    addresses.add(parts[3].split("/", 1)[0])
-        return frozenset(addresses)
+        return ipv4_addresses(completed.returncode, completed.stdout)
 
     def port53_released(self) -> bool:
         """Report whether port 53 is free for Pi-hole."""
@@ -353,21 +552,19 @@ class Pihole:
             check=False,
             operation=f"running `{PIHOLE_CMD} snap-check`",
         )
-        output = completed.stdout.strip()
-        match completed.returncode:
-            case 0:
-                return SnapCheckOk()
-            case 1:
-                return SnapCheckConfigError(output=output)
-            case 2:
-                return SnapCheckRuntimeError(output=output)
-            case _:
+        outcome = classify_snap_check(completed.returncode, completed.stdout.strip())
+        match outcome:
+            case SnapCheckUnexpected(returncode=code):
                 raise PiholeError(
                     operation=f"running `{PIHOLE_CMD} snap-check`",
                     expected="exit code 0, 1, or 2",
-                    actual=f"unexpected exit code {completed.returncode}",
+                    actual=f"unexpected exit code {code}",
                     remedy="check the snap-check source for new exit codes",
                 )
+            case SnapCheckOk() | SnapCheckConfigError() | SnapCheckRuntimeError():
+                return outcome
+            case _ as unreachable:
+                assert_never(unreachable)
 
     def connected_plugs(self) -> frozenset[str]:
         """Return the set of snap plugs currently connected.
@@ -388,20 +585,7 @@ class Pihole:
             logger.warning("could not read connected plugs: %s", err)
             return frozenset()
 
-        if completed.returncode != 0:
-            return frozenset()
-
-        connected: set[str] = set()
-        for line in completed.stdout.splitlines():
-            # Connected and disconnected rows have the same columns;
-            # the Slot column (parts[2]) is the only discriminator.
-            stripped = line.strip()
-            if not stripped or stripped.startswith("Interface"):
-                continue
-            parts = stripped.split()
-            if len(parts) >= 3 and parts[1].startswith(f"{SNAP_NAME}:") and parts[2] != "-":
-                connected.add(parts[1].split(":", 1)[1])
-        return frozenset(connected)
+        return parse_connected_plugs(completed.returncode, completed.stdout)
 
     def connect_plugs(self, plugs: Sequence[str]) -> None:
         """Connect the named snap plugs, and verify they are connected.
@@ -431,7 +615,7 @@ class Pihole:
                     remedy=f"run `snap connect {SNAP_NAME}:{plug}` on the machine as root",
                 ) from err
         after = self.connected_plugs()
-        missing = [p for p in plugs if p not in after]
+        missing = missing_plugs(plugs, after)
         if missing:
             raise PiholeError(
                 operation=f"connecting plugs for {SNAP_NAME}",
@@ -462,8 +646,10 @@ class Pihole:
                 actual=f"the command could not be run: {err}",
                 remedy="check that systemd is running on this machine",
             ) from err
-        if completed.returncode != 0:
-            error_line = completed.stderr.strip() or completed.stdout.strip() or "(no output)"
+        error_line = gravity_schedule_error(
+            completed.returncode, completed.stdout, completed.stderr
+        )
+        if error_line is not None:
             raise PiholeError(
                 operation=operation,
                 expected="a valid systemd OnCalendar expression",
@@ -496,9 +682,7 @@ class Pihole:
                 actual=f"the command could not be run: {err}",
                 remedy="check that systemd is running on this machine",
             ) from err
-        if completed.returncode != 0:
-            return None
-        return completed.stdout.strip() or None
+        return drop_in_paths(completed.returncode, completed.stdout)
 
     def gravity_schedule(self) -> str | None:
         """Return the schedule OUR drop-in imposes, or None if absent.
@@ -516,11 +700,7 @@ class Pihole:
             # Total by contract: None is the safe direction.
             logger.warning("could not read the gravity timer drop-in: %s", err)
             return None
-        for line in content.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("OnCalendar=") and stripped != "OnCalendar=":
-                return stripped.removeprefix("OnCalendar=")
-        return None
+        return parse_gravity_schedule(content)
 
     def write_gravity_timer(self, schedule: str) -> None:
         """Write the host systemd drop-in overriding the gravity timer.
@@ -645,8 +825,7 @@ class Pihole:
         except subprocess.CalledProcessError as err:
             # Chained: this argv carries no secret. Only the tail
             # travels — the output can be hundreds of lines.
-            output = (err.stderr or err.stdout or "").strip()
-            tail = "\n".join(output.splitlines()[-5:]) or "(no output)"
+            tail = output_tail(err.stdout, err.stderr)
             raise PiholeError(
                 operation="updating gravity",
                 expected="`pihole -g` to complete",
@@ -812,7 +991,7 @@ class Pihole:
         # Both keys must be present and match. Absence is not evidence
         # the write landed — FTL's default is true (rule 6).
         after = {key: self._ftl_config_bool(key) for key in NTP_ACTIVE_KEYS}
-        not_proven = [key for key, state in after.items() if state is not active]
+        not_proven = unproven_keys(after, active)
         if not_proven:
             raise PiholeError(
                 operation=operation,
@@ -850,11 +1029,12 @@ class Pihole:
             ) from None
 
         after = self._ftl_config_value(PWHASH_KEY) or ""
-        if not after or after == before:
+        problem = password_hash_problem(before, after)
+        if problem is not None:
             raise PiholeError(
                 operation="setting the admin password",
                 expected="a fresh pwhash in pihole.toml",
-                actual="the hash did not change" if after else "pwhash is still empty",
+                actual=problem,
                 remedy=(
                     "`pihole -a -p` is v5 syntax that prints usage and exits 0; "
                     "`pihole setpassword` is the v6 command"
@@ -918,19 +1098,7 @@ class Pihole:
         except OSError as err:
             logger.warning("could not read listening UDP sockets: %s", err)
             return False
-        if completed.returncode != 0:
-            return False
-        for line in completed.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 5:
-                continue
-            # The local address column ends in :67 for the DHCP
-            # listener; a bare substring check would match :6700.
-            if not parts[3].endswith(":67"):
-                continue
-            if DHCP_BIND_PROCESS in line:
-                return True
-        return False
+        return dhcp_bind_held(completed.returncode, completed.stdout)
 
     def apply_ftl_config(self, password: str, config: Mapping[str, object]) -> None:
         """Apply FTL config keys via the HTTP API, and read back.
@@ -963,59 +1131,14 @@ class Pihole:
             ) from err
 
         for key in config:
-            expected = config[key]
-            actual = config_value(self._read_toml(), key)
-            if actual is None:
-                # Key not found in pihole.toml at all — FTL silently
-                # ignored an unknown key.
+            mismatch = config_mismatch(key, config[key], config_value(self._read_toml(), key))
+            if mismatch is not None:
                 raise PiholeError(
                     operation=f"applying {key}",
-                    expected=f"{key} = {expected!r} in pihole.toml",
-                    actual=f"{key} is absent from pihole.toml",
-                    remedy="FTL ignores unknown keys with HTTP 200; check the key name",
+                    expected=mismatch.expected,
+                    actual=mismatch.actual,
+                    remedy=mismatch.remedy,
                 )
-            # Type-appropriate comparison
-            if isinstance(expected, bool):
-                if not isinstance(actual, bool):
-                    raise PiholeError(
-                        operation=f"applying {key}",
-                        expected=f"{key} = {expected}",
-                        actual=f"{key} = {actual}",
-                        remedy=("the API returned 200 but the value did not land in pihole.toml"),
-                    )
-                if actual != expected:
-                    raise PiholeError(
-                        operation=f"applying {key}",
-                        expected=f"{key} = {expected}",
-                        actual=f"{key} = {actual}",
-                        remedy=("the API returned 200 but the value did not land in pihole.toml"),
-                    )
-            elif isinstance(expected, tuple):
-                if isinstance(actual, list):
-                    if expected != tuple(cast("list[object]", actual)):
-                        raise PiholeError(
-                            operation=f"applying {key}",
-                            expected=f"{key} = {expected!r}",
-                            actual=f"{key} = {actual!r}",
-                            remedy=(
-                                "the API returned 200 but the value did not land in pihole.toml"
-                            ),
-                        )
-                else:
-                    raise PiholeError(
-                        operation=f"applying {key}",
-                        expected=f"{key} = {expected!r}",
-                        actual=f"{key} = {actual!r}",
-                        remedy=("the API returned 200 but the value did not land in pihole.toml"),
-                    )
-            else:
-                if str(actual) != str(expected):
-                    raise PiholeError(
-                        operation=f"applying {key}",
-                        expected=f"{key} = {expected!r}",
-                        actual=f"{key} = {actual!r}",
-                        remedy=("the API returned 200 but the value did not land in pihole.toml"),
-                    )
         logger.info(
             "Applied FTL config for %d keys and verified them in pihole.toml.", len(config)
         )
@@ -1071,16 +1194,14 @@ class Pihole:
 
         Returns None when the file, table, or key is absent.
         """
-        value = config_value(self._read_toml(), key)
-        return value if isinstance(value, str) else None
+        return as_string(config_value(self._read_toml(), key))
 
     def _ftl_config_bool(self, key: str) -> bool | None:
         """Read one dotted boolean key out of `pihole.toml`.
 
         None when the file cannot answer.
         """
-        value = config_value(self._read_toml(), key)
-        return value if isinstance(value, bool) else None
+        return as_bool(config_value(self._read_toml(), key))
 
     def _read_toml(self) -> Mapping[str, object]:
         """Parse `pihole.toml`, or return nothing if it is not there."""

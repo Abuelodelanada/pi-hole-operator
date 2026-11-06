@@ -7,6 +7,7 @@
 **Amended:** 2026-09-05 — §2.6's ordering correction removed: the snap self-signs TLS and serves the webserver from the first boot (upstream PR #15, in the pinned revision), so there is no port correction for the API gate to follow. The gate itself is unchanged.
 **Amended:** 2026-08-11 — added §2.9: raising is only safe before the resolved drop-in exists, which reorders install ahead of freeing port 53.
 **Amended:** 2026-08-08 — §2.7 retried `snap.SnapError`, which does not cover its sibling exceptions. Corrected to `snap.Error`.
+**Amended:** 2026-11-03 — the status mapping moved into the pure core (`status_plan`/`snap_check_status`) and the push channel is now `pihole_state.Blocked`.
 **Related:** [ADR-0001: Charm Scope and Specification](0001-charm-scope-and-specification.md), [ADR-0003: Reconciler and Functional Core](0003-reconciler-and-functional-core.md), [ADR-0004: FTL Configuration Mechanism](0004-ftl-configuration-mechanism.md)
 
 ---
