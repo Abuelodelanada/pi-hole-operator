@@ -1,0 +1,52 @@
+# Manually promote the charm from latest/edge to a more stable risk.
+#
+# charmcraft promote copies every per-architecture revision currently
+# released in the origin channel (amd64 and arm64) to the destination
+# channel — both architectures land together by construction.
+#
+# The CHARMCRAFT_AUTH token must not be channel-attenuated to latest/edge
+# only, or the release to beta/candidate/stable will be denied. Export it
+# with every channel it may release to:
+#   charmcraft login --export token --charm pi-hole --ttl 31536000 \
+#       --channel latest/edge --channel latest/beta \
+#       --channel latest/candidate --channel latest/stable
+
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      destination:
+        description: "Destination risk — promotes the revisions currently in latest/edge"
+        type: choice
+        options: [beta, candidate, stable]
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: promote latest/edge -> latest/${{ inputs.destination }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Run inside the project: charmcraft 4.x store commands touch the
+      # project service even when --name is passed (see charmcraft#2492,
+      # which bit the publish workflow's upload step).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install charmcraft
+        run: sudo snap install charmcraft --classic
+      - name: Promote
+        env:
+          CHARMCRAFT_AUTH: ${{ secrets.CHARMCRAFT_AUTH }}
+        run: |
+          charmcraft promote --yes --name pi-hole \
+            --from-channel=latest/edge \
+            --to-channel=latest/${{ inputs.destination }}
