@@ -65,6 +65,7 @@ platforms:
   amd64:
   arm64:
 
+
 # Support for the ubuntu@26.04 base landed in Juju 3.6.17, so anything
 # older cannot deploy this charm at all. There is no "machine" feature
 # to assume.
