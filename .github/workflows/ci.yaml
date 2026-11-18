@@ -1,0 +1,62 @@
+# The tox gate on every PR.
+#
+# Blocking checks are the env_list gate from tox.ini: lint, static, unit.
+# fmt is deliberately not a CI env: it mutates the tree and exits 0
+# regardless, so its CI-side enforcement is `ruff format --check --diff`
+# inside lint. integration needs a Juju machine model and lock mutates
+# uv.lock — neither is a PR gate. flaplint runs advisory (AGENTS.md: not in
+# env_list).
+#
+# This file only *produces* the status checks. The merge block itself is
+# branch protection: Settings -> Branches -> rule for main -> require
+# "tox -e lint", "tox -e static", "tox -e unit".
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tox:
+    name: tox -e ${{ matrix.env }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # Let every env finish so one failure does not mask the others.
+      fail-fast: false
+      matrix:
+        env: [lint, static, unit]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      # tox.ini sets skip_missing_interpreters = true, so a missing py314
+      # would SKIP the env and exit 0 — green without having run anything.
+      # Provision the interpreter explicitly instead of trusting that.
+      - run: uv python install 3.14
+      # tox provisions tox-uv itself from [tox] requires.
+      - run: uv tool install tox
+      - run: tox -e ${{ matrix.env }}
+
+  flaplint:
+    name: tox -e flaplint (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Advisory per AGENTS.md: relation-databag ordering churn. Runs for
+    # visibility on every PR; do not add it to required status checks.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - run: uv tool install tox
+      - run: tox -e flaplint
