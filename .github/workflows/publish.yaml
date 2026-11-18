@@ -80,6 +80,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # charmcraft upload crashes AFTER a successful upload when no
+      # charmcraft.yaml is in the CWD (charmcraft#2492: it checks for
+      # unpublished charm libraries through the project service, which
+      # raises "Project not configured yet."). This checkout exists so
+      # the upload runs inside the project — remove it once #2492 ships.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - name: Download packed charms
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
