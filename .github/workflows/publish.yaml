@@ -1,0 +1,102 @@
+# Publish to Charmhub on every merge to main (a merged PR is a push to
+# main), or manually from the Actions tab ("Run workflow"). The dispatch
+# picker allows any branch — dispatching from a feature branch publishes
+# that branch's tree to latest/edge, so pick main unless that is the goal.
+#
+# pack runs natively per architecture: the platforms shorthand in
+# charmcraft.yaml (amd64:, arm64:) expands to build-on == build-for, so
+# each arch needs a matching host — no QEMU cross-build. GitHub provides
+# arm64 runners (free on public repos, billed on private ones).
+#
+# publish is a separate job so both archs land together: needs: pack means
+# a failed arm64 build can never leave latest/edge with a newer amd64
+# revision than arm64.
+#
+# One-time prerequisites, by hand:
+#   charmcraft register pi-hole   # fails if the name is taken on Charmhub
+#   charmcraft login --export token --charm pi-hole --channel latest/edge \
+#       --ttl 31536000            # default TTL is 30h — too short for CI
+# Then store the token file's contents as the CHARMCRAFT_AUTH repo secret
+# (Settings -> Secrets and variables -> Actions). charmcraft reads that
+# environment variable for non-interactive auth.
+
+name: publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # false: never cancel an in-flight Charmhub upload when the next merge
+  # lands — the newer run publishes right after this one finishes.
+  cancel-in-progress: false
+
+jobs:
+  pack:
+    name: pack (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # Not plain `lxd init --auto`: the Docker preinstalled on GitHub
+      # runners drops LXD bridge traffic in the FORWARD chain, and the
+      # runner user is not in the lxd group. setup-lxd fixes both (adds
+      # the bridge to DOCKER-USER, sets the daemon group to adm) — the
+      # same pattern as canonical/operator's own charmcraft workflows.
+      - name: Set up LXD
+        uses: canonical/setup-lxd@8c6a87bfb56aa48f3fb9b830baa18562d8bfd4ee  # v1
+        with:
+          channel: 5.21/stable
+      - name: Install charmcraft
+        run: sudo snap install charmcraft --classic
+      - name: Pack
+        run: charmcraft pack --verbose --platform ${{ matrix.arch }}
+      - name: Upload packed charm as workflow artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: charm-${{ matrix.arch }}
+          path: "*.charm"
+          # error: a green pack that produced no file must not publish nothing.
+          if-no-files-found: error
+
+  publish:
+    name: publish to latest/edge
+    needs: pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download packed charms
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Install charmcraft
+        run: sudo snap install charmcraft --classic
+      - name: Upload to Charmhub
+        env:
+          CHARMCRAFT_AUTH: ${{ secrets.CHARMCRAFT_AUTH }}
+        run: |
+          shopt -s nullglob
+          charms=(dist/*.charm)
+          if [ "${#charms[@]}" -ne 2 ]; then
+            echo "expected 2 charms (amd64 + arm64), found ${#charms[@]}" >&2
+            exit 1
+          fi
+          for charm in "${charms[@]}"; do
+            charmcraft upload "$charm" --release latest/edge
+          done
