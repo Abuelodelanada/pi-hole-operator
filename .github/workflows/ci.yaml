@@ -37,7 +37,7 @@ jobs:
         env: [lint, static, unit]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
       # tox.ini sets skip_missing_interpreters = true, so a missing py314
@@ -57,6 +57,6 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.3
       - run: uv tool install tox
       - run: tox -e flaplint
