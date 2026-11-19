@@ -18,7 +18,11 @@ Not a Kubernetes charm: no Pebble, no OCI image.
 > offers `snap-check` / `update-gravity` / `free-port-53` as actions, and
 > can set the blocklist refresh schedule (`gravity-schedule`) through a host
 > drop-in. The NTP server the snap opens on 123/udp is closed by default —
-> `ntp-server-enabled` re-opens it deliberately. It provides one optional
+> `ntp-server-enabled` re-opens it deliberately — and so is FTL's NTP
+> *client* (`ntp.sync.active`): the machine's own time sync owns the clock,
+> and in an LXD container the adjustment FTL attempts can never succeed
+> ([ADR-0006 §2.3](docs/adr/0006-configuration-surface.md)). It provides one
+> optional
 > relation, `cos-agent`, through which the `opentelemetry-collector`
 > subordinate takes the snap's logs (via its read-only `logs` content slot)
 > and host metrics. See

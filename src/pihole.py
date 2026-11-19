@@ -61,6 +61,11 @@ PIHOLE_CMD = f"/snap/bin/{SNAP_NAME}.pihole"
 NTP_ACTIVE_KEYS = ("ntp.ipv4.active", "ntp.ipv6.active")
 """The two keys behind FTL's NTP server on 123/udp, on by default."""
 
+NTP_SYNC_ACTIVE_KEY = "ntp.sync.active"
+"""The FTL NTP client key: hourly sync against pool.ntp.org that adjusts
+the system clock.
+"""
+
 UPSTREAM_DNS_KEY = "dns.upstreams"
 LISTENING_MODE_KEY = "dns.listeningMode"
 BLOCKING_ACTIVE_KEY = "dns.blocking.active"
@@ -460,6 +465,13 @@ class Pihole:
         """
         states = [self._ftl_config_bool(key) for key in NTP_ACTIVE_KEYS]
         return ntp_server_active(states)
+
+    def ntp_client_active(self) -> bool | None:
+        """Report whether FTL's NTP client is enabled.
+
+        None when `pihole.toml` cannot answer.
+        """
+        return self._ftl_config_bool(NTP_SYNC_ACTIVE_KEY)
 
     def upstream_dns(self) -> tuple[str, ...] | None:
         """Return `dns.upstreams` as a tuple, or None if unreadable."""

@@ -11,6 +11,7 @@
 **Amended:** 2026-09-22 — §2.9's port-67 exemption is now evidence-based: FTL up *and* the port taken, so the inverse state (FTL up, 67 free) also Blocks with the unbound-daemon remedy.
 **Amended:** 2026-09-22 — §2.9 gains the port-67 gate: `dhcp_port_blocked` stops an enable into an occupied 67/udp, with the exemption keyed on FTL owning the listener rather than on the config key alone.
 **Amended:** 2026-09-22 — §2.9 records the plug-retention decision: `network-control` + `firewall-control` stay connected after DHCP is disabled, because a connected plug is passive and re-enabling reconnects via drift.
+**Amended:** 2026-11-19 — §2.3 extends to the NTP *client*: `ntp.sync.active` becomes fixed intent `false`, with no config option. The host's own time sync owns the clock; in an LXD container the adjustment can never succeed, and on a VM it would compete with the host daemon.
 
 **Amended:** 2026-09-22 — §2.9 gains the bounded bind wait: `WaitForDhcpBind` after the enable PATCH closes the window in which a status collection would sample 67 free and Block on a self-clearing gate.
 **Related:** [ADR-0001: Charm Scope and Specification](0001-charm-scope-and-specification.md), [ADR-0004: FTL Configuration Mechanism](0004-ftl-configuration-mechanism.md), [ADR-0007: Admin Password Handling](0007-admin-password-handling.md)
@@ -83,6 +84,20 @@ Both keys are reachable via `snap set`, so the charm *can* decide. It defaults t
 **This is a divergence from upstream defaults and must be documented in the
 README.** Silently changing a workload default is worse than the exposure it
 prevents.
+
+**Extended 2026-11-19 — the NTP client joins the server.** FTL also ships an
+NTP *client* — `ntp.sync.active`, default `true` — that syncs against
+`pool.ntp.org` hourly and adjusts the system clock. The charm holds it at
+`false` as **fixed intent, with no config option**: on a Juju-managed Ubuntu
+machine the host's own time sync owns the clock, so the client is redundant
+where it works and a permanent error where it cannot. In an LXD container the
+kernel denies the clock change even with `time-control` connected (observed
+2026-11-19 on the operator's production container as FTL's UI error *"Failed
+to adjust time during NTP sync: Insufficient permissions"*); on a VM, where
+the plug makes it work, it would compete with the host's own daemon. Applied
+through the same `PATCH /api/config` path as every other key
+([ADR-0004](0004-ftl-configuration-mechanism.md)), so no restart is involved.
+The README documents this divergence alongside the server's.
 
 ### 2.4 `upstream-dns` is a config option, and stays one
 

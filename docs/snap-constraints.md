@@ -176,6 +176,15 @@ required`, and `Could not fopen("/proc/<pid>/comm")`, plus AppArmor `DENIED`
 lines in `dmesg`. Connecting those three and restarting makes all of them
 disappear.
 
+The `time-control` plug also serves the NTP **client**: `ntp.sync.active`
+(default `true`) makes FTL sync against `pool.ntp.org` hourly and adjust the
+system clock. In an LXD container that adjustment can never succeed — the
+clock belongs to the host, and the kernel denies the change even with the
+plug connected. Observed 2026-11-19 on the operator's production container
+as FTL's UI error *"Failed to adjust time during NTP sync: Insufficient
+permissions"*. The charm therefore holds `ntp.sync.active` at `false`
+(ADR-0006 §2.3, amended 2026-11-19); the host's own time sync owns the clock.
+
 `snap connect` is **idempotent** — reconnecting a connected plug is a no-op, so
 it is safe on every reconcile.
 
