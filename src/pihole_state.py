@@ -18,7 +18,7 @@ DHCP_BIND_TIMEOUT = 30.0
 # Shared by pihole.py and ftl_api.py. See ADR-0009 §4.
 SNAP_NAME = "pihole-by-rajannpatel"
 
-SNAP_REVISIONS: Mapping[str, str] = {"amd64": "1417", "arm64": "1415"}
+SNAP_REVISIONS: Mapping[str, str] = {"amd64": "1464", "arm64": "1460"}
 """The revisions this charm's release is built against. See ADR-0010."""
 
 _SNAP_ARCH: Mapping[str, str] = {"x86_64": "amd64", "aarch64": "arm64"}
