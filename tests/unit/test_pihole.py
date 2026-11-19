@@ -905,6 +905,55 @@ def test_a_readable_toml_reports_what_it_says(
     assert workload.ntp_server_active() is expected
 
 
+def test_ntp_client_active_reads_true(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+):
+    """ntp.sync.active reads True from pihole.toml."""
+    # GIVEN a pihole.toml with ntp.sync.active = true
+    write_pihole_toml(snap_data, raw="[ntp.sync]\nactive = true\n")
+
+    # WHEN the fact is read
+    # THEN it is True
+    assert workload.ntp_client_active() is True
+
+
+def test_ntp_client_active_reads_false(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+):
+    """ntp.sync.active reads False from pihole.toml."""
+    # GIVEN a pihole.toml with ntp.sync.active = false
+    write_pihole_toml(snap_data, raw="[ntp.sync]\nactive = false\n")
+
+    # WHEN the fact is read
+    # THEN it is False
+    assert workload.ntp_client_active() is False
+
+
+def test_ntp_client_active_absent_is_none(
+    workload: pihole.Pihole,
+):
+    """ntp_client_active returns None when the key is absent."""
+    # GIVEN a machine whose pihole.toml does not exist yet
+    # WHEN the fact is read
+    # THEN it is None — unreadable and unset are the same
+    assert workload.ntp_client_active() is None
+
+
+def test_ntp_client_active_not_a_bool_is_none(
+    workload: pihole.Pihole,
+    snap_data: pathlib.Path,
+):
+    """ntp_client_active returns None when the value is not a bool."""
+    # GIVEN a pihole.toml where ntp.sync.active is a string
+    write_pihole_toml(snap_data, raw='[ntp.sync]\nactive = "yes"\n')
+
+    # WHEN the fact is read
+    # THEN it is None — as_bool rejects non-bool values
+    assert workload.ntp_client_active() is None
+
+
 def test_setting_the_password_uses_the_v6_command_and_never_snap_set(
     fake_snap: FakeSnap,
     snap_data: pathlib.Path,

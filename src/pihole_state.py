@@ -56,6 +56,13 @@ first boot."""
 NTP_PORTS: tuple[tuple[PortProtocol, int], ...] = (("udp", 123),)
 """The NTP server, only advertised when the operator enabled it."""
 
+NTP_CLIENT_ACTIVE = False
+"""The FTL NTP client is always disabled: the host's own time sync owns
+the clock. In containers the adjustment can never succeed; on VMs it
+would compete with the host daemon. See ADR-0006 §2.3 (amended
+2026-11-19).
+"""
+
 GRAVITY_TIMER_UNIT = "snap.pihole-by-rajannpatel.gravity-sync.timer"
 """The systemd timer unit that drives the weekly gravity update."""
 
@@ -212,6 +219,7 @@ class SnapPresent:
     port53_released: bool
     port67_free: bool
     ntp_server_active: bool | None
+    ntp_client_active: bool | None
     upstream_dns: tuple[str, ...] | None
     listening_mode: str | None
     blocking_enabled: bool | None
@@ -496,6 +504,13 @@ class PiholeFacts(Protocol):
         """
         ...
 
+    def ntp_client_active(self) -> bool | None:
+        """`ntp.sync.active` as `pihole.toml` holds it.
+
+        None when the file cannot answer.
+        """
+        ...
+
     def upstream_dns(self) -> tuple[str, ...] | None:
         """`dns.upstreams` as `pihole.toml` holds it.
 
@@ -574,6 +589,7 @@ def fetch(pihole: PiholeFacts, admin_password: str) -> PiholeState:
         port53_released=pihole.port53_released(),
         port67_free=pihole.port67_free(),
         ntp_server_active=pihole.ntp_server_active(),
+        ntp_client_active=pihole.ntp_client_active(),
         upstream_dns=pihole.upstream_dns(),
         listening_mode=pihole.listening_mode(),
         blocking_enabled=pihole.blocking_enabled(),
@@ -630,6 +646,7 @@ def _bootstrap(intent: PiholeIntent) -> Sequence[PiholeOutcome]:
     ftl_config: list[tuple[str, str | bool | tuple[str, ...]]] = [
         ("dns.blocking.active", intent.blocking_enabled),
         ("dns.dnssec", intent.dnssec_enabled),
+        ("ntp.sync.active", NTP_CLIENT_ACTIVE),
     ]
     outcomes.append(SetFtlConfig(config=tuple(ftl_config), password=intent.admin_password))
     if intent.gravity_schedule is not None:
@@ -726,6 +743,10 @@ def _drifted_config(
         drifted.append(("dns.blocking.active", intent.blocking_enabled))
     if state.dnssec_enabled != intent.dnssec_enabled:
         drifted.append(("dns.dnssec", intent.dnssec_enabled))
+    # Unknown drifts to the correction, same as the NTP server's
+    # tri-state: the read-back after the PATCH adjudicates.
+    if state.ntp_client_active is not False:
+        drifted.append(("ntp.sync.active", NTP_CLIENT_ACTIVE))
     return tuple(drifted)
 
 

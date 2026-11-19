@@ -211,7 +211,7 @@ def test_a_fresh_machine_is_installed_started_and_gated(
     absent_snap.set_password.assert_called_once_with(ADMIN_PASSWORD)
     absent_snap.apply_ftl_config.assert_called_once_with(
         password=ADMIN_PASSWORD,
-        config={"dns.blocking.active": True, "dns.dnssec": False},
+        config={"dns.blocking.active": True, "dns.dnssec": False, "ntp.sync.active": False},
     )
 
 
@@ -780,6 +780,27 @@ def test_config_changed_with_ntp_enabled_applies_set_ntp_server(
 
     # THEN set_ntp_server is called with active=True
     mock_pihole.set_ntp_server.assert_called_once_with(active=True)
+
+
+def test_ntp_client_active_drift_applies_via_ftl_config(
+    ctx: testing.Context[charm.PiholeCharm],
+    base_state: testing.State,
+    mock_pihole: MagicMock,
+    mock_resolved: MagicMock,
+):
+    # GIVEN a converged machine whose ntp_client_active fact is True —
+    # the snap default, which the charm always overrides
+    mock_pihole.ntp_client_active.return_value = True
+
+    # WHEN config-changed fires
+    ctx.run(ctx.on.config_changed(), base_state)
+
+    # THEN the drifted key is applied via the FTL API — no restart
+    # needed, so no set_ntp_server call
+    mock_pihole.apply_ftl_config.assert_called_once_with(
+        password=ADMIN_PASSWORD, config={"ntp.sync.active": False}
+    )
+    mock_pihole.set_ntp_server.assert_not_called()
 
 
 def test_an_invalid_config_value_blocks_without_converging(

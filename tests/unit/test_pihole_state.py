@@ -84,6 +84,7 @@ def converged(**overrides: object) -> SnapPresent:
         port53_released=True,
         port67_free=True,
         ntp_server_active=False,
+        ntp_client_active=False,
         upstream_dns=None,
         listening_mode=None,
         blocking_enabled=True,
@@ -118,6 +119,7 @@ class FactsStub:
     port53_free: bool = True
     port67_free_value: bool = True
     ntp: bool | None = False
+    ntp_client: bool | None = False
     upstreams: tuple[str, ...] | None = None
     mode: str | None = None
     blocking: bool | None = True
@@ -177,6 +179,11 @@ class FactsStub:
         """Report whether FTL's NTP server is enabled."""
         self.reads.append("ntp_server_active")
         return self.ntp
+
+    def ntp_client_active(self) -> bool | None:
+        """Report whether FTL's NTP client is enabled."""
+        self.reads.append("ntp_client_active")
+        return self.ntp_client
 
     def upstream_dns(self) -> tuple[str, ...] | None:
         """Report the upstream DNS servers."""
@@ -243,7 +250,12 @@ def test_absent_snap_yields_the_whole_ordered_install_sequence():
         StartFtl(),
         AwaitApi(),
         SetFtlConfig(
-            password=PASSWORD, config=(("dns.blocking.active", True), ("dns.dnssec", False))
+            password=PASSWORD,
+            config=(
+                ("dns.blocking.active", True),
+                ("dns.dnssec", False),
+                ("ntp.sync.active", False),
+            ),
         ),
     )
 
@@ -458,6 +470,7 @@ def test_fetch_reads_every_fact_exactly_once():
         "installed_revision",
         "listening_mode",
         "machine_ipv4_addresses",
+        "ntp_client_active",
         "ntp_server_active",
         "pinned_revision",
         "port53_released",
@@ -733,6 +746,32 @@ def test_the_ntp_decision_is_a_tri_state_comparison(
     # drifting to a correction in both directions — and a correction
     # always carries its own readiness gate
     assert compute(state, intent) == expected
+
+
+# -- The NTP client tri-state comparison. -----------------------------
+
+
+def test_ntp_client_active_true_drifts_to_false():
+    # GIVEN a converged machine where ntp_client_active is True — the
+    # snap default, which the charm always overrides
+    state = converged(ntp_client_active=True)
+
+    # WHEN the plan is computed
+    outcomes = compute(state, INTENT)
+
+    # THEN the drifted key is applied via the API — no restart needed
+    assert outcomes == (SetFtlConfig(password=PASSWORD, config=(("ntp.sync.active", False),)),)
+
+
+def test_ntp_client_active_none_drifts_to_false():
+    # GIVEN a machine where ntp_client_active is None (unreadable TOML)
+    state = converged(ntp_client_active=None)
+
+    # WHEN the plan is computed
+    # THEN unknown drifts to the correction — the read-back after the
+    # PATCH adjudicates, same as the NTP server's tri-state
+    outcomes = compute(state, INTENT)
+    assert outcomes == (SetFtlConfig(password=PASSWORD, config=(("ntp.sync.active", False),)),)
 
 
 # -- The per-architecture pin (ADR-0010). ------------------------------

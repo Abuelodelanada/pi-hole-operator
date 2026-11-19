@@ -100,6 +100,7 @@ def mock_pihole(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     mock.port53_released.return_value = True
     mock.port67_free.return_value = True
     mock.ntp_server_active.return_value = False
+    mock.ntp_client_active.return_value = False
     mock.upstream_dns.return_value = None
     mock.listening_mode.return_value = None
     mock.blocking_enabled.return_value = True
